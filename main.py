@@ -744,7 +744,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<h1>📖 Verifure Game — Помощь</h1>"
         "<h3>🎮 Игры <i>(ответом на сообщение соперника)</i></h3>"
         "<ul>"
-        "<details closed><summary>👤 Профиль &amp; Активность</summary>"
+        "<details closed><summary>👤 Профиль и Активность</summary>"
         "<ul>"
         "<li>/profile — профиль и баланс VRF <i>(поддержка reply)</i></li>"
         "<li>/top — 🏆 топ игроков <i>(VRF / Уровень / Победы)</i></li>"

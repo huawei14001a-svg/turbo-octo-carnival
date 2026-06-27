@@ -746,7 +746,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<ul>"
         "<details closed><summary>👤 Профиль и Активность</summary>"
         "<ul>"
-        "<footer> {{= "<tg-emoji emoji-id=\""+5420323339723881652+"\">⭐️</tg-emoji>"=}} /profile — профиль и баланс VRF <i>(поддержка reply)</footer>"
+        "<footer>/profile — профиль и баланс VRF <i>(поддержка reply)</footer>"
         "<footer>/top — 🏆 топ игроков <i>(VRF / Уровень / Победы)</i></footer>"
         "<footer>/stats — 📊 статистика чата</footer>"
         "<footer>/daily — ⚡ ежедневный бонус</footer>"

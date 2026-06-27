@@ -741,21 +741,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
+
+    # Корректный HTML, совместимый с Telegram Bot API (parse_mode='HTML')
     rich_h = (
-        "<h1>📖 Verifure Game — Помощь</h1>"
-        "<h3>🎮 Игры <i>(ответом на сообщение соперника)</i></h3>"
+        "📖 <b>Verifure Game — Помощь</b>\n\n"
+        "<b>🎮 Игры (ответом на сообщение соперника)</b>\n"
         "<ul>"
-        "<details closed><summary>👤 Профиль &amp; Активность</summary>"
+        "<li><b>👤 Профиль и Активность</b>"
         "<ul>"
         "<li>/profile — профиль и баланс VRF <i>(поддержка reply)</i></li>"
         "<li>/top — 🏆 топ игроков <i>(VRF / Уровень / Победы)</i></li>"
         "<li>/stats — 📊 статистика чата</li>"
         "<li>/daily — ⚡ ежедневный бонус</li>"
         "<li>/bonus — статус всех кулдаунов</li>"
-        "</ul>"
-        "</details>"
-        "</ul>"
-        "<details closed><summary>🎮 Игры</summary>"
+        "</ul></li>"
+        "<li><b>🎮 Игры</b>"
         "<ul>"
         "<li>/duel — ⚔️ Дуэль на VRF <i>(reply)</i></li>"
         "<li>/cubes <code>[раунды] [ставка]</code> — 🎲 Кубики</li>"
@@ -764,43 +764,39 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/bowling — 🎳 Боулинг <i>(reply)</i></li>"
         "<li>/darts — 🎯 Дартс <i>(reply)</i></li>"
         "<li>/slot — 🎰 Слот-машина PvP <i>(reply)</i></li>"
-        "<li>/mines — 💣 Мины <i>(соло) <i>(reply)</i></i></li>"
+        "<li>/mines — 💣 Мины <i>(соло, reply)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики <i>(reply)</i></li>"
-        "</ul>"
-        "</details>"
-        "</ul>"
-        "<details closed><summary>ЕЩЁ</summary>"
+        "</ul></li>"
+        "<li><b>💒 Браки</b>"
         "<ul>"
         "<li>/marry — предложение руки и сердца</li>"
         "<li>/accept · /reject — ответ на предложение</li>"
         "<li>/divorce — развод · /marriage — карточка пары</li>"
         "<li>/marriages — все пары чата</li>"
-        "</ul>"
-        "<details closed><summary>🎁 Активности</summary>"
+        "</ul></li>"
+        "<li><b>🎁 Активности</b>"
         "<ul>"
         "<li>/gift — 🎁 подарить VRF <i>(ответом, стоит 75 VRF)</i></li>"
         "<li>/love — ❤️ послать любовь <i>(ответом, +VRF обоим)</i></li>"
-        "</ul>"
-        "</details>"
-        "<ul>"
-        "<details closed><summary>🛡️ Администраторы</summary>"
+        "</ul></li>"
+        "<li><b>🛡️ Администраторы</b>"
         "<ul>"
         "<li>/admin — панель управления</li>"
         "<li>/givevrf <code>&lt;n&gt;</code> · /takevrf <code>&lt;n&gt;</code> — выдать/забрать VRF</li>"
         "<li>/givebear · /addadmin · /removeadmin · /listadmins</li>"
-        "</ul>"
-        "</details>"
-        "<ul>"
-        "<details closed><summary>⚙️ Механика</summary>"
+        "</ul></li>"
+        "<li><b>⚙️ Механика</b>"
         "<ul>"
         f"<li>Начальный баланс: <b>{STARTING_VRF} VRF</b></li>"
         f"<li>Ежедневный бонус: <b>{DAILY_BONUS_BASE} VRF</b> + стрик (до +60)</li>"
         f"<li>💍 Брак: <b>+{DAILY_MARRIED_BONUS} VRF</b> к ежедневному</li>"
         f"<li>🎁 Подарок: <b>{GIFT_COST} VRF</b> &rarr; <b>{GIFT_REWARD} VRF</b> получателю</li>"
         "<li>🐻 Медведь за каждые <b>10 побед</b></li>"
+        "</ul></li>"
         "</ul>"
-        "</details>"
     )
+
+    # Fallback (простой текст) – оставляем как есть, он уже корректен
     fb_h = (
         "📖 <b>Verifure Game — Помощь</b>\n\n"
         "<b>👤 Профиль:</b> /profile /top /stats /daily /bonus\n"
@@ -810,9 +806,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🛡️ Админ:</b> /admin /givevrf /takevrf /givebear /addadmin\n\n"
         f"💎 Старт: <b>{STARTING_VRF} VRF</b> · Бонус: <b>{DAILY_BONUS_BASE} VRF/день</b> · 🐻 за 10 побед!"
     )
-    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
 
+    await send_rich(
+        context.bot,
+        cid,
+        html=rich_h,
+        fallback_html=fb_h,
+        reply_to_id=update.message.message_id)
 
 # ══════════════════════════════════════════════════════
 #           PROFILE & LEADERBOARD

@@ -751,6 +751,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/stats — 📊 статистика чата</li>"
         "<li>/daily — ⚡ ежедневный бонус</li>"
         "<li>/bonus — статус всех кулдаунов</li>"
+        "<footer>📖 /help — посмотреть все команды</footer>"
         "</ul>"
         "</details>"
         "</ul>"

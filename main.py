@@ -782,6 +782,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/givebear · /addadmin · /removeadmin · /listadmins</li>"
         "</ul>"
         "<hr/>"
+        "<details open><summary>🛡️ Администраторы</summary>"
+        "<ul>"
+        "<li>/admin — панель управления</li>"
+        "<li>/givevrf <code>&lt;n&gt;</code> · /takevrf <code>&lt;n&gt;</code> — выдать/забрать VRF</li>"
+        "<li>/givebear · /addadmin · /removeadmin · /listadmins</li>"
+        "</ul>"
+        "</details>"
         "<details open><summary>⚙️ Механика</summary>"
         "<ul>"
         f"<li>Начальный баланс: <b>{STARTING_VRF} VRF</b></li>"
@@ -2254,7 +2261,7 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     msg = await update.message.reply_text(
-        f"❌⭕ <b>Крестики-нолики!</b>\n\n"
+        f"❌⭕ <b>Крестики-нолики!</b>\n\n"        
         f"❌ {mention(host.id, host.first_name)}\n"
         f"⭕ {mention(opponent.id, opponent.first_name)}\n\n"
         f"💎 Ставка: <b>{bet} VRF</b>\n\n"

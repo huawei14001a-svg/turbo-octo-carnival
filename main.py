@@ -107,6 +107,7 @@ sports_games: dict    = {}   # key: game_id (str)
 slot_games: dict      = {}   # key: game_id (str)
 mines_games: dict     = {}   # key: f"{uid}:{cid}"
 ttt_games: dict       = {}   # key: game_id (str)
+battle_games: dict    = {}   # key: game_id (str)  — Battleship
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -691,7 +692,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "<ul>"
             "<li>⚔️ <b>Дуэль</b> · 🎲 <b>Кубики</b> · 🎰 <b>Слот-машина</b></li>"
             "<li>🏀 Баскетбол · ⚽ Футбол · 🎳 Боулинг · 🎯 Дартс</li>"
-            "<li>💣 <b>Мины</b> <i>(соло)</i> · ❌⭕ <b>Крестики-нолики</b></li>"
+            "<li>💣 <b>Мины</b> <i>(соло)</i> · ❌⭕ <b>Крестики-нолики</b> · 🚢 <b>Морской Бой</b></li>"
             "</ul>"
             "<hr/>"
             f"<blockquote>💎 Стартовый баланс: <b>{STARTING_VRF} VRF</b></blockquote>"
@@ -723,6 +724,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/slot — 🎰 Слот PvP <i>(ответом)</i></li>"
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики <i>(ответом)</i></li>"
+        "<li>/seabattle — 🚢 Морской Бой <i>(ответом, PvP в ЛС)</i></li>"
         "<li>/daily — ⚡ Ежедневный бонус</li>"
         "</ul>"
         "<footer>📖 /help — посмотреть все команды</footer>"
@@ -762,6 +764,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/slot — 🎰 Слот-машина PvP</li>"
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики</li>"
+        "<li>/seabattle — 🚢 Морской Бой <i>(PvP в ЛС)</i></li>"
         "</ul>"
         "<h3>💒 Браки</h3>"
         "<ul>"
@@ -795,7 +798,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     fb_h = (
         "📖 <b>Verifure Game — Помощь</b>\n\n"
         "<b>👤 Профиль:</b> /profile /top /stats /daily /bonus\n"
-        "<b>🎮 Игры:</b> /duel /cubes /basket /football /bowling /darts /slot /mines /tictac\n"
+        "<b>🎮 Игры:</b> /duel /cubes /basket /football /bowling /darts /slot /mines /tictac /seabattle\n"
         "<b>💒 Браки:</b> /marry /accept /reject /divorce /marriage /marriages\n"
         "<b>🎁 Активности:</b> /gift /love\n"
         "<b>🛡️ Админ:</b> /admin /givevrf /takevrf /givebear /addadmin\n\n"
@@ -2282,6 +2285,194 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+# ══════════════════════════════════════════════════════
+#              BATTLESHIP GAME 🚢
+# ══════════════════════════════════════════════════════
+
+BS_SIZE  = 8                       # 8×8 grid
+BS_SHIPS = [4, 3, 3, 2, 2, 2]     # ship lengths → 16 cells total
+BS_TOTAL = sum(BS_SHIPS)           # 16
+
+
+def _bs_place_ships(size: int, ships: list) -> list:
+    """Randomly place ships with 1-cell buffer. Returns flat bool list."""
+    grid = [False] * (size * size)
+    for length in ships:
+        for _ in range(3000):
+            horiz = random.choice([True, False])
+            if horiz:
+                r = random.randint(0, size - 1)
+                c = random.randint(0, size - length)
+            else:
+                r = random.randint(0, size - length)
+                c = random.randint(0, size - 1)
+            cells = [
+                (r, c + k) if horiz else (r + k, c)
+                for k in range(length)
+            ]
+            ok = True
+            for rr, cc in cells:
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        nr, nc = rr + dr, cc + dc
+                        if 0 <= nr < size and 0 <= nc < size and grid[nr * size + nc]:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if ok:
+                for rr, cc in cells:
+                    grid[rr * size + cc] = True
+                break
+    return grid
+
+
+def _bs_alive(grid: list, shots: list) -> int:
+    """Count ship cells not yet hit."""
+    return sum(1 for i in range(len(grid)) if grid[i] and not shots[i])
+
+
+def _bs_own_board(my_grid: list, opp_shots: list, size: int) -> str:
+    """Render player's own board (ships visible) as monospace text."""
+    COLS = "ABCDEFGH"[:size]
+    lines = ["   " + " ".join(COLS)]
+    for r in range(size):
+        row = []
+        for c in range(size):
+            i = r * size + c
+            if opp_shots[i] and my_grid[i]:
+                row.append("💥")
+            elif opp_shots[i]:
+                row.append("🌊")
+            elif my_grid[i]:
+                row.append("🚢")
+            else:
+                row.append("⬜")
+        lines.append(f"{r+1}  " + " ".join(row))
+    return "\n".join(lines)
+
+
+def _bs_player_text(game: dict, pnum: int) -> str:
+    """Compose DM text for a given player (1 or 2)."""
+    is1    = pnum == 1
+    mygr   = game["grid1"] if is1 else game["grid2"]
+    opgr   = game["grid2"] if is1 else game["grid1"]
+    mysh   = game["shots1"] if is1 else game["shots2"]
+    opsh   = game["shots2"] if is1 else game["shots1"]
+    myname = game["p1_name"] if is1 else game["p2_name"]
+    opname = game["p2_name"] if is1 else game["p1_name"]
+    my_hp  = _bs_alive(mygr, opsh)
+    op_hp  = _bs_alive(opgr, mysh)
+    is_my  = game["turn"] == pnum
+    turn_ln = "🎯 <b>ТВОЙ ХОД!</b> Нажми на клетку ниже ⬇️" if is_my \
+              else f"⏳ <i>Ход {opname}, жди...</i>"
+    board = _bs_own_board(mygr, opsh, BS_SIZE)
+    return (
+        f"🚢 <b>Морской Бой!</b>  ·  Флот: 🛳4 🚢3 🚢3 ⛵2 ⛵2 ⛵2\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>{myname}</b>  ❤️ {my_hp}/{BS_TOTAL}  ·  "
+        f"🎯 <b>{opname}</b>  ❤️ {op_hp}/{BS_TOTAL}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{turn_ln}\n\n"
+        f"<b>🗺 Твоё поле:</b>\n"
+        f"<code>{board}</code>\n\n"
+        f"<b>⬇️ Атакуй поле врага:</b>"
+    )
+
+
+def _bs_atk_kb(game_id: str, opp_grid: list, my_shots: list,
+               pnum: int, reveal: bool = False) -> InlineKeyboardMarkup:
+    """Inline keyboard: opponent grid (ships hidden) for firing."""
+    sz   = BS_SIZE
+    rows = []
+    for r in range(sz):
+        row = []
+        for c in range(sz):
+            i = r * sz + c
+            if my_shots[i]:
+                txt = "💥" if opp_grid[i] else "🌊"
+                cb  = f"bs:x:{game_id}"
+            elif reveal:
+                txt = "🚢" if opp_grid[i] else "⬜"
+                cb  = f"bs:x:{game_id}"
+            else:
+                txt = "⬜"
+                cb  = f"bs:f:{game_id}:{pnum}:{i}"
+            row.append(InlineKeyboardButton(txt, callback_data=cb))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+@only_groups
+async def cmd_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    host = update.effective_user
+    cid  = update.effective_chat.id
+
+    if (not update.message.reply_to_message
+            or update.message.reply_to_message.from_user.is_bot):
+        await update.message.reply_text(
+            "🚢 <b>Морской Бой</b>\n\nОтветь на сообщение соперника чтобы начать!\n"
+            "Игра ведётся в <b>личных сообщениях</b> с ботом (8×8, ставка VRF).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    opp = update.message.reply_to_message.from_user
+    if opp.id == host.id:
+        await update.message.reply_text("❌ Нельзя играть с собой!")
+        return
+
+    await db_ensure_user(host.id, cid, host.username or "", host.first_name)
+    await db_ensure_user(opp.id,  cid, opp.username  or "", opp.first_name)
+    hu  = await db_get_user(host.id, cid)
+    ou  = await db_get_user(opp.id,  cid)
+    bet = calc_bet(hu["vrf"], ou["vrf"])
+    if hu["vrf"] < bet or ou["vrf"] < bet:
+        await update.message.reply_text(
+            f"❌ Нужно <b>{fmt(bet)} VRF</b> у каждого!", parse_mode=ParseMode.HTML
+        )
+        return
+
+    game_id = str(uuid.uuid4())[:8]
+    battle_games[game_id] = {
+        "game_id": game_id, "cid": cid, "bet": bet,
+        "p1_id":  host.id, "p1_name": host.first_name, "p1_mid": None,
+        "p2_id":  opp.id,  "p2_name": opp.first_name,  "p2_mid": None,
+        "grid1":  None, "grid2": None,
+        "shots1": [False] * (BS_SIZE * BS_SIZE),
+        "shots2": [False] * (BS_SIZE * BS_SIZE),
+        "turn": 1, "state": "waiting",
+    }
+
+    await update.message.reply_text(
+        f"🚢 <b>МОРСКОЙ БОЙ!</b>\n\n"
+        f"⚔️ {mention(host.id, host.first_name)} vs {mention(opp.id, opp.first_name)}\n"
+        f"💎 Ставка: <b>{fmt(bet)} VRF</b>  ·  Поле: <b>8×8</b>\n"
+        f"🛳 Флот: 4·3·3·2·2·2 (6 кораблей)\n\n"
+        f"📨 Игра ведётся в <b>личных сообщениях</b> с ботом!\n"
+        f"{mention(opp.id, opp.first_name)}, принимаешь вызов?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚔️ Принять!", callback_data=f"bsj:{game_id}"),
+            InlineKeyboardButton("❌ Отказать",  callback_data=f"bsd:{game_id}"),
+        ]]),
+    )
+
+    bot = context.bot
+    async def _bs_timeout() -> None:
+        await asyncio.sleep(JOIN_TIMEOUT)
+        if game_id in battle_games and battle_games[game_id]["state"] == "waiting":
+            del battle_games[game_id]
+            try:
+                await bot.send_message(cid, "⏰ Приглашение в Морской Бой истекло.")
+            except TelegramError:
+                pass
+    context.application.create_task(_bs_timeout())
+
+
 # ══════════════════════════════════════════════════════
 #           CASINO 777 HANDLER 🎰
 # ══════════════════════════════════════════════════════
@@ -2351,6 +2542,12 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if v["cid"] == cid and v["state"] == "waiting" and uid in (v["host_id"], v["opp_id"]):
             del ttt_games[k]
             cancelled.append("❌⭕ Крестики-нолики")
+
+    # Battleship (waiting invite)
+    for k, v in list(battle_games.items()):
+        if v["cid"] == cid and v["state"] == "waiting" and uid in (v["p1_id"], v["p2_id"]):
+            del battle_games[k]
+            cancelled.append("🚢 Морской Бой")
 
     if cancelled:
         await update.message.reply_text(
@@ -3196,6 +3393,208 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Battleship: accept / decline ─────────────────────
+    if data.startswith("bsj:") or data.startswith("bsd:"):
+        game_id = data[4:]
+        game    = battle_games.get(game_id)
+        if not game:
+            await query.answer("❌ Игра не найдена", show_alert=True)
+            return
+        if game["state"] != "waiting":
+            await query.answer("❌ Уже началась или отменена", show_alert=True)
+            return
+
+        if data.startswith("bsd:"):
+            if who.id != game["p2_id"]:
+                await query.answer("❌ Это не твой вызов!", show_alert=True)
+                return
+            del battle_games[game_id]
+            await query.answer("❌ Отказано")
+            await query.edit_message_text(
+                f"❌ {mention(who.id, who.first_name)} отказался от Морского боя.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # ── Accept ───────────────────────────────────────
+        if who.id != game["p2_id"]:
+            await query.answer("❌ Ты не соперник!", show_alert=True)
+            return
+        bet = game["bet"]
+        p1u = await db_get_user(game["p1_id"], cid)
+        p2u = await db_get_user(game["p2_id"], cid)
+        if not p1u or p1u["vrf"] < bet:
+            await query.answer("❌ У вызывающего недостаточно VRF!", show_alert=True)
+            return
+        if not p2u or p2u["vrf"] < bet:
+            await query.answer("❌ У тебя недостаточно VRF!", show_alert=True)
+            return
+
+        game["grid1"] = _bs_place_ships(BS_SIZE, BS_SHIPS)
+        game["grid2"] = _bs_place_ships(BS_SIZE, BS_SHIPS)
+        game["state"] = "playing"
+        await query.answer("🚢 Принято! Проверь личку бота.")
+
+        # Send DM to each player
+        failed = []
+        for pn in (1, 2):
+            p_is1  = pn == 1
+            p_id   = game["p1_id"] if p_is1 else game["p2_id"]
+            p_ogr  = game["grid2"] if p_is1 else game["grid1"]
+            p_mysh = game["shots1"] if p_is1 else game["shots2"]
+            try:
+                dm = await context.bot.send_message(
+                    chat_id=p_id,
+                    text=_bs_player_text(game, pn),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_bs_atk_kb(game_id, p_ogr, p_mysh, pn),
+                )
+                if p_is1:
+                    game["p1_mid"] = dm.message_id
+                else:
+                    game["p2_mid"] = dm.message_id
+            except TelegramError:
+                failed.append(game["p1_name"] if p_is1 else game["p2_name"])
+
+        if failed:
+            del battle_games[game_id]
+            await query.edit_message_text(
+                f"❌ <b>Морской Бой не запущен!</b>\n\n"
+                f"Игрок(и) <b>{', '.join(failed)}</b> не начали бота в личке.\n"
+                f"Напишите боту /start в ЛС, затем попробуйте снова.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await query.edit_message_text(
+            f"🚢 <b>МОРСКОЙ БОЙ НАЧАЛСЯ!</b>\n\n"
+            f"⚔️ {mention(game['p1_id'], game['p1_name'])} vs "
+            f"{mention(game['p2_id'], game['p2_name'])}\n"
+            f"💎 Ставка: <b>{fmt(bet)} VRF</b>\n\n"
+            f"📨 Игра идёт в <b>личных сообщениях!</b>\n"
+            f"🎯 Первый ход: <b>{game['p1_name']}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Battleship: fire ──────────────────────────────────
+    if data.startswith("bs:"):
+        parts  = data.split(":")
+        action = parts[1]
+
+        if action in ("noop", "x"):
+            await query.answer()
+            return
+
+        if action == "f" and len(parts) == 5:
+            game_id = parts[2]
+            pnum    = int(parts[3])
+            cell    = int(parts[4])
+            game    = battle_games.get(game_id)
+
+            if not game or game["state"] != "playing":
+                await query.answer("❌ Игра не найдена или завершена", show_alert=True)
+                return
+
+            is1 = pnum == 1
+            pid = game["p1_id"] if is1 else game["p2_id"]
+            if who.id != pid:
+                await query.answer("❌ Это не твоя игра!", show_alert=True)
+                return
+            if game["turn"] != pnum:
+                await query.answer("⏳ Сейчас не твой ход!", show_alert=True)
+                return
+
+            mysh = game["shots1"] if is1 else game["shots2"]
+            opgr = game["grid2"] if is1 else game["grid1"]
+            if mysh[cell]:
+                await query.answer("Уже стрелял сюда!", show_alert=True)
+                return
+
+            mysh[cell] = True
+            hit        = opgr[cell]
+            await query.answer("💥 ПОПАДАНИЕ!" if hit else "🌊 Мимо!")
+
+            # ── Check win ────────────────────────────────
+            if _bs_alive(opgr, mysh) == 0:
+                w_id   = pid
+                w_name = game["p1_name"] if is1 else game["p2_name"]
+                l_id   = game["p2_id"]   if is1 else game["p1_id"]
+                l_name = game["p2_name"] if is1 else game["p1_name"]
+                g_cid  = game["cid"]
+                bet    = game["bet"]
+                w_mid  = game["p1_mid"] if is1 else game["p2_mid"]
+                l_mid  = game["p2_mid"] if is1 else game["p1_mid"]
+                rev_shots = list(mysh)
+                rev_opgr  = list(opgr)
+                del battle_games[game_id]
+
+                await db_deduct_vrf(l_id, g_cid, bet)
+                new_bal = await db_add_vrf(w_id, g_cid, bet)
+                await db_add_xp(w_id, g_cid, XP_PER_WIN)
+                await db_add_xp(l_id, g_cid, XP_PER_GAME)
+                await db_record_game(w_id, g_cid, won=True)
+                await db_record_game(l_id, g_cid, won=False)
+
+                try:
+                    await context.bot.edit_message_text(
+                        f"🏆 <b>ПОБЕДА!</b>\n\nТы потопил весь вражеский флот!\n\n"
+                        f"💎 +{fmt(bet)} VRF  →  Баланс: {fmt(new_bal)} VRF",
+                        chat_id=w_id, message_id=w_mid,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_bs_atk_kb(game_id, rev_opgr, rev_shots, pnum, reveal=True),
+                    )
+                except TelegramError:
+                    pass
+                try:
+                    await context.bot.edit_message_text(
+                        f"💔 <b>ПОРАЖЕНИЕ!</b>\n\nТвой флот потоплен...\n\n"
+                        f"💸 -{fmt(bet)} VRF",
+                        chat_id=l_id, message_id=l_mid,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                try:
+                    await context.bot.send_message(
+                        g_cid,
+                        f"🚢 <b>МОРСКОЙ БОЙ — ФИНАЛ!</b>\n\n"
+                        f"🏆 Победитель: {mention(w_id, w_name)}\n"
+                        f"💔 Потоплен: {mention(l_id, l_name)}\n"
+                        f"💎 Приз: <b>+{fmt(bet)} VRF</b>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                return
+
+            # ── Continue: hit = same turn, miss = switch ─
+            if not hit:
+                game["turn"] = 2 if is1 else 1
+
+            # Update both players' DMs
+            for upn in (1, 2):
+                up1    = upn == 1
+                up_id  = game["p1_id"]  if up1 else game["p2_id"]
+                up_mid = game["p1_mid"] if up1 else game["p2_mid"]
+                up_ogr = game["grid2"]  if up1 else game["grid1"]
+                up_sh  = game["shots1"] if up1 else game["shots2"]
+                if up_mid is None:
+                    continue
+                try:
+                    await context.bot.edit_message_text(
+                        _bs_player_text(game, upn),
+                        chat_id=up_id, message_id=up_mid,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_bs_atk_kb(game_id, up_ogr, up_sh, upn),
+                    )
+                except TelegramError:
+                    pass
+            return
+
+        await query.answer()
+        return
+
     # ── Admin panel ──────────────────────────────────────
     if data.startswith("ap:"):
         uid   = who.id
@@ -3553,6 +3952,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("slot",     "🎰 Слот PvP (ответом)"),
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
+        BotCommand("seabattle","🚢 Морской Бой (ответом, PvP в ЛС)"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
@@ -3609,6 +4009,7 @@ def main() -> None:
     app.add_handler(CommandHandler("slot",    cmd_slot))
     app.add_handler(CommandHandler("mines",   cmd_mines))
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
+    app.add_handler(CommandHandler("seabattle", cmd_seabattle))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Admin

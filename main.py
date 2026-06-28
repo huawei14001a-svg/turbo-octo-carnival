@@ -21,6 +21,8 @@ import aiosqlite
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     ReactionTypeEmoji,
     Update,
 )
@@ -31,6 +33,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -56,6 +59,19 @@ LOVE_MARRIED_REWARD = 35
 LOVE_COOLDOWN_M     = 30
 MAX_BET             = 500
 MIN_BET             = 10
+
+# ── Referral ──────────────────────────────────────────
+REFERRAL_BONUS_INVITER = 200   # VRF to the person who shared the link
+REFERRAL_BONUS_NEW     = 150   # VRF to the new user
+
+# ── Telegram message effects (private chat only) ──────
+# These are built-in Telegram effect IDs (🔥 ❤ 🎉 👍 💩 🌟)
+MSG_EFFECT_FIRE      = "5046589136895476552"
+MSG_EFFECT_HEART     = "5044134455711629726"
+MSG_EFFECT_CONFETTI  = "5046507253588062484"
+MSG_EFFECT_THUMBSUP  = "5107584321108051014"
+MSG_EFFECT_POOP      = "5104841245755180586"   # for losses 😄
+MSG_EFFECT_STAR      = "5104858069535582021"
 
 # ── XP / Levels ──────────────────────────────────────
 XP_PER_MSG_MIN  = 2
@@ -341,6 +357,15 @@ async def db_init() -> None:
             await db.commit()
         except Exception:
             pass  # Column already exists
+        for col_sql in (
+            "ALTER TABLE users ADD COLUMN referral_by    INTEGER DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
+        ):
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except Exception:
+                pass
     log.info("Database initialised at %s", DB_PATH)
 
 
@@ -691,6 +716,59 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u   = update.effective_user
     cid = update.effective_chat.id
 
+    # ── Handle referral deep link in private chat ─────────
+    if update.effective_chat.type == "private" and context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            inviter_id = None
+            try:
+                inviter_id = int(arg[4:])
+            except ValueError:
+                pass
+            if inviter_id and inviter_id != u.id:
+                # Find inviter in any chat and reward both
+                async with aiosqlite.connect(DB_PATH) as db:
+                    # Check if user already has a referral_by set
+                    async with db.execute(
+                        "SELECT referral_by FROM users WHERE user_id=? LIMIT 1", (u.id,)
+                    ) as cur:
+                        row = await cur.fetchone()
+                    already = row and row[0] is not None if row else False
+
+                    if not already:
+                        # Credit inviter in all their chats
+                        await db.execute(
+                            "UPDATE users SET vrf=vrf+?, referral_count=referral_count+1 WHERE user_id=?",
+                            (REFERRAL_BONUS_INVITER, inviter_id),
+                        )
+                        # Mark new user's referral_by
+                        await db.execute(
+                            "UPDATE users SET referral_by=? WHERE user_id=?",
+                            (inviter_id, u.id),
+                        )
+                        # Credit new user if they exist
+                        await db.execute(
+                            "UPDATE users SET vrf=vrf+? WHERE user_id=?",
+                            (REFERRAL_BONUS_NEW, u.id),
+                        )
+                        await db.commit()
+                        try:
+                            await context.bot.send_message(
+                                inviter_id,
+                                f"🎉 <b>Реферальный бонус!</b>\n\n"
+                                f"👤 {u.first_name} зарегистрировался по твоей ссылке!\n"
+                                f"💎 +{fmt(REFERRAL_BONUS_INVITER)} VRF",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except TelegramError:
+                            pass
+                        await update.message.reply_text(
+                            f"🎉 <b>Реферальный бонус!</b>\n\n"
+                            f"Ты зарегистрировался по ссылке от друга!\n"
+                            f"💎 +{fmt(REFERRAL_BONUS_NEW)} VRF тебе на счёт!",
+                            parse_mode=ParseMode.HTML,
+                        )
+
     if update.effective_chat.type == "private":
         rich_h = (
             "<h1>👋 Verifure Game</h1>"
@@ -800,20 +878,138 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<li>💍 Брак: <b>+{DAILY_MARRIED_BONUS} VRF</b> к ежедневному</li>"
         f"<li>🎁 Подарок: <b>{GIFT_COST} VRF</b> &rarr; <b>{GIFT_REWARD} VRF</b> получателю</li>"
         "<li>🐻 Медведь за каждые <b>10 побед</b></li>"
+        f"<li>🔗 Реферал: <b>+{REFERRAL_BONUS_INVITER} VRF</b> тебе &amp; <b>+{REFERRAL_BONUS_NEW} VRF</b> другу</li>"
         "</ul>"
         "</details>"
     )
     fb_h = (
         "📖 <b>Verifure Game — Помощь</b>\n\n"
-        "<b>👤 Профиль:</b> /profile /top /stats /daily /bonus\n"
+        "<b>👤 Профиль:</b> /profile /top /stats /daily /bonus /ref\n"
         "<b>🎮 Игры:</b> /duel /cubes /basket /football /bowling /darts /slot /mines /tictac /seabattle\n"
         "<b>💒 Браки:</b> /marry /accept /reject /divorce /marriage /marriages\n"
         "<b>🎁 Активности:</b> /gift /love\n"
         "<b>🛡️ Админ:</b> /admin /givevrf /takevrf /givebear /addadmin\n\n"
-        f"💎 Старт: <b>{STARTING_VRF} VRF</b> · Бонус: <b>{DAILY_BONUS_BASE} VRF/день</b> · 🐻 за 10 побед!"
+        f"💎 Старт: <b>{STARTING_VRF} VRF</b> · Бонус: <b>{DAILY_BONUS_BASE} VRF/день</b> · 🐻 за 10 побед!\n"
+        f"🔗 Реф. ссылка: /ref"
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id)
+
+
+# ══════════════════════════════════════════════════════
+#           REFERRAL SYSTEM 🔗
+# ══════════════════════════════════════════════════════
+
+async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show personal referral link + stats."""
+    u   = update.effective_user
+    cid = update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    uu  = await db_get_user(u.id, cid)
+
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{u.id}"
+
+    ref_count = uu.get("referral_count") or 0
+    earned    = ref_count * REFERRAL_BONUS_INVITER
+
+    ref_text = (
+        f"🔗 <b>Реферальная ссылка</b>\n\n"
+        f"Поделись ссылкой — получите бонус оба:\n"
+        f"💎 Ты получишь: <b>+{fmt(REFERRAL_BONUS_INVITER)} VRF</b> за каждого\n"
+        f"💎 Друг получит: <b>+{fmt(REFERRAL_BONUS_NEW)} VRF</b>\n\n"
+        f"📊 Приглашено: <b>{ref_count}</b> чел. · Заработано: <b>{fmt(earned)} VRF</b>\n\n"
+        f"<code>{ref_link}</code>"
+    )
+    await update.message.reply_text(
+        ref_text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 Поделиться", switch_inline_query=f"ref {u.id}"),
+        ]]),
+    )
+
+
+# ══════════════════════════════════════════════════════
+#           INLINE QUERY HANDLER 🔍
+# ══════════════════════════════════════════════════════
+
+async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle @BotName queries from any chat."""
+    query   = update.inline_query
+    uid     = query.from_user.id
+    q_text  = (query.query or "").strip().lower()
+
+    # Try to fetch the user's data from any chat they've played in
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE user_id=? ORDER BY vrf DESC LIMIT 1", (uid,)
+        ) as cur:
+            row = await cur.fetchone()
+    u_data = dict(row) if row else None
+
+    results = []
+
+    # ── Referral card ────────────────────────────────
+    bot_info     = await context.bot.get_me()
+    ref_link     = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+    ref_count    = (u_data.get("referral_count") or 0) if u_data else 0
+
+    ref_article = InlineQueryResultArticle(
+        id="ref",
+        title="🔗 Моя реферальная ссылка",
+        description=f"Пригласи друга — получи {REFERRAL_BONUS_INVITER} VRF",
+        input_message_content=InputTextMessageContent(
+            f"🎮 <b>Играй в Verifure Game!</b>\n\n"
+            f"💎 Стартовый баланс {STARTING_VRF} VRF · Мины · Морской бой · Дуэли\n\n"
+            f"🔗 Моя реферальная ссылка:\n{ref_link}",
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+    results.append(ref_article)
+
+    # ── Profile card ─────────────────────────────────
+    if u_data:
+        lvl     = get_level(u_data["experience"])
+        rank_nm = get_rank(lvl)
+        wr      = round(u_data["wins"] / max(1, u_data["total_games"]) * 100, 1)
+        profile_article = InlineQueryResultArticle(
+            id="profile",
+            title=f"👤 Мой профиль — {fmt(u_data['vrf'])} VRF",
+            description=f"Уровень {lvl} · {rank_nm} · {u_data['wins']} побед · W/R {wr}%",
+            input_message_content=InputTextMessageContent(
+                f"👤 <b>Мой профиль в Verifure Game</b>\n\n"
+                f"💎 VRF: <b>{fmt(u_data['vrf'])}</b>\n"
+                f"🏅 Уровень: <b>{lvl}</b> — {rank_nm}\n"
+                f"🏆 Побед: <b>{u_data['wins']}</b>  ·  "
+                f"🎮 Игр: <b>{u_data['total_games']}</b>  ·  "
+                f"W/R: <b>{wr}%</b>\n"
+                f"🔥 Стрик: <b>{u_data.get('win_streak', 0)}</b>  ·  "
+                f"🐻 Медведей: <b>{u_data.get('bears', 0)}</b>\n\n"
+                f"🎮 <b>Играй со мной!</b> {ref_link}",
+                parse_mode=ParseMode.HTML,
+            ),
+        )
+        results.insert(0, profile_article)
+
+    # ── Game invite card ──────────────────────────────
+    invite_article = InlineQueryResultArticle(
+        id="invite",
+        title="⚔️ Вызвать на дуэль / игру",
+        description="Отправить вызов в любой чат",
+        input_message_content=InputTextMessageContent(
+            f"⚔️ <b>Вызываю на игру в Verifure Game!</b>\n\n"
+            f"💎 Дуэли · 🎲 Кубики · 🎰 Слот · 💣 Мины · 🚢 Морской Бой\n\n"
+            f"👉 Добавь бота в чат и используй /duel /slot /tictac /seabattle\n"
+            f"🔗 {ref_link}",
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+    results.append(invite_article)
+
+    await query.answer(results, cache_time=30, is_personal=True)
 
 
 # ══════════════════════════════════════════════════════
@@ -892,9 +1088,9 @@ async def _show_top(update_or_query, context, cid: int, sort: str, edit: bool = 
     title  = titles.get(sort, "VRF")
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💎 VRF",     callback_data=f"top:vrf:{cid}"),
-        InlineKeyboardButton("⭐ Уровень", callback_data=f"top:level:{cid}"),
-        InlineKeyboardButton("🏆 Победы", callback_data=f"top:wins:{cid}"),
+        InlineKeyboardButton("🔵 💎 VRF",     callback_data=f"top:vrf:{cid}"),
+        InlineKeyboardButton("🔵 ⭐ Уровень", callback_data=f"top:level:{cid}"),
+        InlineKeyboardButton("🔵 🏆 Победы", callback_data=f"top:wins:{cid}"),
     ]])
 
     col_hdr = {"vrf": "VRF", "level": "Уровень / XP", "wins": "Побед"}.get(sort, "VRF")
@@ -1373,8 +1569,8 @@ async def cmd_marry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(target.id, target.first_name)}!\n\nПримешь предложение?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("💍 Да!", callback_data=f"ma:{proposer.id}:{target.id}"),
-            InlineKeyboardButton("💔 Нет", callback_data=f"mr:{proposer.id}:{target.id}"),
+            InlineKeyboardButton("🟢 Да! 💍", callback_data=f"ma:{proposer.id}:{target.id}"),
+            InlineKeyboardButton("🔴 Нет 💔", callback_data=f"mr:{proposer.id}:{target.id}"),
         ]]),
     )
 
@@ -1543,8 +1739,8 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(opponent.id, opponent.first_name)}, принимаешь?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚔️ Принять",    callback_data=f"da:{challenger.id}:{opponent.id}"),
-            InlineKeyboardButton("🏳️ Отклонить", callback_data=f"dd:{challenger.id}:{opponent.id}"),
+            InlineKeyboardButton("🟢 Принять ⚔️",    callback_data=f"da:{challenger.id}:{opponent.id}"),
+            InlineKeyboardButton("🔴 Отклонить", callback_data=f"dd:{challenger.id}:{opponent.id}"),
         ]]),
     )
 
@@ -1628,9 +1824,18 @@ async def _run_duel(context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h)
 
-
-# ══════════════════════════════════════════════════════
-#               CUBES GAME 🎲
+    # Send message effect DM to winner for big wins
+    if bet >= 200:
+        try:
+            effect = MSG_EFFECT_CONFETTI if bet >= 400 else MSG_EFFECT_STAR
+            await context.bot.send_message(
+                chat_id=w_id,
+                text=f"🏆 <b>Победа в дуэли!</b>\n💎 +{fmt(bet)} VRF",
+                parse_mode=ParseMode.HTML,
+                message_effect_id=effect,
+            )
+        except TelegramError:
+            pass
 # ══════════════════════════════════════════════════════
 
 @only_groups
@@ -1672,8 +1877,8 @@ async def cmd_cubes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🎲 Принять — {bet} VRF", callback_data=f"cj:{game_id}"),
-        InlineKeyboardButton("❌ Отказать", callback_data=f"cd:{game_id}"),
+        InlineKeyboardButton(f"🟢 Принять 🎲 {bet} VRF", callback_data=f"cj:{game_id}"),
+        InlineKeyboardButton("🔴 Отказать", callback_data=f"cd:{game_id}"),
     ]])
 
     msg = await update.message.reply_text(
@@ -1828,8 +2033,8 @@ async def _cmd_sport(update: Update, context: ContextTypes.DEFAULT_TYPE, game_ty
         f"💎 Ставка: <b>{bet} VRF</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"{emoji} Принять", callback_data=f"sj:{game_id}"),
-            InlineKeyboardButton("❌ Отказать",       callback_data=f"sd:{game_id}"),
+            InlineKeyboardButton(f"🟢 Принять {emoji}", callback_data=f"sj:{game_id}"),
+            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sd:{game_id}"),
         ]]),
     )
 
@@ -1987,8 +2192,8 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 Лучшая комбинация побеждает!",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎰 Принять вызов", callback_data=f"slj:{game_id}"),
-            InlineKeyboardButton("❌ Отказать",       callback_data=f"sld:{game_id}"),
+            InlineKeyboardButton("🟢 Принять 🎰", callback_data=f"slj:{game_id}"),
+            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sld:{game_id}"),
         ]]),
     )
 
@@ -2034,7 +2239,7 @@ def _mines_grid_kb(uid: int, cid: int, game: dict) -> InlineKeyboardMarkup:
             f"💸 Забрать {fmt(payout)} VRF  ({mult}×)",
             callback_data=f"mg:co:{uid}:{cid}",
         ),
-        InlineKeyboardButton("🏳 Сдаться", callback_data=f"mg:q:{uid}:{cid}"),
+        InlineKeyboardButton("🔴 Сдаться 🏳", callback_data=f"mg:q:{uid}:{cid}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -2057,7 +2262,7 @@ def _mines_dead_kb(game: dict, boom_idx: int = -1) -> InlineKeyboardMarkup:
                 txt = "⬛"
             row.append(InlineKeyboardButton(txt, callback_data="mg:noop"))
         rows.append(row)
-    rows.append([InlineKeyboardButton("🎮 Играть снова", callback_data="mg:new")])
+    rows.append([InlineKeyboardButton("🟢 Играть снова 🎮", callback_data="mg:new")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2082,7 +2287,7 @@ def _mines_bet_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
     row2 = [InlineKeyboardButton(f"💎 {v} VRF",
             callback_data=f"mg:b:{uid}:{cid}:{v}") for v in [100, 200, 500]]
     return InlineKeyboardMarkup([row1, row2,
-        [InlineKeyboardButton("❌ Отмена", callback_data="mg:cancel")]])
+        [InlineKeyboardButton("🔴 Отмена", callback_data="mg:cancel")]])
 
 
 @only_groups
@@ -2135,7 +2340,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("👮 Бот-админы",   callback_data="ap:admins")],
         [InlineKeyboardButton("📋 Все команды",   callback_data="ap:cmds"),
          InlineKeyboardButton("ℹ️ Управление",   callback_data="ap:manage")],
-        [InlineKeyboardButton("❌ Закрыть",       callback_data="ap:close")],
+        [InlineKeyboardButton("🔴 Закрыть",       callback_data="ap:close")],
     ])
     await update.message.reply_text(
         f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -2368,7 +2573,7 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton("8×8  (5 в ряд)",
                     callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:8"),
             ],
-            [InlineKeyboardButton("❌ Отмена", callback_data="ttsz:cancel")],
+            [InlineKeyboardButton("🔴 Отмена", callback_data="ttsz:cancel")],
         ]),
     )
 
@@ -2544,8 +2749,8 @@ async def cmd_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"{mention(opp.id, opp.first_name)}, принимаешь вызов?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚔️ Принять!", callback_data=f"bsj:{game_id}"),
-            InlineKeyboardButton("❌ Отказать",  callback_data=f"bsd:{game_id}"),
+            InlineKeyboardButton("🟢 Принять ⚔️", callback_data=f"bsj:{game_id}"),
+            InlineKeyboardButton("🔴 Отказать",  callback_data=f"bsd:{game_id}"),
         ]]),
     )
 
@@ -2585,6 +2790,16 @@ async def on_casino_777(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode=ParseMode.HTML,
         )
         await _react(update, "🎉")
+        # Send confetti effect DM to the winner
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="🎰 <b>777! ДЖЕКПОТ!</b> 🎊\nТебе сегодня везёт!",
+                parse_mode=ParseMode.HTML,
+                message_effect_id=MSG_EFFECT_CONFETTI,
+            )
+        except TelegramError:
+            pass
     except TelegramError:
         pass
 
@@ -2893,7 +3108,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🕹 {mention(game['opp_id'], game['opp_name'])}: ожидает...",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎰 Крутить!", callback_data=f"slsp:{game_id}"),
+                InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
             ]]),
         )
         return
@@ -2997,7 +3212,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"🕹 {mention(game['opp_id'], game['opp_name'])}: {o_status}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🎰 Крутить!", callback_data=f"slsp:{game_id}"),
+                        InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
                     ]]),
                 )
             except TelegramError:
@@ -3070,8 +3285,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{o_m}, принимаешь вызов?",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"⭕ Принять — {bet} VRF", callback_data=f"ttj:{game_id}"),
-                InlineKeyboardButton("❌ Отказать",              callback_data=f"ttd:{game_id}"),
+                InlineKeyboardButton(f"🟢 Принять ⭕  {bet} VRF", callback_data=f"ttj:{game_id}"),
+                InlineKeyboardButton("🔴 Отказать",              callback_data=f"ttd:{game_id}"),
             ]]),
         )
 
@@ -3307,7 +3522,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  for mc in [3, 5]],
                 [InlineKeyboardButton(f"💣 {mc} мин", callback_data=f"mg:mc:{uid2}:{cid2}:{mc}:{bet}")
                  for mc in [10, 15]],
-                [InlineKeyboardButton("◀️ Назад", callback_data="mg:new")],
+                [InlineKeyboardButton("🔵 Назад", callback_data="mg:new")],
             ])
             await query.edit_message_text(
                 f"💣 <b>Мины</b>  ·  Ставка: <b>{bet} VRF</b>\n\n"
@@ -3698,7 +3913,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         action  = data[3:]
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ap:back")]])
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔵 Назад", callback_data="ap:back")]])
 
         if action == "back":
             await query.answer()
@@ -3709,7 +3924,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  InlineKeyboardButton("👮 Бот-админы",  callback_data="ap:admins")],
                 [InlineKeyboardButton("📋 Все команды",  callback_data="ap:cmds"),
                  InlineKeyboardButton("ℹ️ Управление",  callback_data="ap:manage")],
-                [InlineKeyboardButton("❌ Закрыть",      callback_data="ap:close")],
+                [InlineKeyboardButton("🔴 Закрыть",      callback_data="ap:close")],
             ])
             await query.edit_message_text(
                 f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -4029,6 +4244,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("stats",    "📊 Статистика чата"),
         BotCommand("daily",    "⚡ Ежедневный бонус"),
         BotCommand("bonus",    "📋 Статус бонусов"),
+        BotCommand("ref",      "🔗 Реферальная ссылка (+VRF за друга)"),
         BotCommand("gift",     "🎁 Подарить VRF (ответом)"),
         BotCommand("love",     "💝 Любовь (ответом)"),
         BotCommand("duel",     "⚔️ Дуэль (ответом)"),
@@ -4074,6 +4290,10 @@ def main() -> None:
     app.add_handler(CommandHandler("stats",   cmd_stats))
     app.add_handler(CommandHandler("daily",   cmd_daily))
     app.add_handler(CommandHandler("bonus",   cmd_bonus))
+    app.add_handler(CommandHandler("ref",     cmd_ref))
+
+    # Inline mode (@BotName in any chat)
+    app.add_handler(InlineQueryHandler(on_inline_query))
 
     # Marriage
     app.add_handler(CommandHandler("marry",    cmd_marry))

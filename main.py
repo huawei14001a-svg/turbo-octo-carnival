@@ -21,8 +21,6 @@ import aiosqlite
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     ReactionTypeEmoji,
     Update,
 )
@@ -109,16 +107,6 @@ sports_games: dict    = {}   # key: game_id (str)
 slot_games: dict      = {}   # key: game_id (str)
 mines_games: dict     = {}   # key: f"{uid}:{cid}"
 ttt_games: dict       = {}   # key: game_id (str)
-
-# ── Reply keyboard shown to players ──────────────────────
-MAIN_KB = ReplyKeyboardMarkup([
-    ["/duel",     "/cubes",   "/tictac"],
-    ["/slot",     "/mines",   "/basket"],
-    ["/football", "/bowling", "/darts"],
-    ["/profile",  "/top",     "/daily"],
-    ["/stats",    "/bonus",   "/cancel"],
-    ["/marry",    "/gift",    "/love",    "/help"],
-], resize_keyboard=True, input_field_placeholder="Выбери команду...")
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -747,15 +735,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id)
-    # Show keyboard for group chats
-    if update.effective_chat.type != "private":
-        try:
-            await context.bot.send_message(
-                cid, "⌨️ Клавиатура активирована!",
-                reply_markup=MAIN_KB,
-            )
-        except TelegramError:
-            pass
 
 
 
@@ -763,67 +742,53 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     rich_h = (
-        "<h1>🎮 Verifure Game — Помощь</h1>"
+        "<h1>📖 Verifure Game — Помощь</h1>"
+        "<h3>👤 Профиль &amp; Активность</h3>"
         "<ul>"
-        "<details closed><summary>👤 Профиль и Активность</summary>"
-        "<ul>"
-        "<footer>→  /profile — профиль и баланс VRF <i>(поддержка reply)</i></footer>"
-        "<footer>→  /top — топ игроков <i>(VRF / Уровень / Победы)</i></footer>"
-        "<footer>→  /stats — статистика чата</footer>"
-        "<footer>→  /daily — ежедневный бонус ⚡</footer>"
-        "<footer>→  /bonus — статус всех кулдаунов</footer>"
-        "<footer>→  /help — посмотреть все команды</footer>"
+        "<li>/profile — профиль и баланс VRF</li>"
+        "<li>/top — 🏆 топ игроков <i>(VRF / Уровень / Победы)</i></li>"
+        "<li>/stats — 📊 статистика чата</li>"
+        "<li>/daily — ⚡ ежедневный бонус</li>"
+        "<li>/bonus — статус всех кулдаунов</li>"
         "</ul>"
-        "</details>"
-        "<details closed><summary>🎮 Игры <i>(ответом на сообщение соперника)</i></summary>"
+        "<h3>🎮 Игры <i>(ответом на сообщение соперника)</i></h3>"
         "<ul>"
-        "<footer>→  /duel — ⚔️ Дуэль на VRF</footer>"
-        "<footer>→  /cubes <code>[раунды] [ставка]</code> — 🎲 Кубики</footer>"
-        "<footer>→  /basket — 🏀 Баскетбол</footer>"
-        "<footer>→  /football — ⚽ Футбол</footer>"
-        "<footer>→  /bowling — 🎳 Боулинг</footer>"
-        "<footer>→  /darts — 🎯 Дартс</footer>"
-        "<footer>→  /slot — 🎰 Слот-машина PvP</footer>"
-        "<footer>→  /mines — 💣 Мины <i>(соло)</i></footer>"
-        "<footer>→  /tictac — ❌⭕ Крестики-нолики</footer>"
+        "<li>/duel — ⚔️ Дуэль на VRF</li>"
+        "<li>/cubes <code>[раунды] [ставка]</code> — 🎲 Кубики</li>"
+        "<li>/basket — 🏀 Баскетбол</li>"
+        "<li>/football — ⚽ Футбол</li>"
+        "<li>/bowling — 🎳 Боулинг</li>"
+        "<li>/darts — 🎯 Дартс</li>"
+        "<li>/slot — 🎰 Слот-машина PvP</li>"
+        "<li>/mines — 💣 Мины <i>(соло)</i></li>"
+        "<li>/tictac — ❌⭕ Крестики-нолики</li>"
         "</ul>"
-        "</details>"
-        "<details closed><summary>💒 Браки и Активности</summary>"
+        "<h3>💒 Браки</h3>"
         "<ul>"
-        "<footer>→  /marry — предложение руки и сердца</footer>"
-        "<footer>→  /accept · /reject — принять / отклонить</footer>"
-        "<footer>→  /divorce — развод · /marriage — карточка</footer>"
-        "<footer>→  /marriages — все пары чата</footer>"
-        "<footer>→  /gift — 🎁 подарить VRF <i>(ответом)</i></footer>"
-        "<footer>→  /love — ❤️ послать любовь <i>(ответом)</i></footer>"
+        "<li>/marry — предложение руки и сердца</li>"
+        "<li>/accept · /reject — ответ на предложение</li>"
+        "<li>/divorce — развод · /marriage — карточка пары</li>"
+        "<li>/marriages — все пары чата</li>"
         "</ul>"
-        "</details>"
-        "<details closed><summary>🔧 Разное</summary>"
+        "<h3>🎁 Активности</h3>"
         "<ul>"
-        "<footer>→  куб 4 500 — 🎲 угадай число (×5 при попадании)</footer>"
-        "<footer>→  пер 500 — 💸 перевод VRF (с реплеем)</footer>"
-        "<footer>→  б — 💎 быстрый баланс</footer>"
-        "<footer>→  /cancel — 🚫 отменить ожидающую игру</footer>"
-        "<footer>→  /keyboard — ⌨️ показать клавиатуру</footer>"
+        "<li>/gift — 🎁 подарить VRF <i>(ответом, стоит 75 VRF)</i></li>"
+        "<li>/love — ❤️ послать любовь <i>(ответом, +VRF обоим)</i></li>"
         "</ul>"
-        "</details>"
-        "<details closed><summary>🛡️ Администраторы</summary>"
+        "<h3>🛡️ Администраторы</h3>"
         "<ul>"
-        "<footer>→  /admin — панель управления</footer>"
-        "<footer>→  /givevrf · /takevrf <code>[n]</code> — выдать/забрать VRF</footer>"
-        "<footer>→  /givebear — 🐻 медведь</footer>"
-        "<footer>→  /addadmin · /removeadmin · /listadmins</footer>"
-        "</ul>"
-        "</details>"
+        "<li>/admin — панель управления</li>"
+        "<li>/givevrf <code>&lt;n&gt;</code> · /takevrf <code>&lt;n&gt;</code> — выдать/забрать VRF</li>"
+        "<li>/givebear · /addadmin · /removeadmin · /listadmins</li>"
         "</ul>"
         "<hr/>"
         "<details open><summary>⚙️ Механика</summary>"
         "<ul>"
-        f"<footer>→  Начальный баланс: <b>{STARTING_VRF} VRF</b></footer>"
-        f"<footer>→  Ежедневный бонус: <b>{DAILY_BONUS_BASE} VRF</b> + стрик (до +60)</footer>"
-        f"<footer>→  💍 Брак: <b>+{DAILY_MARRIED_BONUS} VRF</b> к ежедневному</footer>"
-        f"<footer>→  🎁 Подарок: <b>{GIFT_COST} VRF</b> → <b>{GIFT_REWARD} VRF</b> получателю</footer>"
-        "<footer>→  🐻 Медведь за каждые <b>10 побед</b></footer>"
+        f"<li>Начальный баланс: <b>{STARTING_VRF} VRF</b></li>"
+        f"<li>Ежедневный бонус: <b>{DAILY_BONUS_BASE} VRF</b> + стрик (до +60)</li>"
+        f"<li>💍 Брак: <b>+{DAILY_MARRIED_BONUS} VRF</b> к ежедневному</li>"
+        f"<li>🎁 Подарок: <b>{GIFT_COST} VRF</b> &rarr; <b>{GIFT_REWARD} VRF</b> получателю</li>"
+        "<li>🐻 Медведь за каждые <b>10 побед</b></li>"
         "</ul>"
         "</details>"
     )
@@ -838,15 +803,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id)
-    # Show keyboard for group chats
-    if update.effective_chat.type != "private":
-        try:
-            await context.bot.send_message(
-                cid, "⌨️ Клавиатура активирована!",
-                reply_markup=MAIN_KB,
-            )
-        except TelegramError:
-            pass
 
 
 # ══════════════════════════════════════════════════════
@@ -1159,15 +1115,6 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id)
-    # Show keyboard for group chats
-    if update.effective_chat.type != "private":
-        try:
-            await context.bot.send_message(
-                cid, "⌨️ Клавиатура активирована!",
-                reply_markup=MAIN_KB,
-            )
-        except TelegramError:
-            pass
 
 
 @only_groups
@@ -2335,16 +2282,6 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-@only_groups
-async def cmd_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show/refresh the command keyboard."""
-    await update.message.reply_text(
-        "⌨️ Клавиатура команд активирована!",
-        reply_markup=MAIN_KB,
-    )
-
-
-
 # ══════════════════════════════════════════════════════
 #           CASINO 777 HANDLER 🎰
 # ══════════════════════════════════════════════════════
@@ -3404,7 +3341,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # ── Text shortcuts ────────────────────────────────────
     # б / баланс → balance
-    if word in ("б", "баланс", "balance", "bal") or low == "💎 баланс":
+    if word in ("б", "баланс", "balance", "bal"):
         uu = await db_get_user(u.id, cid)
         bal = uu["vrf"] if uu else 0
         lvl = get_level(uu["experience"]) if uu else 1
@@ -3543,18 +3480,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if rolled == val:
             gain    = bet * 5
             new_bal = await db_add_vrf(u.id, cid, gain)
-            await context.bot.send_message(
-                cid,
-                f"🎲 {mention(u.id, u.first_name)} ставил на <b>{val}</b> — выпало <b>{rolled}</b> — УГАДАЛ! ✅\n\n"
+            await update.message.reply_text(
+                f"🎲 Выпало <b>{rolled}</b> — УГАДАЛ! ✅\n\n"
                 f"💎 +{fmt(gain)} VRF (×5)\n"
                 f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>",
                 parse_mode=ParseMode.HTML,
             )
         else:
             new_bal = await db_deduct_vrf(u.id, cid, bet)
-            await context.bot.send_message(
-                cid,
-                f"🎲 {mention(u.id, u.first_name)} ставил на <b>{val}</b> — выпало <b>{rolled}</b> — промах! ❌\n\n"
+            await update.message.reply_text(
+                f"🎲 Выпало <b>{rolled}</b> — промах! ❌\n\n"
                 f"💸 -{fmt(bet)} VRF\n"
                 f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>",
                 parse_mode=ParseMode.HTML,
@@ -3619,7 +3554,6 @@ async def on_startup(app: Application) -> None:
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
-        BotCommand("keyboard", "⌨️ Показать клавиатуру команд"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
         BotCommand("marriages","👫 Все пары"),

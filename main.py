@@ -39,6 +39,35 @@ from telegram.ext import (
     filters,
 )
 
+
+# ══════════════════════════════════════════════════════
+#  STYLED BUTTON — InlineKeyboardButton + style field
+# ══════════════════════════════════════════════════════
+# Telegram Bot API supports: style="success" 🟢  "danger" 🔴  "primary" 🔵
+# python-telegram-bot may not expose `style` yet, so we inject it via to_dict.
+
+class SBtn(InlineKeyboardButton):
+    """
+    InlineKeyboardButton с официальным параметром Telegram API `style`.
+    Значения: "success" (зелёный) | "danger" (красный) | "primary" (синий)
+    """
+    _cache: dict = {}  # id(self) → style str
+
+    def __init__(self, text: str, *, style: str = None, **kwargs):
+        super().__init__(text, **kwargs)
+        if style:
+            SBtn._cache[id(self)] = style
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        s = SBtn._cache.get(id(self))
+        if s:
+            d["style"] = s
+        return d
+
+    def __del__(self) -> None:
+        SBtn._cache.pop(id(self), None)
+
 # ══════════════════════════════════════════════════════
 #                       CONFIG
 # ══════════════════════════════════════════════════════
@@ -1290,9 +1319,9 @@ async def _show_top(update_or_query, context, cid: int, sort: str, edit: bool = 
     title  = titles.get(sort, "VRF")
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔵 💎 VRF",     callback_data=f"top:vrf:{cid}"),
-        InlineKeyboardButton("🔵 ⭐ Уровень", callback_data=f"top:level:{cid}"),
-        InlineKeyboardButton("🔵 🏆 Победы", callback_data=f"top:wins:{cid}"),
+        SBtn("💎 VRF",    style="primary", callback_data=f"top:vrf:{cid}"),
+        SBtn("⭐ Уровень", style="primary", callback_data=f"top:level:{cid}"),
+        SBtn("🏆 Победы", style="primary", callback_data=f"top:wins:{cid}"),
     ]])
 
     col_hdr = {"vrf": "VRF", "level": "Уровень / XP", "wins": "Побед"}.get(sort, "VRF")
@@ -1771,8 +1800,8 @@ async def cmd_marry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(target.id, target.first_name)}!\n\nПримешь предложение?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Да! 💍", callback_data=f"ma:{proposer.id}:{target.id}"),
-            InlineKeyboardButton("🔴 Нет 💔", callback_data=f"mr:{proposer.id}:{target.id}"),
+            SBtn("Да! 💍", style="success", callback_data=f"ma:{proposer.id}:{target.id}"),
+            SBtn("Нет 💔", style="danger", callback_data=f"mr:{proposer.id}:{target.id}"),
         ]]),
     )
 
@@ -1941,8 +1970,8 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(opponent.id, opponent.first_name)}, принимаешь?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять ⚔️",    callback_data=f"da:{challenger.id}:{opponent.id}"),
-            InlineKeyboardButton("🔴 Отклонить", callback_data=f"dd:{challenger.id}:{opponent.id}"),
+            SBtn("Принять ⚔️", style="success",    callback_data=f"da:{challenger.id}:{opponent.id}"),
+            SBtn("Отклонить", style="danger", callback_data=f"dd:{challenger.id}:{opponent.id}"),
         ]]),
     )
 
@@ -2079,8 +2108,8 @@ async def cmd_cubes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🟢 Принять 🎲 {bet} VRF", callback_data=f"cj:{game_id}"),
-        InlineKeyboardButton("🔴 Отказать", callback_data=f"cd:{game_id}"),
+        SBtn(f"Принять 🎲 {bet} VRF", style="success", callback_data=f"cj:{game_id}"),
+        SBtn("Отказать", style="danger", callback_data=f"cd:{game_id}"),
     ]])
 
     msg = await update.message.reply_text(
@@ -2235,8 +2264,8 @@ async def _cmd_sport(update: Update, context: ContextTypes.DEFAULT_TYPE, game_ty
         f"💎 Ставка: <b>{bet} VRF</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"🟢 Принять {emoji}", callback_data=f"sj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sd:{game_id}"),
+            SBtn(f"Принять {emoji}", style="success", callback_data=f"sj:{game_id}"),
+            SBtn("Отказать", style="danger",       callback_data=f"sd:{game_id}"),
         ]]),
     )
 
@@ -2394,8 +2423,8 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 Лучшая комбинация побеждает!",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять 🎰", callback_data=f"slj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sld:{game_id}"),
+            SBtn("Принять 🎰", style="success", callback_data=f"slj:{game_id}"),
+            SBtn("Отказать", style="danger",       callback_data=f"sld:{game_id}"),
         ]]),
     )
 
@@ -2441,7 +2470,7 @@ def _mines_grid_kb(uid: int, cid: int, game: dict) -> InlineKeyboardMarkup:
             f"💸 Забрать {fmt(payout)} VRF  ({mult}×)",
             callback_data=f"mg:co:{uid}:{cid}",
         ),
-        InlineKeyboardButton("🔴 Сдаться 🏳", callback_data=f"mg:q:{uid}:{cid}"),
+        SBtn("Сдаться", style="danger", callback_data=f"mg:q:{uid}:{cid}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -2464,7 +2493,7 @@ def _mines_dead_kb(game: dict, boom_idx: int = -1) -> InlineKeyboardMarkup:
                 txt = "⬛"
             row.append(InlineKeyboardButton(txt, callback_data="mg:noop"))
         rows.append(row)
-    rows.append([InlineKeyboardButton("🟢 Играть снова 🎮", callback_data="mg:new")])
+    rows.append([SBtn("Играть снова 🎮", style="success", callback_data="mg:new")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2489,7 +2518,7 @@ def _mines_bet_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
     row2 = [InlineKeyboardButton(f"💎 {v} VRF",
             callback_data=f"mg:b:{uid}:{cid}:{v}") for v in [100, 200, 500]]
     return InlineKeyboardMarkup([row1, row2,
-        [InlineKeyboardButton("🔴 Отмена", callback_data="mg:cancel")]])
+        [SBtn("Отмена", style="danger", callback_data="mg:cancel")]])
 
 
 @only_groups
@@ -2542,7 +2571,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("👮 Бот-админы",   callback_data="ap:admins")],
         [InlineKeyboardButton("📋 Все команды",   callback_data="ap:cmds"),
          InlineKeyboardButton("ℹ️ Управление",   callback_data="ap:manage")],
-        [InlineKeyboardButton("🔴 Закрыть",       callback_data="ap:close")],
+        [SBtn("Закрыть", style="danger",       callback_data="ap:close")],
     ])
     await update.message.reply_text(
         f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -2775,7 +2804,7 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton("8×8  (5 в ряд)",
                     callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:8"),
             ],
-            [InlineKeyboardButton("🔴 Отмена", callback_data="ttsz:cancel")],
+            [SBtn("Отмена", style="danger", callback_data="ttsz:cancel")],
         ]),
     )
 
@@ -2951,8 +2980,8 @@ async def cmd_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"{mention(opp.id, opp.first_name)}, принимаешь вызов?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять ⚔️", callback_data=f"bsj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",  callback_data=f"bsd:{game_id}"),
+            SBtn("Принять ⚔️", style="success", callback_data=f"bsj:{game_id}"),
+            SBtn("Отказать", style="danger",  callback_data=f"bsd:{game_id}"),
         ]]),
     )
 
@@ -3310,7 +3339,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🕹 {mention(game['opp_id'], game['opp_name'])}: ожидает...",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
+                SBtn("Крутить! 🎰", style="primary", callback_data=f"slsp:{game_id}"),
             ]]),
         )
         return
@@ -3414,7 +3443,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"🕹 {mention(game['opp_id'], game['opp_name'])}: {o_status}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
+                        SBtn("Крутить! 🎰", style="primary", callback_data=f"slsp:{game_id}"),
                     ]]),
                 )
             except TelegramError:
@@ -3487,8 +3516,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{o_m}, принимаешь вызов?",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"🟢 Принять ⭕  {bet} VRF", callback_data=f"ttj:{game_id}"),
-                InlineKeyboardButton("🔴 Отказать",              callback_data=f"ttd:{game_id}"),
+                SBtn(f"Принять ⭕  {bet} VRF", style="success", callback_data=f"ttj:{game_id}"),
+                SBtn("Отказать", style="danger",              callback_data=f"ttd:{game_id}"),
             ]]),
         )
 
@@ -3724,7 +3753,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  for mc in [3, 5]],
                 [InlineKeyboardButton(f"💣 {mc} мин", callback_data=f"mg:mc:{uid2}:{cid2}:{mc}:{bet}")
                  for mc in [10, 15]],
-                [InlineKeyboardButton("🔵 Назад", callback_data="mg:new")],
+                [SBtn("Назад", style="primary", callback_data="mg:new")],
             ])
             await query.edit_message_text(
                 f"💣 <b>Мины</b>  ·  Ставка: <b>{bet} VRF</b>\n\n"
@@ -4115,7 +4144,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         action  = data[3:]
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔵 Назад", callback_data="ap:back")]])
+        back_kb = InlineKeyboardMarkup([[SBtn("Назад", style="primary", callback_data="ap:back")]])
 
         if action == "back":
             await query.answer()
@@ -4126,7 +4155,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  InlineKeyboardButton("👮 Бот-админы",  callback_data="ap:admins")],
                 [InlineKeyboardButton("📋 Все команды",  callback_data="ap:cmds"),
                  InlineKeyboardButton("ℹ️ Управление",  callback_data="ap:manage")],
-                [InlineKeyboardButton("🔴 Закрыть",      callback_data="ap:close")],
+                [SBtn("Закрыть", style="danger",      callback_data="ap:close")],
             ])
             await query.edit_message_text(
                 f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",

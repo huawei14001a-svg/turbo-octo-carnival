@@ -58,8 +58,8 @@ class SBtn(InlineKeyboardButton):
         if style:
             SBtn._cache[id(self)] = style
 
-    def to_dict(self) -> dict:
-        d = super().to_dict()
+    def to_dict(self, **kwargs) -> dict:
+        d = super().to_dict(**kwargs)
         s = SBtn._cache.get(id(self))
         if s:
             d["style"] = s
@@ -261,146 +261,211 @@ log = logging.getLogger("verifure")
 #          STATISTICS IMAGE GENERATOR 📊
 # ══════════════════════════════════════════════════════
 
-# Chart palette (matches dark Telegram theme)
-_C_BG     = '#0d1117'
-_C_CARD   = '#161b22'
-_C_GOLD   = '#e3b341'
-_C_GREEN  = '#3fb950'
-_C_RED    = '#f85149'
-_C_BLUE   = '#2a78d6'
-_C_GRAY   = '#484f58'
-_C_WHITE  = '#c9d1d9'
-_C_ORANGE = '#d29922'
-_C_PURPLE = '#8b5cf6'
-
-
 def _stats_image_sync(u: dict, display_name: str) -> Optional[bytes]:
-    """Sync matplotlib image — call via run_in_executor."""
+    """
+    Draw a stats card using Pillow (PIL).
+    Falls back to None if Pillow is not installed.
+    Add 'Pillow' to requirements.txt to enable.
+    """
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.gridspec import GridSpec
+        from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return None
 
-    wins   = int(u.get("wins", 0))
-    losses = int(u.get("losses", 0))
-    draws  = int(u.get("draws", 0))
+    # ── Palette ───────────────────────────────────────────
+    BG      = (13,  17,  23)
+    CARD    = (22,  27,  34)
+    TRACK   = (33,  38,  45)
+    BORDER  = (48,  54,  61)
+    WHITE   = (201, 209, 217)
+    MUTED   = (125, 133, 144)
+    GOLD    = (227, 179,  65)
+    GREEN   = (63,  185,  80)
+    RED     = (248,  81,  73)
+    BLUE    = (42,  120, 214)
+    GRAY    = (72,   79,  88)
+    ORANGE  = (210, 159,  34)
+    BROWN   = (161, 136, 127)
+
+    # ── Data ──────────────────────────────────────────────
+    wins   = int(u.get("wins",        0))
+    losses = int(u.get("losses",      0))
+    draws  = int(u.get("draws",       0))
     total  = int(u.get("total_games", 0))
-    vrf    = int(u.get("vrf", 0))
-    streak = int(u.get("win_streak", 0))
-    mstrk  = int(u.get("max_streak", 0))
-    bears  = int(u.get("bears", 0))
-    xp     = int(u.get("experience", 0))
+    vrf    = int(u.get("vrf",         0))
+    streak = int(u.get("win_streak",  0))
+    mstrk  = int(u.get("max_streak",  0))
+    bears  = int(u.get("bears",       0))
+    xp     = int(u.get("experience",  0))
     lvl    = get_level(xp)
     rnk    = get_rank(lvl)
     _, c_xp, n_xp, pct = get_progress(xp)
     wr     = round(wins / max(1, total) * 100, 1)
     profit = vrf - STARTING_VRF
     p_sign = "+" if profit >= 0 else ""
-    p_col  = _C_GREEN if profit >= 0 else _C_RED
+    p_col  = GREEN if profit >= 0 else RED
 
-    fig = plt.figure(figsize=(10.5, 5.5), facecolor=_C_BG, dpi=120)
-    gs  = GridSpec(2, 3, figure=fig, wspace=0.38, hspace=0.52,
-                   left=0.05, right=0.97, top=0.82, bottom=0.13)
+    # ── Canvas ────────────────────────────────────────────
+    W, H = 900, 538
+    img  = Image.new("RGB", (W, H), BG)
+    d    = ImageDraw.Draw(img)
 
-    # ── Header ────────────────────────────────────────────
-    fig.text(0.5, 0.96, display_name, fontsize=18,
-             color=_C_WHITE, ha="center", va="top", fontweight="bold")
-    fig.text(0.5, 0.90,
-             f"💎 {fmt(vrf)} VRF   ·   Уровень {lvl} — {rnk}   ·   W/R {wr}%",
-             fontsize=10.5, color=_C_GOLD, ha="center", va="top")
-
-    # ── PIE — W / L / D ──────────────────────────────────
-    ax_pie = fig.add_subplot(gs[:, 0])
-    ax_pie.set_facecolor(_C_CARD)
-    pairs = [(wins, _C_GREEN, f"Победы\n{wins}"),
-             (losses, _C_RED, f"Пораж.\n{losses}"),
-             (draws, _C_GRAY, f"Ничья\n{draws}")]
-    nz = [(v, c, l) for v, c, l in pairs if v > 0]
-    if nz:
-        vals, cols, lbls = zip(*nz)
-        wedges, _, auts = ax_pie.pie(
-            vals, colors=cols, autopct="%1.0f%%", startangle=90,
-            pctdistance=0.70,
-            wedgeprops={"linewidth": 2.5, "edgecolor": _C_BG},
-            textprops={"color": _C_WHITE, "fontsize": 8.5},
-        )
-        ax_pie.legend(wedges, lbls, loc="lower center",
-                      bbox_to_anchor=(0.5, -0.20),
-                      fontsize=8, frameon=False,
-                      labelcolor=_C_WHITE, ncol=len(nz))
-    else:
-        ax_pie.text(0, 0, "Нет игр", ha="center", va="center",
-                    color=_C_GRAY, fontsize=11)
-        ax_pie.set_aspect("equal")
-    ax_pie.set_title("W / L / D", color=_C_WHITE, fontsize=9.5, pad=4)
-
-    # ── KEY STATS ─────────────────────────────────────────
-    ax_st = fig.add_subplot(gs[0, 1])
-    ax_st.set_facecolor(_C_CARD)
-    ax_st.axis("off")
-    ax_st.set_title("Показатели", color=_C_WHITE, fontsize=9.5, pad=4)
-    rows = [
-        ("🏆 Побед",     f"{wins}  ({wr}%)", _C_GREEN),
-        ("❌ Поражений", f"{losses}",          _C_RED),
-        ("🎮 Всего игр", f"{total}",           _C_WHITE),
-        ("🔥 Стрик",     f"{streak}  (рек. {mstrk})", _C_ORANGE),
-        ("🐻 Медведей",  f"{bears}",           "#a1887f"),
+    # ── Fonts (DejaVu is standard on Ubuntu/Railway) ──────
+    _REG = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ]
+    _BOLD = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ]
+
+    def _font(paths: list, size: int):
+        for p in paths:
+            try:
+                return ImageFont.truetype(p, size)
+            except (OSError, IOError):
+                continue
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    f10  = _font(_REG,  10); f11 = _font(_REG,  11)
+    f12  = _font(_REG,  12); f14 = _font(_REG,  14)
+    fb12 = _font(_BOLD, 12); fb14 = _font(_BOLD, 14)
+    fb20 = _font(_BOLD, 20); fb24 = _font(_BOLD, 24)
+    fb28 = _font(_BOLD, 28)
+
+    # ── Draw helpers ──────────────────────────────────────
+    def _tw(s: str, font) -> int:
+        b = d.textbbox((0, 0), s, font=font)
+        return b[2] - b[0]
+
+    def tl(x, y, s, font, fill=WHITE):
+        d.text((x, y), s, font=font, fill=fill)
+
+    def tr(x, y, s, font, fill=WHITE):
+        d.text((x - _tw(s, font), y), s, font=font, fill=fill)
+
+    def tc(cx, y, s, font, fill=WHITE):
+        d.text((cx - _tw(s, font) // 2, y), s, font=font, fill=fill)
+
+    def rr(x1, y1, x2, y2, fill=CARD, r=10, outline=None):
+        try:
+            d.rounded_rectangle(
+                [x1, y1, x2, y2], radius=r, fill=fill,
+                outline=outline, width=1 if outline else 0,
+            )
+        except AttributeError:
+            d.rectangle([x1, y1, x2, y2], fill=fill, outline=outline)
+
+    def hrule(y, x1=25, x2=W-25):
+        d.line([(x1, y), (x2, y)], fill=TRACK, width=1)
+
+    # ══════════════════════════════════════════════════════
+    # HEADER
+    # ══════════════════════════════════════════════════════
+    tc(W//2, 12, display_name, fb24)
+    tc(W//2, 46,
+       f"{fmt(vrf)} VRF   |   Ур.{lvl} — {rnk}   |   W/R {wr}%",
+       f14, GOLD)
+
+    # ══════════════════════════════════════════════════════
+    # METRIC CARDS  (Победы / Поражения / Ничьи)
+    # ══════════════════════════════════════════════════════
+    CY1, CY2 = 76, 170
+    CW = (W - 40) // 3
+    for i, (lbl, val, col) in enumerate([
+        ("Победы",    wins,   GREEN),
+        ("Поражения", losses, RED),
+        ("Ничьи",     draws,  GRAY),
+    ]):
+        cx1 = 15 + i * (CW + 5)
+        cx2 = cx1 + CW
+        mid = (cx1 + cx2) // 2
+        rr(cx1, CY1, cx2, CY2)
+        tc(mid, CY1 + 8,  lbl, f11, MUTED)
+        tc(mid, CY1 + 30, str(val), fb28, col)
+        pv = round(val / max(1, total) * 100, 1)
+        tc(mid, CY1 + 74, f"{pv}%", f10, MUTED)
+
+    # ══════════════════════════════════════════════════════
+    # LEVEL PROGRESS BAR
+    # ══════════════════════════════════════════════════════
+    LY1 = 178
+    rr(15, LY1, W-15, LY1 + 56)
+    tl(25, LY1 + 8, f"Уровень {lvl} → {lvl+1}", f12, MUTED)
+    tr(W-25, LY1 + 8,
+       f"{int(pct*100)}%   |   {xp-c_xp:,} / {n_xp-c_xp:,} XP", f12, MUTED)
+    rr(25, LY1+32, W-25, LY1+50, fill=TRACK, r=9)
+    fw = max(18, int((W-50) * pct))
+    rr(25, LY1+32, 25+fw, LY1+50, fill=BLUE, r=9)
+
+    # ══════════════════════════════════════════════════════
+    # W / L / D  RATIO BAR
+    # ══════════════════════════════════════════════════════
+    WY1 = 242
+    rr(15, WY1, W-15, WY1 + 62)
+    tl(25, WY1 + 8, "W / L / D", f12, MUTED)
+
+    BX, BW = 25, W - 50
+    BY1, BY2 = WY1+30, WY1+46
+
+    rr(BX, BY1, BX+BW, BY2, fill=TRACK, r=8)   # track
+    if total > 0:
+        ww = int(BW * wins   / total)
+        lw = int(BW * losses / total)
+        dw = BW - ww - lw
+        gap = 3
+        # Wins
+        if ww > 0:
+            rr(BX, BY1, BX+ww, BY2, fill=GREEN, r=8)
+        # Losses
+        if lw > 0:
+            xl = BX + ww + (gap if ww else 0)
+            d.rectangle([xl, BY1, xl+lw, BY2], fill=RED)
+            if dw <= 0:  # round right end
+                rr(BX+BW-8, BY1, BX+BW, BY2, fill=RED, r=8)
+        # Draws
+        if dw > 0:
+            xd = BX + ww + lw + (gap*2 if (ww+lw) else 0)
+            d.rectangle([xd, BY1, BX+BW, BY2], fill=GRAY)
+            rr(BX+BW-8, BY1, BX+BW, BY2, fill=GRAY, r=8)
+        # Legend
+        lx = BX
+        for lc, lt, lv in [(GREEN,"Победы",wins),(RED,"Пор.",losses),(GRAY,"Ничья",draws)]:
+            d.ellipse([lx, BY2+5, lx+8, BY2+13], fill=lc)
+            tl(lx+12, BY2+4, f"{lt}: {lv}", f10, MUTED)
+            lx += 130
+    else:
+        tc(BX + BW//2, BY1+4, "Нет игр", f11, MUTED)
+
+    # ══════════════════════════════════════════════════════
+    # STATS TABLE
+    # ══════════════════════════════════════════════════════
+    TY = 312
+    rows = [
+        ("Всего игр",       str(total),                   WHITE),
+        ("Текущий стрик",   f"{streak}  (рекорд: {mstrk})", ORANGE),
+        ("Медведей",        str(bears),                   BROWN),
+        ("VRF от старта",   f"{p_sign}{fmt(profit)}",     p_col),
+        ("Всего побед",     str(wins),                    GREEN),
+    ]
+    RH = 40
+    TH = len(rows) * RH + 16
+    rr(15, TY, W-15, TY+TH)
     for i, (lbl, val, col) in enumerate(rows):
-        y = 0.84 - i * 0.175
-        ax_st.text(0.05, y, lbl, transform=ax_st.transAxes,
-                   color=_C_GRAY, fontsize=8.5)
-        ax_st.text(0.97, y, val, transform=ax_st.transAxes,
-                   color=col, fontsize=8.5, ha="right", fontweight="bold")
-
-    # ── LEVEL PROGRESS ────────────────────────────────────
-    ax_lv = fig.add_subplot(gs[0, 2])
-    ax_lv.set_facecolor(_C_CARD)
-    ax_lv.axis("off")
-    ax_lv.set_title(f"Ур. {lvl} → {lvl+1}", color=_C_WHITE, fontsize=9.5, pad=4)
-    # Track
-    ax_lv.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.30), 0.90, 0.22, boxstyle="round,pad=0.01",
-        linewidth=0, facecolor="#21262d", transform=ax_lv.transAxes, clip_on=False))
-    # Fill
-    fill_w = max(0.008, 0.90 * pct)
-    ax_lv.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.30), fill_w, 0.22, boxstyle="round,pad=0.01",
-        linewidth=0, facecolor=_C_BLUE, transform=ax_lv.transAxes, clip_on=False))
-    ax_lv.text(0.5, 0.72, f"{int(pct*100)}%",
-               ha="center", color=_C_WHITE, fontsize=15, fontweight="bold",
-               transform=ax_lv.transAxes)
-    ax_lv.text(0.5, 0.12,
-               f"{xp - c_xp:,} / {n_xp - c_xp:,} XP",
-               ha="center", color=_C_GRAY, fontsize=8.5, transform=ax_lv.transAxes)
-
-    # ── VRF BAR: start vs now ─────────────────────────────
-    ax_bar = fig.add_subplot(gs[1, 1:])
-    ax_bar.set_facecolor(_C_CARD)
-    cats  = [f"Старт\n{fmt(STARTING_VRF)}", f"Сейчас\n{fmt(vrf)}"]
-    vals2 = [STARTING_VRF, vrf]
-    bcols = [_C_GRAY, _C_GREEN if vrf >= STARTING_VRF else _C_RED]
-    bars  = ax_bar.bar(cats, vals2, color=bcols, width=0.42,
-                        edgecolor=_C_BG, linewidth=2)
-    for bar, val in zip(bars, vals2):
-        ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(vals2) * 0.03,
-                    fmt(val), ha="center", va="bottom",
-                    color=_C_WHITE, fontsize=10, fontweight="bold")
-    ax_bar.set_title(f"VRF Баланс  ({p_sign}{fmt(profit)} от старта)",
-                     color=p_col, fontsize=9.5, pad=4)
-    ax_bar.tick_params(colors=_C_WHITE, labelsize=8.5)
-    ax_bar.spines[:].set_visible(False)
-    ax_bar.set_yticks([])
-    ax_bar.set_facecolor(_C_CARD)
+        ry = TY + 10 + i * RH
+        tl(25, ry, lbl, f14, MUTED)
+        tr(W-25, ry, val, fb14, col)
+        if i < len(rows)-1:
+            hrule(ry + RH - 2)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight", facecolor=_C_BG)
-    plt.close(fig)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
 
@@ -1135,9 +1200,9 @@ async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if img_bytes is None:
         await update.message.reply_text(
-            "❌ <b>matplotlib не установлен!</b>\n\n"
+            "❌ <b>Pillow не установлен!</b>\n\n"
             "Добавь в <code>requirements.txt</code>:\n"
-            "<code>matplotlib</code>",
+            "<code>Pillow</code>",
             parse_mode=ParseMode.HTML,
         )
         return

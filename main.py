@@ -738,60 +738,51 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     rich_h = (
         "<h1>📖 Verifure Game — Помощь</h1>"
+        "<h3>👤 Профиль &amp; Активность</h3>"
+        "<ul>"
+        "<li>/profile — профиль и баланс VRF</li>"
+        "<li>/top — 🏆 топ игроков <i>(VRF / Уровень / Победы)</i></li>"
+        "<li>/stats — 📊 статистика чата</li>"
+        "<li>/daily — ⚡ ежедневный бонус</li>"
+        "<li>/bonus — статус всех кулдаунов</li>"
+        "</ul>"
         "<h3>🎮 Игры <i>(ответом на сообщение соперника)</i></h3>"
         "<ul>"
-        "<details closed><summary>👤 Профиль и Активность</summary>"
-        "<ul>"
-        "<footer>→ 👤 /profile — профиль и баланс VRF <i>(поддержка reply)</footer>"
-        "<footer>→ 🏆 /top — топ игроков <i>(VRF / Уровень / Победы)</i></footer>"
-        "<footer>→ 📊 /stats — статистика чата</footer>"
-        "<footer>→ ⚡ /daily — ежедневный бонус</footer>"
-        "<footer>→ ⭐ /bonus — статус всех кулдаунов</footer>"
-        "<footer>→ 📖 /help — посмотреть все команды</footer>"
+        "<li>/duel — ⚔️ Дуэль на VRF</li>"
+        "<li>/cubes <code>[раунды] [ставка]</code> — 🎲 Кубики</li>"
+        "<li>/basket — 🏀 Баскетбол</li>"
+        "<li>/football — ⚽ Футбол</li>"
+        "<li>/bowling — 🎳 Боулинг</li>"
+        "<li>/darts — 🎯 Дартс</li>"
+        "<li>/slot — 🎰 Слот-машина PvP</li>"
+        "<li>/mines — 💣 Мины <i>(соло)</i></li>"
+        "<li>/tictac — ❌⭕ Крестики-нолики</li>"
         "</ul>"
-        "</details>"
-        "</ul>"
-        "<details closed><summary>🎮 Игры</summary>"
-        "<ul>"
-        "<footer>→ ⚔️ /duel — ⚔️ Дуэль на VRF <i>(reply)</i></footer>"
-        "<footer>→ 🎲 /cubes — <code>[раунды] [ставка]</code></footer>"
-        "<footer>→ 🏀 /basket — Баскетбол <i>(reply)</i></footer>"
-        "<footer>→ ⚽ /football — Футбол <i>(reply)</i></footer>"
-        "<footer>→ 🎳 /bowling — Боулинг <i>(reply)</i></footer>"
-        "<footer>→ 🎯 /darts — Дартс <i>(reply)</i></footer>"
-        "<footer>→ 🎰 /slot — Слот-машина PvP <i>(reply)</i></footer>"
-        "<footer>→ 💣 /mines — Мины <i>(соло) <i>(reply)</i></i></footer>"
-        "<footer>→ ❌⭕ /tictac — Крестики-нолики <i>(reply)</i></footer>"
-        "</ul>"
-        "</details>"
-        "</ul>"
-        "<details closed><summary>ЕЩЁ</summary>"
+        "<h3>💒 Браки</h3>"
         "<ul>"
         "<li>/marry — предложение руки и сердца</li>"
         "<li>/accept · /reject — ответ на предложение</li>"
         "<li>/divorce — развод · /marriage — карточка пары</li>"
         "<li>/marriages — все пары чата</li>"
         "</ul>"
-        "<details closed><summary>🎁 Активности</summary>"
+        "<h3>🎁 Активности</h3>"
         "<ul>"
         "<li>/gift — 🎁 подарить VRF <i>(ответом, стоит 75 VRF)</i></li>"
         "<li>/love — ❤️ послать любовь <i>(ответом, +VRF обоим)</i></li>"
         "</ul>"
-        "</details>"
-        "<ul>"
-        "<details closed><summary>🛡️ Администраторы</summary>"
+        "<h3>🛡️ Администраторы</h3>"
         "<ul>"
         "<li>/admin — панель управления</li>"
         "<li>/givevrf <code>&lt;n&gt;</code> · /takevrf <code>&lt;n&gt;</code> — выдать/забрать VRF</li>"
         "<li>/givebear · /addadmin · /removeadmin · /listadmins</li>"
         "</ul>"
-        "</details>"
-        "<ul>"
-        "<details closed><summary>⚙️ Механика</summary>"
+        "<hr/>"
+        "<details open><summary>⚙️ Механика</summary>"
         "<ul>"
         f"<li>Начальный баланс: <b>{STARTING_VRF} VRF</b></li>"
         f"<li>Ежедневный бонус: <b>{DAILY_BONUS_BASE} VRF</b> + стрик (до +60)</li>"
@@ -812,8 +803,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id)
-    
-    
+
+
 # ══════════════════════════════════════════════════════
 #           PROFILE & LEADERBOARD
 # ══════════════════════════════════════════════════════
@@ -2199,15 +2190,32 @@ async def cmd_listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 #           TIC-TAC-TOE GAME ❌⭕
 # ══════════════════════════════════════════════════════
 
-TTT_BET = 50  # Fixed max bet for tic-tac-toe
+TTT_SIZES: dict = {
+    3: {"win": 3, "label": "3×3"},
+    5: {"win": 4, "label": "5×5"},
+    8: {"win": 5, "label": "8×8"},
+}
 
 
-def ttt_check_winner(board: list) -> Optional[str]:
-    """Returns 'X' or 'O' if there is a winner, else None."""
-    wins = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
-    for a, b, cc in wins:
-        if board[a] and board[a] == board[b] == board[cc]:
-            return board[a]
+def ttt_check_winner(board: list, size: int = 3, win: int = 3) -> Optional[str]:
+    """Returns 'X' or 'O' if `win` consecutive marks found, else None."""
+    for r in range(size):
+        for col in range(size):
+            sym = board[r * size + col]
+            if not sym:
+                continue
+            # Horizontal →
+            if col + win <= size and all(board[r * size + col + k] == sym for k in range(win)):
+                return sym
+            # Vertical ↓
+            if r + win <= size and all(board[(r + k) * size + col] == sym for k in range(win)):
+                return sym
+            # Diagonal ↘
+            if r + win <= size and col + win <= size and all(board[(r+k)*size+(col+k)] == sym for k in range(win)):
+                return sym
+            # Diagonal ↙
+            if r + win <= size and col - win + 1 >= 0 and all(board[(r+k)*size+(col-k)] == sym for k in range(win)):
+                return sym
     return None
 
 
@@ -2215,12 +2223,12 @@ def _ttt_sym(s: str) -> str:
     return {"X": "❌", "O": "⭕", "": "⬜"}.get(s, "⬜")
 
 
-def ttt_board_kb(game_id: str, board: list, locked: bool = False) -> InlineKeyboardMarkup:
+def ttt_board_kb(game_id: str, board: list, size: int = 3, locked: bool = False) -> InlineKeyboardMarkup:
     rows = []
-    for r in range(3):
+    for r in range(size):
         row = []
-        for col in range(3):
-            i   = r * 3 + col
+        for col in range(size):
+            i   = r * size + col
             sym = _ttt_sym(board[i])
             cb  = "ttt:noop" if (locked or board[i]) else f"ttt:{game_id}:{i}"
             row.append(InlineKeyboardButton(sym, callback_data=cb))
@@ -2247,48 +2255,31 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hu = await db_get_user(host.id, cid)
     ou = await db_get_user(opponent.id, cid)
 
-    bet = min(calc_bet(hu["vrf"], ou["vrf"]), TTT_BET)
-    bet = max(bet, MIN_BET)
-    if hu["vrf"] < bet or ou["vrf"] < bet:
-        await update.message.reply_text(f"❌ Недостаточно VRF! Нужно минимум {bet} VRF у обоих.")
+    bet = calc_bet(hu["vrf"], ou["vrf"])
+    bet = max(bet, 1)
+    if hu["vrf"] < 1 or ou["vrf"] < 1:
+        await update.message.reply_text("❌ Недостаточно VRF!")
         return
 
-    game_id = str(uuid.uuid4())[:8]
-    ttt_games[game_id] = {
-        "host_id": host.id,     "host_name": host.first_name,
-        "opp_id":  opponent.id, "opp_name":  opponent.first_name,
-        "cid": cid, "bet": bet, "state": "waiting",
-        "board": [""] * 9,
-        "turn": "host",   # "host" plays X, "opp" plays O
-    }
-
-    msg = await update.message.reply_text(
-        f"❌⭕ <b>Крестики-нолики!</b>\n\n"        
-        f"❌ {mention(host.id, host.first_name)}\n"
-        f"⭕ {mention(opponent.id, opponent.first_name)}\n\n"
-        f"💎 Ставка: <b>{bet} VRF</b>\n\n"
-        f"{mention(opponent.id, opponent.first_name)}, принимаешь вызов?",
+    o_m = mention(opponent.id, opponent.first_name)
+    await update.message.reply_text(
+        f"❌⭕ <b>Крестики-нолики</b>\n\n"
+        f"⚔️ {mention(host.id, host.first_name)} vs {o_m}\n"
+        f"💎 Расчётная ставка: <b>{bet} VRF</b>\n\n"
+        f"📐 Выбери размер поля:",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"⭕ Принять — {bet} VRF", callback_data=f"ttj:{game_id}"),
-            InlineKeyboardButton("❌ Отказать",              callback_data=f"ttd:{game_id}"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("3×3  (3 в ряд)",
+                    callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:3"),
+                InlineKeyboardButton("5×5  (4 в ряд)",
+                    callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:5"),
+                InlineKeyboardButton("8×8  (5 в ряд)",
+                    callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:8"),
+            ],
+            [InlineKeyboardButton("❌ Отмена", callback_data="ttsz:cancel")],
+        ]),
     )
-
-    bot = context.bot
-    mid = msg.message_id
-
-    async def auto_cancel():
-        await asyncio.sleep(JOIN_TIMEOUT)
-        if game_id in ttt_games and ttt_games[game_id]["state"] == "waiting":
-            del ttt_games[game_id]
-            try:
-                await bot.edit_message_reply_markup(cid, mid, reply_markup=None)
-                await bot.send_message(cid, "⏰ Приглашение в крестики-нолики истекло.")
-            except TelegramError:
-                pass
-
-    context.application.create_task(auto_cancel())
 
 
 # ══════════════════════════════════════════════════════
@@ -2317,6 +2308,57 @@ async def on_casino_777(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _react(update, "🎉")
     except TelegramError:
         pass
+
+
+
+# ══════════════════════════════════════════════════════
+#           CANCEL COMMAND — /cancel / отмена
+# ══════════════════════════════════════════════════════
+
+@only_groups
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel all waiting/pending games the user is in."""
+    uid       = update.effective_user.id
+    cid       = update.effective_chat.id
+    cancelled = []
+
+    # Duel challenges (challenger or opponent)
+    for k in [k for k, v in list(duel_challenges.items())
+              if k.startswith(f"{cid}:") and (v.get("c_id") == uid or v.get("o_id") == uid)]:
+        del duel_challenges[k]
+        cancelled.append("⚔️ Дуэль")
+
+    # Cubes (waiting)
+    for k, v in list(cubes_games.items()):
+        if v["cid"] == cid and v["state"] == "waiting" and uid in (v["host_id"], v["opp_id"]):
+            del cubes_games[k]
+            cancelled.append("🎲 Кубики")
+
+    # Sports (waiting)
+    for k, v in list(sports_games.items()):
+        if v.get("cid") == cid and v.get("state") == "waiting" and uid in (v.get("host_id"), v.get("opp_id")):
+            del sports_games[k]
+            cancelled.append("🏅 Спорт")
+
+    # Slot (active, not yet spun fully)
+    for k, v in list(slot_games.items()):
+        if v["cid"] == cid and uid in (v["host_id"], v["opp_id"]):
+            del slot_games[k]
+            cancelled.append("🎰 Слот")
+
+    # TTT (waiting invite)
+    for k, v in list(ttt_games.items()):
+        if v["cid"] == cid and v["state"] == "waiting" and uid in (v["host_id"], v["opp_id"]):
+            del ttt_games[k]
+            cancelled.append("❌⭕ Крестики-нолики")
+
+    if cancelled:
+        await update.message.reply_text(
+            f"✅ <b>Отменено:</b> {', '.join(cancelled)}",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("❌ Нет ожидающих игр для отмены")
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2677,6 +2719,91 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
         return
 
+    # ── TTT size selection ──────────────────────────────
+    if data.startswith("ttsz:"):
+        if data == "ttsz:cancel":
+            await query.answer("Отменено")
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
+            return
+
+        parts  = data.split(":")
+        h_id   = int(parts[1])
+        o_id   = int(parts[2])
+        cid2   = int(parts[3])
+        size   = int(parts[4])
+
+        if who.id != h_id:
+            await query.answer("❌ Выбор только для хоста!", show_alert=True)
+            return
+
+        sz_cfg = TTT_SIZES.get(size)
+        if not sz_cfg:
+            await query.answer("❌ Неверный размер", show_alert=True)
+            return
+
+        hu = await db_get_user(h_id, cid2)
+        ou = await db_get_user(o_id, cid2)
+        if not hu or not ou:
+            await query.answer("❌ Пользователи не найдены", show_alert=True)
+            return
+
+        bet = max(calc_bet(hu["vrf"], ou["vrf"]), 1)
+        if hu["vrf"] < 1:
+            await query.answer("❌ Недостаточно VRF!", show_alert=True)
+            return
+        if ou["vrf"] < 1:
+            await query.answer("❌ У соперника недостаточно VRF!", show_alert=True)
+            return
+
+        win   = sz_cfg["win"]
+        label = sz_cfg["label"]
+
+        game_id = str(uuid.uuid4())[:8]
+        ttt_games[game_id] = {
+            "host_id": h_id,  "host_name": hu["first_name"],
+            "opp_id":  o_id,  "opp_name":  ou["first_name"],
+            "cid": cid2, "bet": bet, "state": "waiting",
+            "board": [""] * (size * size),
+            "turn": "host",
+            "size": size,
+            "win":  win,
+        }
+
+        await query.answer(f"Поле {label} выбрано!")
+        h_m = mention(h_id, hu["first_name"])
+        o_m = mention(o_id, ou["first_name"])
+
+        await query.edit_message_text(
+            f"❌⭕ <b>Крестики-нолики!</b>\n\n"
+            f"❌ {h_m}\n"
+            f"⭕ {o_m}\n\n"
+            f"📐 Поле: <b>{label}</b> — победа при <b>{win} в ряд</b>\n"
+            f"💎 Ставка: <b>{bet} VRF</b>\n\n"
+            f"{o_m}, принимаешь вызов?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"⭕ Принять — {bet} VRF", callback_data=f"ttj:{game_id}"),
+                InlineKeyboardButton("❌ Отказать",              callback_data=f"ttd:{game_id}"),
+            ]]),
+        )
+
+        bot = context.bot
+        msg_id = query.message.message_id
+        async def _ttsz_timeout():
+            await asyncio.sleep(JOIN_TIMEOUT)
+            if game_id in ttt_games and ttt_games[game_id]["state"] == "waiting":
+                del ttt_games[game_id]
+                try:
+                    await bot.edit_message_reply_markup(cid2, msg_id, reply_markup=None)
+                    await bot.send_message(cid2, "⏰ Приглашение в крестики-нолики истекло.")
+                except TelegramError:
+                    pass
+        context.application.create_task(_ttsz_timeout())
+        return
+
     # ── TTT invite ──────────────────────────────────────
     if data.startswith("ttj:") or data.startswith("ttd:"):
         game_id = data[4:]
@@ -2716,6 +2843,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         game["state"] = "playing"
+        sz   = game.get("size", 3)
+        win  = game.get("win",  3)
         await query.answer("❌⭕ Начинаем!")
         h_m = mention(game["host_id"], game["host_name"])
         o_m = mention(who.id, who.first_name)
@@ -2723,10 +2852,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"❌⭕ <b>Крестики-нолики!</b>\n\n"
             f"❌ {h_m}\n"
             f"⭕ {o_m}\n\n"
+            f"📐 Поле: <b>{sz}×{sz}</b> | Победа: <b>{win} в ряд</b>\n"
             f"💎 Ставка: <b>{bet} VRF</b>\n\n"
             f"🎮 Ход: {h_m} (❌)",
             parse_mode=ParseMode.HTML,
-            reply_markup=ttt_board_kb(game_id, game["board"]),
+            reply_markup=ttt_board_kb(game_id, game["board"], sz),
         )
         return
 
@@ -2772,7 +2902,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bet = game["bet"]
         board_snap = game["board"][:]
 
-        winner = ttt_check_winner(game["board"])
+        sz = game.get("size", 3)
+        wn = game.get("win",  3)
+        winner = ttt_check_winner(game["board"], sz, wn)
         if winner:
             game["state"] = "over"
             w_id   = game["host_id"] if winner == "X" else game["opp_id"]
@@ -2795,7 +2927,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🏆 Победитель: <b>{mention(w_id, w_name)}</b>\n"
                 f"💎 +{bet} VRF → Баланс: {fmt(new_bal)} VRF",
                 parse_mode=ParseMode.HTML,
-                reply_markup=ttt_board_kb(game_id, board_snap, locked=True),
+                reply_markup=ttt_board_kb(game_id, board_snap, sz, locked=True),
             )
             return
 
@@ -2811,7 +2943,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"⭕ {o_m}\n\n"
                 f"🤝 Ничья! Ставки возвращены.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=ttt_board_kb(game_id, board_snap, locked=True),
+                reply_markup=ttt_board_kb(game_id, board_snap, sz, locked=True),
             )
             return
 
@@ -2825,10 +2957,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"❌⭕ <b>Крестики-нолики!</b>\n\n"
             f"❌ {h_m}\n"
             f"⭕ {o_m}\n\n"
+            f"📐 Поле: <b>{sz}×{sz}</b> | Победа: <b>{wn} в ряд</b>\n"
             f"💎 Ставка: <b>{bet} VRF</b>\n\n"
             f"🎮 Ход: {next_m} ({next_sym})",
             parse_mode=ParseMode.HTML,
-            reply_markup=ttt_board_kb(game_id, game["board"]),
+            reply_markup=ttt_board_kb(game_id, game["board"], sz),
         )
         return
 
@@ -3198,9 +3331,167 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if u.is_bot:
         return
 
-    cid = update.effective_chat.id
+    cid  = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    low  = text.lower()
+    pts  = low.split()
+    word = pts[0] if pts else ""
+
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
 
+    # ── Text shortcuts ────────────────────────────────────
+    # б / баланс → balance
+    if word in ("б", "баланс", "balance", "bal"):
+        uu = await db_get_user(u.id, cid)
+        bal = uu["vrf"] if uu else 0
+        lvl = get_level(uu["experience"]) if uu else 1
+        await update.message.reply_text(
+            f"💎 {mention(u.id, u.first_name)}: <b>{fmt(bal)} VRF</b>  |  🏅 Ур. {lvl}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # топ → leaderboard
+    if word in ("топ", "top", "лидеры"):
+        await _show_top(update, context, cid, "vrf")
+        return
+
+    # проф / профиль → profile (reuse cmd_profile logic)
+    if word in ("проф", "профиль", "профа", "пр"):
+        context.args = []
+        await cmd_profile(update, context)
+        return
+
+    # бонус → daily status
+    if word in ("бонус", "bonus"):
+        await cmd_bonus(update, context)
+        return
+
+    # ── Transfer: пер [сумма] (с реплеем или @username [сумма]) ─
+    if word in ("пер", "перевод", "send", "tr"):
+        sender = u
+        amount_str = pts[1] if len(pts) > 1 else ""
+        recipient  = None
+
+        # Resolve recipient
+        if update.message.reply_to_message and not update.message.reply_to_message.from_user.is_bot:
+            recipient = update.message.reply_to_message.from_user
+        elif len(pts) >= 3 and pts[1].startswith("@"):
+            # "пер @username 500"
+            uname_query = pts[1].lstrip("@").lower()
+            amount_str  = pts[2] if len(pts) > 2 else ""
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT * FROM users WHERE LOWER(username)=? AND chat_id=? LIMIT 1",
+                    (uname_query, cid)
+                ) as cur:
+                    row = await cur.fetchone()
+            if row:
+                class _FakeUser:
+                    id = row["user_id"]
+                    first_name = row["first_name"]
+                    is_bot = False
+                recipient = _FakeUser()
+            else:
+                await update.message.reply_text(f"❌ Пользователь @{uname_query} не найден в этом чате")
+                return
+
+        if not recipient:
+            await update.message.reply_text(
+                "❌ Ответь на сообщение получателя или укажи <b>@username</b>:\n"
+                "<code>пер 500</code> (с реплеем) / <code>пер @username 500</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if recipient.id == sender.id:
+            await update.message.reply_text("❌ Нельзя переводить себе!")
+            return
+
+        try:
+            amount = int(amount_str.replace(",", "").replace(".", ""))
+        except (ValueError, AttributeError):
+            await update.message.reply_text("❌ Укажи сумму: <code>пер 500</code>", parse_mode=ParseMode.HTML)
+            return
+
+        if amount < 1:
+            await update.message.reply_text("❌ Сумма должна быть минимум 1 VRF!")
+            return
+
+        await db_ensure_user(recipient.id, cid, getattr(recipient, "username", "") or "", recipient.first_name)
+        su = await db_get_user(sender.id, cid)
+        if su["vrf"] < amount:
+            await update.message.reply_text(
+                f"❌ Недостаточно VRF! Есть: <b>{fmt(su['vrf'])}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await db_deduct_vrf(sender.id, cid, amount)
+        new_bal = await db_add_vrf(recipient.id, cid, amount)
+
+        await update.message.reply_text(
+            f"💸 <b>Перевод!</b>\n\n"
+            f"От: {mention(sender.id, sender.first_name)}\n"
+            f"Кому: {mention(recipient.id, recipient.first_name)}\n"
+            f"💎 Сумма: <b>{fmt(amount)} VRF</b>\n"
+            f"💰 Баланс получателя: <b>{fmt(new_bal)} VRF</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ── Cube dice: куб [1-6] [ставка] ─────────────────────
+    if word in ("куб", "кубик", "dice") and len(pts) >= 3:
+        try:
+            val = int(pts[1])
+            bet = int(pts[2].replace(",", ""))
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Формат: <code>куб [1-6] [ставка]</code>\nПример: <code>куб 4 500</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if not 1 <= val <= 6:
+            await update.message.reply_text("❌ Число должно быть от <b>1</b> до <b>6</b>!", parse_mode=ParseMode.HTML)
+            return
+        if bet < 1:
+            await update.message.reply_text("❌ Ставка минимум 1 VRF!")
+            return
+
+        uu = await db_get_user(u.id, cid)
+        if uu["vrf"] < bet:
+            await update.message.reply_text(
+                f"❌ Недостаточно VRF! Есть: <b>{fmt(uu['vrf'])}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        dice_msg = await context.bot.send_dice(chat_id=cid, emoji="🎲")
+        rolled   = dice_msg.dice.value
+        await asyncio.sleep(4)
+
+        if rolled == val:
+            gain    = bet * 5
+            new_bal = await db_add_vrf(u.id, cid, gain)
+            await update.message.reply_text(
+                f"🎲 Выпало <b>{rolled}</b> — УГАДАЛ! ✅\n\n"
+                f"💎 +{fmt(gain)} VRF (×5)\n"
+                f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            new_bal = await db_deduct_vrf(u.id, cid, bet)
+            await update.message.reply_text(
+                f"🎲 Выпало <b>{rolled}</b> — промах! ❌\n\n"
+                f"💸 -{fmt(bet)} VRF\n"
+                f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    # ── XP from regular messages ──────────────────────────
     if not await db_can_earn_xp(u.id, cid):
         return
 
@@ -3257,6 +3548,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("slot",     "🎰 Слот PvP (ответом)"),
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
+        BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
         BotCommand("marriages","👫 Все пары"),
@@ -3312,6 +3604,7 @@ def main() -> None:
     app.add_handler(CommandHandler("slot",    cmd_slot))
     app.add_handler(CommandHandler("mines",   cmd_mines))
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
+    app.add_handler(CommandHandler(["cancel", "отмена"], cmd_cancel))
 
     # Admin
     app.add_handler(CommandHandler("admin",        cmd_admin))

@@ -8,6 +8,7 @@ Admin ID: 6254951831
 """
 
 import asyncio
+import io
 import logging
 import math
 import os
@@ -225,6 +226,154 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("verifure")
+
+
+# ══════════════════════════════════════════════════════
+#          STATISTICS IMAGE GENERATOR 📊
+# ══════════════════════════════════════════════════════
+
+# Chart palette (matches dark Telegram theme)
+_C_BG     = '#0d1117'
+_C_CARD   = '#161b22'
+_C_GOLD   = '#e3b341'
+_C_GREEN  = '#3fb950'
+_C_RED    = '#f85149'
+_C_BLUE   = '#2a78d6'
+_C_GRAY   = '#484f58'
+_C_WHITE  = '#c9d1d9'
+_C_ORANGE = '#d29922'
+_C_PURPLE = '#8b5cf6'
+
+
+def _stats_image_sync(u: dict, display_name: str) -> Optional[bytes]:
+    """Sync matplotlib image — call via run_in_executor."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.gridspec import GridSpec
+    except ImportError:
+        return None
+
+    wins   = int(u.get("wins", 0))
+    losses = int(u.get("losses", 0))
+    draws  = int(u.get("draws", 0))
+    total  = int(u.get("total_games", 0))
+    vrf    = int(u.get("vrf", 0))
+    streak = int(u.get("win_streak", 0))
+    mstrk  = int(u.get("max_streak", 0))
+    bears  = int(u.get("bears", 0))
+    xp     = int(u.get("experience", 0))
+    lvl    = get_level(xp)
+    rnk    = get_rank(lvl)
+    _, c_xp, n_xp, pct = get_progress(xp)
+    wr     = round(wins / max(1, total) * 100, 1)
+    profit = vrf - STARTING_VRF
+    p_sign = "+" if profit >= 0 else ""
+    p_col  = _C_GREEN if profit >= 0 else _C_RED
+
+    fig = plt.figure(figsize=(10.5, 5.5), facecolor=_C_BG, dpi=120)
+    gs  = GridSpec(2, 3, figure=fig, wspace=0.38, hspace=0.52,
+                   left=0.05, right=0.97, top=0.82, bottom=0.13)
+
+    # ── Header ────────────────────────────────────────────
+    fig.text(0.5, 0.96, display_name, fontsize=18,
+             color=_C_WHITE, ha="center", va="top", fontweight="bold")
+    fig.text(0.5, 0.90,
+             f"💎 {fmt(vrf)} VRF   ·   Уровень {lvl} — {rnk}   ·   W/R {wr}%",
+             fontsize=10.5, color=_C_GOLD, ha="center", va="top")
+
+    # ── PIE — W / L / D ──────────────────────────────────
+    ax_pie = fig.add_subplot(gs[:, 0])
+    ax_pie.set_facecolor(_C_CARD)
+    pairs = [(wins, _C_GREEN, f"Победы\n{wins}"),
+             (losses, _C_RED, f"Пораж.\n{losses}"),
+             (draws, _C_GRAY, f"Ничья\n{draws}")]
+    nz = [(v, c, l) for v, c, l in pairs if v > 0]
+    if nz:
+        vals, cols, lbls = zip(*nz)
+        wedges, _, auts = ax_pie.pie(
+            vals, colors=cols, autopct="%1.0f%%", startangle=90,
+            pctdistance=0.70,
+            wedgeprops={"linewidth": 2.5, "edgecolor": _C_BG},
+            textprops={"color": _C_WHITE, "fontsize": 8.5},
+        )
+        ax_pie.legend(wedges, lbls, loc="lower center",
+                      bbox_to_anchor=(0.5, -0.20),
+                      fontsize=8, frameon=False,
+                      labelcolor=_C_WHITE, ncol=len(nz))
+    else:
+        ax_pie.text(0, 0, "Нет игр", ha="center", va="center",
+                    color=_C_GRAY, fontsize=11)
+        ax_pie.set_aspect("equal")
+    ax_pie.set_title("W / L / D", color=_C_WHITE, fontsize=9.5, pad=4)
+
+    # ── KEY STATS ─────────────────────────────────────────
+    ax_st = fig.add_subplot(gs[0, 1])
+    ax_st.set_facecolor(_C_CARD)
+    ax_st.axis("off")
+    ax_st.set_title("Показатели", color=_C_WHITE, fontsize=9.5, pad=4)
+    rows = [
+        ("🏆 Побед",     f"{wins}  ({wr}%)", _C_GREEN),
+        ("❌ Поражений", f"{losses}",          _C_RED),
+        ("🎮 Всего игр", f"{total}",           _C_WHITE),
+        ("🔥 Стрик",     f"{streak}  (рек. {mstrk})", _C_ORANGE),
+        ("🐻 Медведей",  f"{bears}",           "#a1887f"),
+    ]
+    for i, (lbl, val, col) in enumerate(rows):
+        y = 0.84 - i * 0.175
+        ax_st.text(0.05, y, lbl, transform=ax_st.transAxes,
+                   color=_C_GRAY, fontsize=8.5)
+        ax_st.text(0.97, y, val, transform=ax_st.transAxes,
+                   color=col, fontsize=8.5, ha="right", fontweight="bold")
+
+    # ── LEVEL PROGRESS ────────────────────────────────────
+    ax_lv = fig.add_subplot(gs[0, 2])
+    ax_lv.set_facecolor(_C_CARD)
+    ax_lv.axis("off")
+    ax_lv.set_title(f"Ур. {lvl} → {lvl+1}", color=_C_WHITE, fontsize=9.5, pad=4)
+    # Track
+    ax_lv.add_patch(mpatches.FancyBboxPatch(
+        (0.05, 0.30), 0.90, 0.22, boxstyle="round,pad=0.01",
+        linewidth=0, facecolor="#21262d", transform=ax_lv.transAxes, clip_on=False))
+    # Fill
+    fill_w = max(0.008, 0.90 * pct)
+    ax_lv.add_patch(mpatches.FancyBboxPatch(
+        (0.05, 0.30), fill_w, 0.22, boxstyle="round,pad=0.01",
+        linewidth=0, facecolor=_C_BLUE, transform=ax_lv.transAxes, clip_on=False))
+    ax_lv.text(0.5, 0.72, f"{int(pct*100)}%",
+               ha="center", color=_C_WHITE, fontsize=15, fontweight="bold",
+               transform=ax_lv.transAxes)
+    ax_lv.text(0.5, 0.12,
+               f"{xp - c_xp:,} / {n_xp - c_xp:,} XP",
+               ha="center", color=_C_GRAY, fontsize=8.5, transform=ax_lv.transAxes)
+
+    # ── VRF BAR: start vs now ─────────────────────────────
+    ax_bar = fig.add_subplot(gs[1, 1:])
+    ax_bar.set_facecolor(_C_CARD)
+    cats  = [f"Старт\n{fmt(STARTING_VRF)}", f"Сейчас\n{fmt(vrf)}"]
+    vals2 = [STARTING_VRF, vrf]
+    bcols = [_C_GRAY, _C_GREEN if vrf >= STARTING_VRF else _C_RED]
+    bars  = ax_bar.bar(cats, vals2, color=bcols, width=0.42,
+                        edgecolor=_C_BG, linewidth=2)
+    for bar, val in zip(bars, vals2):
+        ax_bar.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(vals2) * 0.03,
+                    fmt(val), ha="center", va="bottom",
+                    color=_C_WHITE, fontsize=10, fontweight="bold")
+    ax_bar.set_title(f"VRF Баланс  ({p_sign}{fmt(profit)} от старта)",
+                     color=p_col, fontsize=9.5, pad=4)
+    ax_bar.tick_params(colors=_C_WHITE, labelsize=8.5)
+    ax_bar.spines[:].set_visible(False)
+    ax_bar.set_yticks([])
+    ax_bar.set_facecolor(_C_CARD)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight", facecolor=_C_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 
@@ -928,6 +1077,59 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("📤 Поделиться", switch_inline_query=f"ref {u.id}"),
         ]]),
+    )
+
+
+# ══════════════════════════════════════════════════════
+#         STATS IMAGE COMMAND 📊
+# ══════════════════════════════════════════════════════
+
+@only_groups
+async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send statistics as a styled image card."""
+    if update.message.reply_to_message and not update.message.reply_to_message.from_user.is_bot:
+        target = update.message.reply_to_message.from_user
+    else:
+        target = update.effective_user
+
+    cid = update.effective_chat.id
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+    u = await db_get_user(target.id, cid)
+    if not u:
+        return
+
+    display = f"@{u['username']}" if u.get("username") else u.get("first_name", "Игрок")
+
+    # Run in executor to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+    img_bytes = await loop.run_in_executor(None, _stats_image_sync, u, display)
+
+    if img_bytes is None:
+        await update.message.reply_text(
+            "❌ <b>matplotlib не установлен!</b>\n\n"
+            "Добавь в <code>requirements.txt</code>:\n"
+            "<code>matplotlib</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lvl     = get_level(u["experience"])
+    wr      = round(u["wins"] / max(1, u["total_games"]) * 100, 1)
+    profit  = u["vrf"] - STARTING_VRF
+    p_sign  = "+" if profit >= 0 else ""
+
+    caption = (
+        f"📊 <b>Статистика {mention(target.id, u['first_name'])}</b>\n"
+        f"💎 {fmt(u['vrf'])} VRF  ·  Уровень {lvl} — {get_rank(lvl)}\n"
+        f"🏆 {u['wins']} побед ({wr}%)  ·  🎮 {u['total_games']} игр\n"
+        f"💰 Баланс от старта: <b>{p_sign}{fmt(profit)} VRF</b>"
+    )
+
+    await context.bot.send_photo(
+        chat_id=cid,
+        photo=io.BytesIO(img_bytes),
+        caption=caption,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -4240,6 +4442,7 @@ async def on_startup(app: Application) -> None:
     cmds = [
         BotCommand("start",    "🏠 Старт / Главное меню"),
         BotCommand("profile",  "👤 Мой профиль"),
+        BotCommand("statsimg", "📊 Статистика картинкой"),
         BotCommand("top",      "🏆 Топ игроков"),
         BotCommand("stats",    "📊 Статистика чата"),
         BotCommand("daily",    "⚡ Ежедневный бонус"),
@@ -4285,6 +4488,7 @@ def main() -> None:
 
     # Profile
     app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("statsimg", cmd_statsimg))
     app.add_handler(CommandHandler("top",     cmd_top))
     app.add_handler(CommandHandler(["leaderboard", "lb"], cmd_top))
     app.add_handler(CommandHandler("stats",   cmd_stats))

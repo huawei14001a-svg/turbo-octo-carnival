@@ -333,6 +333,14 @@ async def db_init() -> None:
 
         """)
         await db.commit()
+        # ── Migrations (safe: ignore if column already exists) ──
+        try:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN last_bio_bonus TEXT DEFAULT NULL"
+            )
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
     log.info("Database initialised at %s", DB_PATH)
 
 
@@ -1000,18 +1008,95 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db_ensure_user(u_obj.id, cid, u_obj.username or "", u_obj.first_name)
     u     = await db_get_user(u_obj.id, cid)
     now   = datetime.now()
-    cd    = 20 * 3600
+    cd    = 20 * 3600  # 20-hour cooldown
 
+    # ── Cooldown check ────────────────────────────────────
     if u["last_daily"]:
         elapsed = (now - datetime.fromisoformat(u["last_daily"])).total_seconds()
         if elapsed < cd:
             rem = int(cd - elapsed)
-            await update.message.reply_text(
-                f"⏰ Следующий бонус через <b>{fmt_cd(rem)}</b>",
-                parse_mode=ParseMode.HTML,
+
+            # ── Bio-bonus: can be used ONCE per cooldown period ─
+            bio_bonus_used = False
+            lbb = u.get("last_bio_bonus")
+            if lbb:
+                bio_elapsed = (now - datetime.fromisoformat(lbb)).total_seconds()
+                bio_bonus_used = bio_elapsed < cd
+
+            if bio_bonus_used:
+                # Already used bio bypass this period
+                await update.message.reply_text(
+                    f"⏰ Следующий бонус через <b>{fmt_cd(rem)}</b>\n\n"
+                    f"✅ Промо-бонус за <code>@VerifureGift</code> уже получен сегодня.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # ── Check Telegram bio ──────────────────────────
+            has_promo = False
+            try:
+                user_chat = await context.bot.get_chat(u_obj.id)
+                bio = (user_chat.bio or "")
+                has_promo = "@VerifureGift" in bio
+            except TelegramError:
+                pass  # Can't read bio — user hasn't started bot in DM
+
+            if not has_promo:
+                await update.message.reply_text(
+                    f"⏰ Следующий бонус через <b>{fmt_cd(rem)}</b>\n\n"
+                    f"💡 <b>Хочешь получить бонус прямо сейчас?</b>\n"
+                    f"Добавь <code>@VerifureGift</code> в описание своего профиля Telegram "
+                    f"и используй <b>/daily</b> снова — получишь бонус немедленно! 🎁",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            # ── Bio found → give promo bonus ────────────────
+            streak      = u.get("daily_streak") or 0
+            streak_bonus = min(max(streak - 1, 0), 6) * DAILY_STREAK_BONUS
+            m           = await db_get_marriage(u_obj.id, cid)
+            marry_bonus  = DAILY_MARRIED_BONUS if m else 0
+            promo_total  = DAILY_BONUS_BASE + streak_bonus + marry_bonus
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET last_bio_bonus=? WHERE user_id=? AND chat_id=?",
+                    (_now(), u_obj.id, cid),
+                )
+                await db.commit()
+
+            new_bal = await db_add_vrf(u_obj.id, cid, promo_total)
+
+            rich_promo = (
+                "<h2>🎁 Промо-бонус!</h2>"
+                "<table bordered striped>"
+                f"<tr><td>✅ <code>@VerifureGift</code></td><td align=\"right\">в профиле!</td></tr>"
+                f"<tr><td>💎 База</td><td align=\"right\"><b>+{DAILY_BONUS_BASE} VRF</b></td></tr>"
             )
+            if streak_bonus:
+                rich_promo += f"<tr><td>🔥 Стрик {streak} дн.</td><td align=\"right\"><b>+{streak_bonus} VRF</b></td></tr>"
+            if marry_bonus:
+                rich_promo += f"<tr><td>💍 Бонус брака</td><td align=\"right\"><b>+{marry_bonus} VRF</b></td></tr>"
+            rich_promo += (
+                f"<tr><th>Итого</th><th align=\"right\"><mark><b>+{promo_total} VRF</b></mark></th></tr>"
+                "</table>"
+                f"<blockquote>💰 Баланс: <b>{fmt(new_bal)} VRF</b></blockquote>"
+                f"<p>⏰ Следующий обычный бонус через <b>{fmt_cd(rem)}</b></p>"
+            )
+            fb_promo = (
+                f"🎁 <b>Промо-бонус!</b>\n\n"
+                f"✅ <code>@VerifureGift</code> найден в профиле!\n\n"
+                f"💎 +{promo_total} VRF\n"
+                f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>\n\n"
+                f"⏰ Следующий обычный бонус через <b>{fmt_cd(rem)}</b>"
+            )
+            await send_rich(context.bot, cid, html=rich_promo, fallback_html=fb_promo,
+                            reply_to_id=update.message.message_id)
             return
 
+    # ══════════════════════════════════════════════════════
+    #  Normal daily bonus (cooldown passed)
+    # ══════════════════════════════════════════════════════
     streak = u.get("daily_streak") or 0
     last_streak = u.get("last_daily")
     if last_streak:
@@ -1088,6 +1173,7 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         rem = int(secs - (datetime.now() - datetime.fromisoformat(last)).total_seconds())
         return f"⏰ {fmt_cd(rem)}" if rem > 0 else "✅ Доступен"
 
+    bio_bonus_txt = cd_txt("last_bio_bonus", 20 * 3600)
     m = await db_get_marriage(u_obj.id, cid)
 
     rich_h = (
@@ -1096,6 +1182,7 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<table bordered striped>"
         f"<tr><td>💎 VRF</td><td align=\"right\"><mark><b>{fmt(u['vrf'])}</b></mark></td></tr>"
         f"<tr><td>📅 Ежедневный</td><td align=\"right\">{daily_txt}</td></tr>"
+        f"<tr><td>🎁 Промо @VerifureGift</td><td align=\"right\">{bio_bonus_txt}</td></tr>"
         f"<tr><td>🔥 Стрик</td><td align=\"right\"><b>{u.get('daily_streak', 0)}</b> дн.</td></tr>"
         f"<tr><td>💑 Брак</td><td align=\"right\">{'✅ +15 VRF' if m else '❌ Нет'}</td></tr>"
         f"<tr><td>🎁 Подарок /gift</td><td align=\"right\">{cd_txt('last_gift', GIFT_COOLDOWN_H * 3600)}</td></tr>"
@@ -1109,6 +1196,7 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🎁 <b>Бонусы: {mention(u_obj.id, u_obj.first_name)}</b>\n\n"
         f"💎 VRF: <b>{fmt(u['vrf'])}</b>\n\n"
         f"📅 Ежедневный: {daily_txt}\n"
+        f"🎁 Промо @VerifureGift: {bio_bonus_txt}\n"
         f"🔥 Стрик: {u.get('daily_streak', 0)} дн.\n"
         f"💑 Брак: {'✅ +15 VRF к бонусу' if m else '❌ Нет'}\n"
         f"🎀 Подарок /gift: {cd_txt('last_gift', GIFT_COOLDOWN_H * 3600)}\n"

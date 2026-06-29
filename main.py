@@ -13,12 +13,14 @@ import logging
 import math
 import os
 import random
+import time
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Optional, Tuple
 
 import aiosqlite
+from aiohttp import web as aio_web
 from telegram import (
     ChatPermissions,
     InlineKeyboardButton,
@@ -158,6 +160,13 @@ ttt_games: dict       = {}   # key: game_id (str)
 battle_games: dict    = {}   # key: game_id (str)  — Battleship
 giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
 giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
+game_tokens: dict     = {}   # key: token (str) — HTML5 game sessions
+
+# ── HTML5 Game constants (set in Railway environment variables) ─
+GAME_SHORT_NAME = os.environ.get("GAME_SHORT_NAME", "vrfcoin")
+GAME_PAGE_URL   = os.environ.get("GAME_PAGE_URL",   "")   # GitHub Pages URL
+BOT_SERVER_URL  = os.environ.get("BOT_SERVER_URL",  "")   # Railway URL (no trailing /)
+GAME_API_PATH   = "/api/game/score"                        # score submission endpoint
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -1721,6 +1730,157 @@ async def cmd_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         reply_markup=_gw_kb_react(sid),
     )
+
+
+# ══════════════════════════════════════════════════════
+#           HTML5 GAME  🎮  (sendGame API)
+# ══════════════════════════════════════════════════════
+
+# ── VRF reward tiers (mirrors JS calcVRF) ────────────
+def _game_vrf(score: int) -> int:
+    if score < 50:   return 0
+    if score < 300:  return (score - 50) // 15
+    if score < 1200: return 17 + (score - 300) // 28
+    return min(100, 49 + (score - 1200) // 45)
+
+
+# ── Score API handler (aiohttp) ───────────────────────
+async def handle_game_score(request: aio_web.Request) -> aio_web.Response:
+    """POST /api/game/score  — called by game.html when game ends."""
+    # CORS preflight
+    if request.method == "OPTIONS":
+        return aio_web.Response(
+            headers={
+                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return aio_web.json_response({"ok": False, "error": "bad json"},
+                                     status=400)
+
+    token = str(data.get("token", ""))
+    uid   = int(data.get("uid", 0))
+    score = max(0, min(int(data.get("score", 0)), 999_999))
+
+    info = game_tokens.pop(token, None)
+    if not info or info["uid"] != uid:
+        return aio_web.json_response({"ok": False, "error": "invalid token"},
+                                     status=403)
+
+    # Expire after 90 minutes
+    if time.time() - info["created"] > 5400:
+        return aio_web.json_response({"ok": False, "error": "token expired"},
+                                     status=403)
+
+    cid    = info["cid"]
+    msg_id = info["msg_id"]
+    bot    = info["bot"]
+
+    # setGameScore
+    try:
+        await bot.set_game_score(
+            user_id=uid, score=score,
+            chat_id=cid, message_id=msg_id,
+            force=True,
+        )
+    except Exception as e:
+        log.warning("setGameScore failed: %s", e)
+
+    # Award VRF
+    vrf = _game_vrf(score)
+    msg_text = ""
+    if vrf > 0:
+        try:
+            await db_ensure_user(uid, cid, "", "")
+            new_bal = await db_add_vrf(uid, cid, vrf)
+            await db_add_xp(uid, cid, XP_PER_WIN if score >= 200 else XP_PER_GAME)
+            msg_text = f"Баланс: {fmt(new_bal)} VRF"
+        except Exception as e:
+            log.warning("VRF award failed: %s", e)
+
+    resp = aio_web.json_response(
+        {"ok": True, "vrf_earned": vrf, "message": msg_text},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+    return resp
+
+
+# ── /game command ─────────────────────────────────────
+@only_groups
+async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the HTML5 game message."""
+    cid = update.effective_chat.id
+
+    if not GAME_SHORT_NAME:
+        await update.message.reply_text(
+            "❌ Игра не настроена.\n"
+            "Установи переменные окружения:\n"
+            "<code>GAME_SHORT_NAME GAME_PAGE_URL BOT_SERVER_URL</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await context.bot.send_game(
+            chat_id=cid,
+            game_short_name=GAME_SHORT_NAME,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+# ── Callback: user clicked "Play" ─────────────────────
+async def on_game_callback(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle callback_query with game_short_name (Play button)."""
+    query = update.callback_query
+    if not query or not query.game_short_name:
+        return
+
+    user   = query.from_user
+    cid    = query.message.chat_id if query.message else 0
+    msg_id = query.message.message_id if query.message else 0
+
+    if not GAME_PAGE_URL:
+        await query.answer(
+            url=None,
+            text="⚠️ GAME_PAGE_URL не задан в переменных окружения!",
+            show_alert=True,
+        )
+        return
+
+    # Create signed token
+    token = str(uuid.uuid4())
+    game_tokens[token] = {
+        "uid":     user.id,
+        "cid":     cid,
+        "msg_id":  msg_id,
+        "bot":     context.bot,
+        "created": time.time(),
+    }
+
+    # Expire old tokens (simple cleanup)
+    now = time.time()
+    dead = [k for k, v in game_tokens.items()
+            if now - v["created"] > 5400]
+    for k in dead:
+        game_tokens.pop(k, None)
+
+    api_url = (BOT_SERVER_URL.rstrip("/") + GAME_API_PATH) if BOT_SERVER_URL else ""
+
+    params = (
+        f"?uid={user.id}"
+        f"&token={token}"
+        f"&name={user.first_name}"
+        f"&api={api_url}"
+    )
+    game_url = GAME_PAGE_URL.rstrip("/") + "/" + params
+
+    await query.answer(url=game_url)
 
 
 # ══════════════════════════════════════════════════════
@@ -5871,6 +6031,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
         BotCommand("seabattle","🚢 Морской Бой (ответом, PvP в ЛС)"),
         BotCommand("giveaway", "🎁 Розыгрыш медведей среди реакций"),
+        BotCommand("game",     "🎮 VRF Rush — собирай монеты, зарабатывай VRF!"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
@@ -5886,7 +6047,7 @@ async def on_startup(app: Application) -> None:
     log.info("Verifure Game 10.1 is online!")
 
 
-def main() -> None:
+async def main() -> None:
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN environment variable is not set!")
         raise SystemExit(1)
@@ -5960,25 +6121,50 @@ def main() -> None:
     app.add_handler(CommandHandler(["predlist",  "warnlist"],  cmd_warnlist))
     app.add_handler(CommandHandler(["mutelist"],               cmd_mutelist))
 
+    # HTML5 Game
+    app.add_handler(CommandHandler("game", cmd_game))
+    # Game "Play" button — must run BEFORE the generic CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(on_game_callback, pattern=None))
+
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(MessageHandler(filters.Dice, on_casino_777))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    log.info("Starting polling...")
-    app.run_polling(
+    # ── aiohttp side-server (for game score API + health) ──
+    web_app = aio_web.Application()
+    web_app.router.add_route("OPTIONS", GAME_API_PATH, handle_game_score)
+    web_app.router.add_post(GAME_API_PATH, handle_game_score)
+    web_app.router.add_get("/health", lambda _: aio_web.Response(text="OK"))
+    runner = aio_web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = aio_web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Web server started on port %d", port)
+
+    # ── Start Telegram bot (non-blocking) ──────────────────
+    log.info("Starting Telegram polling…")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
         drop_pending_updates=True,
         allowed_updates=[
-            "message",
-            "callback_query",
-            "inline_query",
-            "message_reaction",
-            "chat_member",
-            "my_chat_member",
+            "message", "callback_query", "inline_query",
+            "message_reaction", "chat_member", "my_chat_member",
         ],
     )
 
+    # Keep running until interrupted
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

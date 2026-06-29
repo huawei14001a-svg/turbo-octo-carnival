@@ -4419,10 +4419,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query    = update.callback_query
-    data     = query.data
-    cid      = query.message.chat_id
-    who      = query.from_user
+    query = update.callback_query
+    if not query:
+        return
+
+    # ── HTML5 Game "Play" button ─────────────────────────
+    if query.game_short_name:
+        await on_game_callback(update, context)
+        return
+
+    data  = query.data or ""
+    cid   = query.message.chat_id
+    who   = query.from_user
 
     # ── Top tabs ────────────────────────────────────────
     if data.startswith("top:"):
@@ -6121,10 +6129,8 @@ async def main() -> None:
     app.add_handler(CommandHandler(["predlist",  "warnlist"],  cmd_warnlist))
     app.add_handler(CommandHandler(["mutelist"],               cmd_mutelist))
 
-    # HTML5 Game
+    # HTML5 Game (game click handled inside on_callback above)
     app.add_handler(CommandHandler("game", cmd_game))
-    # Game "Play" button — must run BEFORE the generic CallbackQueryHandler
-    app.add_handler(CallbackQueryHandler(on_game_callback, pattern=None))
 
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))

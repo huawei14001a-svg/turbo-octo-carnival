@@ -36,6 +36,7 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
 
@@ -154,6 +155,8 @@ slot_games: dict      = {}   # key: game_id (str)
 mines_games: dict     = {}   # key: f"{uid}:{cid}"
 ttt_games: dict       = {}   # key: game_id (str)
 battle_games: dict    = {}   # key: game_id (str)  — Battleship
+giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
+giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -1135,6 +1138,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики</li>"
         "<li>/seabattle — 🚢 Морской Бой <i>(PvP в ЛС)</i></li>"
+        "<li>/giveaway — 🎁 Розыгрыш медведей среди реакций</li>"
         "</ul>"
         "<h3>💒 Браки</h3>"
         "<ul>"
@@ -1411,6 +1415,290 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🎮 Игр сыграно: <b>{fmt(total_games)}</b>"
         ),
         parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#              BEAR GIVEAWAY 🐻🎁
+# ══════════════════════════════════════════════════════
+
+GW_REACT_EMOJIS = [
+    "❤", "👍", "🔥", "🎉", "🥰", "👏",
+    "😁", "🤔", "💯", "⚡", "🏆", "🐳",
+    "😢", "🤩", "🙏", "👌", "😍", "🎃",
+    "🤣", "💔", "😱", "🤩", "🥱", "😎",
+]
+
+# ── Keyboard builders ─────────────────────────────────
+
+def _gw_kb_react(sid: str) -> InlineKeyboardMarkup:
+    """Step 1: choose reaction (or any)."""
+    rows = []
+    for i in range(0, len(GW_REACT_EMOJIS), 6):
+        rows.append([
+            SBtn(e, style="primary", callback_data=f"gws:{sid}:r:{e}")
+            for e in GW_REACT_EMOJIS[i:i+6]
+        ])
+    rows.append([SBtn("✨ Любую реакцию", style="success",
+                      callback_data=f"gws:{sid}:r:any")])
+    rows.append([SBtn("Отмена", style="danger",
+                      callback_data=f"gws:{sid}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _gw_kb_bw(sid: str, max_bears: int) -> InlineKeyboardMarkup:
+    """Step 2: bears per winner × number of winners."""
+    presets = [(1,1),(1,2),(1,3),(2,1),(2,2),(3,1),(5,1),(3,3),(5,5),(10,1)]
+    rows, row = [], []
+    for b, w in presets:
+        if b * w > max_bears:
+            continue
+        row.append(SBtn(f"{b}🐻×{w}", style="primary",
+                        callback_data=f"gws:{sid}:bw:{b}:{w}"))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows.append([SBtn("1🐻×1", style="primary",
+                          callback_data=f"gws:{sid}:bw:1:1")])
+    rows.append([SBtn("Отмена", style="danger",
+                      callback_data=f"gws:{sid}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _gw_kb_time(sid: str) -> InlineKeyboardMarkup:
+    """Step 3: choose duration."""
+    return InlineKeyboardMarkup([
+        [
+            SBtn("1 мин",  style="primary", callback_data=f"gws:{sid}:t:1"),
+            SBtn("3 мин",  style="primary", callback_data=f"gws:{sid}:t:3"),
+            SBtn("5 мин",  style="primary", callback_data=f"gws:{sid}:t:5"),
+        ],
+        [
+            SBtn("10 мин", style="primary", callback_data=f"gws:{sid}:t:10"),
+            SBtn("15 мин", style="primary", callback_data=f"gws:{sid}:t:15"),
+            SBtn("30 мин", style="primary", callback_data=f"gws:{sid}:t:30"),
+        ],
+        [SBtn("Отмена", style="danger", callback_data=f"gws:{sid}:cancel")],
+    ])
+
+
+def _gw_kb_confirm(sid: str) -> InlineKeyboardMarkup:
+    """Step 4: confirm & launch."""
+    return InlineKeyboardMarkup([
+        [SBtn("🚀 Запустить розыгрыш!", style="success",
+              callback_data=f"gws:{sid}:go")],
+        [SBtn("Отмена", style="danger",
+              callback_data=f"gws:{sid}:cancel")],
+    ])
+
+
+def _gw_active_text(gw: dict) -> str:
+    """Live text for the giveaway message."""
+    react_str  = f"«{gw['reaction']}»" if gw.get("reaction") else "любую реакцию"
+    elapsed    = (datetime.now() - gw["start_time"]).total_seconds()
+    remaining  = max(0, gw["minutes"] * 60 - elapsed)
+    return (
+        f"🐻 <b>РОЗЫГРЫШ МЕДВЕДЕЙ!</b>\n\n"
+        f"🎁 Приз: <b>{gw['bears']}🐻</b> каждому из <b>{gw['winners']}</b> победителей\n"
+        f"👇 Поставь {react_str} на это сообщение!\n\n"
+        f"⏱ Осталось: <b>{fmt_cd(int(remaining))}</b>\n"
+        f"👥 Участников: <b>{len(gw['participants'])}</b>\n\n"
+        f"🔮 Победители выбираются случайно!"
+    )
+
+
+# ── Core giveaway logic ───────────────────────────────
+
+async def _end_giveaway(bot, key: str) -> None:
+    """Pick winners, award bears, edit the giveaway message."""
+    gw = giveaway_active.pop(key, None)
+    if not gw or gw["state"] != "active":
+        return
+    gw["state"] = "ended"
+
+    cid       = gw["cid"]
+    msg_id    = gw["msg_id"]
+    org_id    = gw["org_id"]
+    bears     = gw["bears"]
+    winners_n = gw["winners"]
+    parts     = list(gw["participants"])
+
+    # ── No participants → return bears ────────────────
+    if not parts:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (bears * winners_n, org_id, cid),
+            )
+            await db.commit()
+        try:
+            await bot.edit_message_text(
+                f"🐻 <b>Розыгрыш завершён</b>\n\n"
+                f"😔 Никто не поставил реакцию...\n"
+                f"🐻 Медведи возвращены организатору.",
+                chat_id=cid, message_id=msg_id,
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    # ── Pick random winners ───────────────────────────
+    actual = min(winners_n, len(parts))
+    winners = random.sample(parts, actual)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for w_id in winners:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (bears, w_id, cid),
+            )
+        unused = (winners_n - actual) * bears
+        if unused > 0:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (unused, org_id, cid),
+            )
+        await db.commit()
+
+    # ── Announce ──────────────────────────────────────
+    lines = "\n".join(
+        f"{'🥇' if i==0 else '🏆'} {mention(w_id, f'Победитель {i+1}')}"
+        for i, w_id in enumerate(winners)
+    )
+    result = (
+        f"🐻🎉 <b>РОЗЫГРЫШ ЗАВЕРШЁН!</b>\n\n"
+        f"Победители ({actual} из {len(parts)} участников):\n"
+        f"{lines}\n\n"
+        f"🎁 Каждый получает: <b>{bears}🐻</b>"
+    )
+    try:
+        await bot.edit_message_text(
+            result, chat_id=cid, message_id=msg_id,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        try:
+            await bot.send_message(cid, result,
+                                   parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=msg_id)
+        except TelegramError:
+            pass
+
+    # React with 🎉 on the finished giveaway message
+    try:
+        await bot.set_message_reaction(
+            chat_id=cid, message_id=msg_id,
+            reaction=[ReactionTypeEmoji("🎉")],
+        )
+    except TelegramError:
+        pass
+
+
+async def _giveaway_timer(bot, key: str, sid: str) -> None:
+    """Background task: countdown updates + end trigger."""
+    gw = giveaway_active.get(key)
+    if not gw:
+        return
+
+    total   = gw["minutes"] * 60
+    elapsed = 0
+    step    = 60   # update interval (seconds)
+
+    while elapsed < total:
+        sleep_for = min(step, total - elapsed)
+        await asyncio.sleep(sleep_for)
+        elapsed += sleep_for
+
+        gw = giveaway_active.get(key)
+        if not gw or gw["state"] != "active":
+            return
+
+        if elapsed < total:
+            # Update countdown
+            try:
+                await bot.edit_message_text(
+                    _gw_active_text(gw),
+                    chat_id=gw["cid"], message_id=gw["msg_id"],
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+
+    await _end_giveaway(bot, key)
+    giveaway_setups.pop(sid, None)
+
+
+# ── Reaction tracking handler ─────────────────────────
+
+async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle MessageReactionUpdated — track giveaway participants."""
+    mr   = update.message_reaction
+    if not mr:
+        return
+    user = mr.user
+    if not user or user.is_bot:
+        return   # Anonymous or bot reactions can't be tracked
+
+    key = f"{mr.chat.id}:{mr.message_id}"
+    gw  = giveaway_active.get(key)
+    if not gw or gw["state"] != "active":
+        return
+
+    required = gw["reaction"]   # None = accept any reaction
+
+    def _has(reactions: list) -> bool:
+        if not reactions:
+            return False
+        if required is None:
+            return True
+        for r in reactions:
+            if isinstance(r, ReactionTypeEmoji) and r.emoji == required:
+                return True
+        return False
+
+    had = _has(mr.old_reaction)
+    has = _has(mr.new_reaction)
+
+    if has and not had:
+        gw["participants"].add(user.id)
+    elif had and not has:
+        gw["participants"].discard(user.id)
+
+
+# ── /giveaway command ─────────────────────────────────
+
+@only_groups
+async def cmd_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Launch the bear giveaway wizard."""
+    u   = update.effective_user
+    cid = update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    uu  = await db_get_user(u.id, cid)
+
+    if not uu or uu.get("bears", 0) < 1:
+        await update.message.reply_text(
+            f"❌ <b>Нет медведей для розыгрыша!</b>\n\n"
+            f"🐻 Медведи выдаются за каждые <b>10 побед</b> в играх.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sid = str(uuid.uuid4())[:8]
+    giveaway_setups[sid] = {
+        "cid": cid, "org_id": u.id, "org_name": u.first_name,
+        "reaction": None, "bears": 1, "winners": 1, "minutes": 5,
+        "bears_avail": uu["bears"],
+    }
+
+    await update.message.reply_text(
+        f"🐻 <b>Розыгрыш медведей</b>\n\n"
+        f"У тебя: <b>{uu['bears']}🐻</b>\n\n"
+        f"<b>Шаг 1 / 3</b> — Выбери реакцию для участия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_gw_kb_react(sid),
     )
 
 
@@ -4381,6 +4669,167 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Giveaway wizard (gws:) ────────────────────────────
+    if data.startswith("gws:"):
+        parts = data.split(":")
+        # parts[0]=gws, parts[1]=sid, parts[2]=step, parts[3+]=args
+        sid   = parts[1]
+        step  = parts[2]
+        setup = giveaway_setups.get(sid)
+
+        # Setup expired
+        if not setup:
+            await query.answer("❌ Сессия настройки истекла", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            return
+
+        # Only the organizer can interact
+        if who.id != setup["org_id"]:
+            await query.answer("❌ Это не твой розыгрыш!", show_alert=True)
+            return
+
+        # ── Cancel ───────────────────────────────────────
+        if step == "cancel":
+            giveaway_setups.pop(sid, None)
+            await query.answer("Отменено")
+            await query.edit_message_text("❌ Розыгрыш отменён.")
+            return
+
+        # ── Step 1: Reaction selected ─────────────────────
+        if step == "r":
+            emoji = parts[3]
+            setup["reaction"] = None if emoji == "any" else emoji
+            label = "✨ Любую реакцию" if emoji == "any" else f"«{emoji}»"
+            await query.answer(f"Реакция: {label}")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш медведей</b>\n\n"
+                f"✅ Реакция: <b>{label}</b>\n\n"
+                f"<b>Шаг 2 / 3</b> — Выбери медведей и победителей:\n"
+                f"<i>Формат: 🐻 на победителя × кол-во победителей</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_bw(sid, setup["bears_avail"]),
+            )
+            return
+
+        # ── Step 2: Bears × Winners selected ─────────────
+        if step == "bw":
+            bears   = int(parts[3])
+            winners = int(parts[4])
+            if bears * winners > setup["bears_avail"]:
+                await query.answer(
+                    f"❌ Нужно {bears*winners}🐻, у тебя только {setup['bears_avail']}🐻",
+                    show_alert=True,
+                )
+                return
+            setup["bears"]   = bears
+            setup["winners"] = winners
+            rl = "✨ Любую" if setup["reaction"] is None else f"«{setup['reaction']}»"
+            await query.answer(f"Выбрано: {bears}🐻 × {winners}")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш медведей</b>\n\n"
+                f"✅ Реакция: <b>{rl}</b>\n"
+                f"✅ Приз: <b>{bears}🐻 × {winners} победителей</b>\n"
+                f"   (итого: <b>{bears*winners}🐻</b> от тебя)\n\n"
+                f"<b>Шаг 3 / 3</b> — На какое время?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_time(sid),
+            )
+            return
+
+        # ── Step 3: Time selected ─────────────────────────
+        if step == "t":
+            minutes = int(parts[3])
+            setup["minutes"] = minutes
+            rl      = "✨ Любую" if setup["reaction"] is None else f"«{setup['reaction']}»"
+            b, w, m = setup["bears"], setup["winners"], minutes
+            await query.answer(f"Время: {minutes} мин")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш — Подтверждение</b>\n\n"
+                f"🎯 Реакция: <b>{rl}</b>\n"
+                f"🎁 Приз: <b>{b}🐻</b> каждому из <b>{w}</b> победителей\n"
+                f"💸 Стоимость: <b>{b*w}🐻</b> (списывается сразу)\n"
+                f"⏱ Время: <b>{m} мин</b>\n\n"
+                f"Всё верно? Запускаем?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_confirm(sid),
+            )
+            return
+
+        # ── Step 4: Launch! ───────────────────────────────
+        if step == "go":
+            setup = giveaway_setups.pop(sid, None)
+            if not setup:
+                await query.answer("❌ Сессия истекла", show_alert=True)
+                return
+
+            # Re-check bears
+            uu = await db_get_user(setup["org_id"], cid)
+            cost = setup["bears"] * setup["winners"]
+            if not uu or uu.get("bears", 0) < cost:
+                await query.answer(
+                    f"❌ Недостаточно 🐻 (нужно {cost}, есть {uu.get('bears',0) if uu else 0})",
+                    show_alert=True,
+                )
+                return
+
+            # Deduct bears immediately
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET bears=bears-? WHERE user_id=? AND chat_id=?",
+                    (cost, setup["org_id"], cid),
+                )
+                await db.commit()
+
+            await query.answer("🚀 Розыгрыш запускается!")
+            await query.edit_message_text(
+                f"✅ Розыгрыш запущен на <b>{setup['minutes']} мин</b>!\n"
+                f"Следи за сообщением ниже 👇",
+                parse_mode=ParseMode.HTML,
+            )
+
+            # Build giveaway message text
+            rl       = f"«{setup['reaction']}»" if setup["reaction"] else "любую реакцию"
+            gw_text  = (
+                f"🐻 <b>РОЗЫГРЫШ МЕДВЕДЕЙ!</b>\n\n"
+                f"🎁 Приз: <b>{setup['bears']}🐻</b> каждому из "
+                f"<b>{setup['winners']}</b> победителей\n"
+                f"👇 Поставь {rl} на это сообщение!\n\n"
+                f"⏱ Осталось: <b>{fmt_cd(setup['minutes']*60)}</b>\n"
+                f"👥 Участников: <b>0</b>\n\n"
+                f"🔮 Победители выбираются случайно!"
+            )
+            gw_msg = await context.bot.send_message(
+                cid, gw_text, parse_mode=ParseMode.HTML,
+            )
+
+            key = f"{cid}:{gw_msg.message_id}"
+            giveaway_active[key] = {
+                "sid":        sid,
+                "cid":        cid,
+                "msg_id":     gw_msg.message_id,
+                "org_id":     setup["org_id"],
+                "org_name":   setup["org_name"],
+                "reaction":   setup["reaction"],
+                "bears":      setup["bears"],
+                "winners":    setup["winners"],
+                "minutes":    setup["minutes"],
+                "start_time": datetime.now(),
+                "participants": set(),
+                "state":      "active",
+            }
+
+            # Launch timer in background
+            context.application.create_task(
+                _giveaway_timer(context.bot, key, sid)
+            )
+            return
+
+        await query.answer()
+        return
+
     # ── Admin panel ──────────────────────────────────────
     if data.startswith("ap:"):
         uid   = who.id
@@ -4745,6 +5194,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
         BotCommand("seabattle","🚢 Морской Бой (ответом, PvP в ЛС)"),
+        BotCommand("giveaway", "🎁 Розыгрыш медведей среди реакций"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
@@ -4808,6 +5258,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mines",   cmd_mines))
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
+    app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Admin
@@ -4819,13 +5270,24 @@ def main() -> None:
     app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
     app.add_handler(CommandHandler("listadmins",   cmd_listadmins))
 
-    # Callbacks & messages
+    # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(MessageHandler(filters.Dice, on_casino_777))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("Starting polling...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "inline_query",
+            "message_reaction",
+            "chat_member",
+            "my_chat_member",
+        ],
+    )
 
 
 if __name__ == "__main__":

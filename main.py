@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import aiosqlite
 from telegram import (
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -598,6 +599,26 @@ async def db_init() -> None:
                 messages INTEGER DEFAULT 0,
                 games    INTEGER DEFAULT 0,
                 PRIMARY KEY (date, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mutes (
+                user_id  INTEGER NOT NULL,
+                chat_id  INTEGER NOT NULL,
+                muted_by INTEGER NOT NULL,
+                muted_at TEXT    NOT NULL,
+                until    TEXT    DEFAULT NULL,
+                reason   TEXT    DEFAULT '',
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS warns (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL,
+                chat_id   INTEGER NOT NULL,
+                warned_by INTEGER NOT NULL,
+                warned_at TEXT    NOT NULL,
+                reason    TEXT    DEFAULT '',
+                active    INTEGER DEFAULT 1
             );
 
 
@@ -3094,11 +3115,553 @@ async def cmd_mines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
 # ══════════════════════════════════════════════════════
 #              ADMIN COMMANDS
 # ══════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════
+#           MODERATION SYSTEM 🛡️  (hidden — admin only)
+# ══════════════════════════════════════════════════════
+
+_WARN_LIMIT = 3          # auto-mute after N warns
+_WARN_AUTO_MUT = timedelta(hours=24)   # auto-mute duration
+
+
+# ── Duration parser ───────────────────────────────────
+
+def _mod_dur(args: list) -> tuple:
+    """
+    Parse duration from command args.
+    Returns (Optional[timedelta], reason: str).
+    Default (no args) → 7 days.
+    """
+    FOREVER = {"навсегда", "perma", "forever", "перм", "perm", "inf", "∞"}
+    SECS: dict = {
+        frozenset({"с", "сек", "sec", "s"}):                                 1,
+        frozenset({"мин", "мин.", "м", "min", "m", "minute", "minutes"}):   60,
+        frozenset({"ч", "час", "h", "hour", "hours", "hr"}):              3600,
+        frozenset({"д", "дн", "день", "дней", "d", "day", "days"}):     86400,
+        frozenset({"н", "нед", "неделя", "w", "week", "weeks"}):       604800,
+        frozenset({"мес", "месяц", "месяца", "mo", "month", "months"}): 2592000,
+    }
+    if not args:
+        return timedelta(days=7), ""
+
+    first = args[0].lower()
+    if first in FOREVER:
+        return None, " ".join(args[1:])
+
+    import re as _re
+    m = _re.match(r"^(\d+)([а-яёa-z.]+)$", first)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        for unit_set, secs in SECS.items():
+            if unit in unit_set:
+                return timedelta(seconds=n * secs), " ".join(args[1:])
+
+    # First arg is not a duration → all args = reason, default 7d
+    return timedelta(days=7), " ".join(args)
+
+
+def _fmt_until(until: Optional[datetime]) -> str:
+    if until is None:
+        return "навсегда"
+    rem = (until - datetime.now()).total_seconds()
+    return fmt_cd(int(rem)) if rem > 0 else "истёк"
+
+
+async def _is_protected(chat, uid: int) -> bool:
+    """True if user is a group admin/creator (can't be moderated)."""
+    try:
+        m = await chat.get_member(uid)
+        return m.status in ("administrator", "creator")
+    except TelegramError:
+        return False
+
+
+# ── Moderation DB helpers ─────────────────────────────
+
+async def db_log_mute(uid: int, cid: int, by: int,
+                      until: Optional[datetime], reason: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO mutes (user_id,chat_id,muted_by,muted_at,until,reason)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(user_id,chat_id) DO UPDATE SET
+                   muted_by=excluded.muted_by, muted_at=excluded.muted_at,
+                   until=excluded.until, reason=excluded.reason""",
+            (uid, cid, by, _now(),
+             until.isoformat() if until else None, reason),
+        )
+        await db.commit()
+
+
+async def db_clear_mute(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM mutes WHERE user_id=? AND chat_id=?", (uid, cid))
+        await db.commit()
+
+
+async def db_get_mutes(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM mutes WHERE chat_id=? ORDER BY muted_at DESC", (cid,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_add_warn(uid: int, cid: int, by: int, reason: str) -> int:
+    """Add a warning and return total active warn count."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warns (user_id,chat_id,warned_by,warned_at,reason) VALUES (?,?,?,?,?)",
+            (uid, cid, by, _now(), reason),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=? AND active=1",
+            (uid, cid),
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+
+async def db_remove_last_warn(uid: int, cid: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC LIMIT 1",
+            (uid, cid),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        await db.execute("UPDATE warns SET active=0 WHERE id=?", (row[0],))
+        await db.commit()
+        return True
+
+
+async def db_clear_warns(uid: int, cid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=? AND active=1",
+            (uid, cid),
+        ) as cur:
+            count = (await cur.fetchone())[0]
+        await db.execute(
+            "UPDATE warns SET active=0 WHERE user_id=? AND chat_id=?", (uid, cid)
+        )
+        await db.commit()
+        return count
+
+
+async def db_get_user_warns(uid: int, cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC",
+            (uid, cid),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_chat_warns(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT user_id, COUNT(*) AS cnt FROM warns
+               WHERE chat_id=? AND active=1 GROUP BY user_id ORDER BY cnt DESC LIMIT 20""",
+            (cid,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ── Shared permissions ────────────────────────────────
+
+_MUTED_PERMS = ChatPermissions(
+    can_send_messages=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+_FULL_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_invite_users=True,
+)
+
+
+# ── /мут /mute ────────────────────────────────────────
+
 @only_groups
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg  = update.message
+    caller = update.effective_user
+    cid  = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/мут [10м / 2ч / 1д / навсегда] [причина]</code>\n"
+            "По умолчанию: 7 дней",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target = msg.reply_to_message.from_user
+    if target.id == caller.id:
+        await msg.reply_text("❌ Нельзя замутить себя")
+        return
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя замутить администратора")
+        return
+
+    dur, reason = _mod_dur(context.args)
+    until_dt   = datetime.now() + dur if dur else None
+
+    try:
+        await context.bot.restrict_chat_member(
+            cid, target.id, _MUTED_PERMS, until_date=until_dt,
+        )
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+    await db_log_mute(target.id, cid, caller.id, until_dt, reason)
+
+    await msg.reply_text(
+        f"🔇 {mention(target.id, target.first_name)} — <b>мут</b>\n"
+        f"⏱ Срок: <b>{_fmt_until(until_dt)}</b>"
+        + (f"\n📝 Причина: {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /размут /анмут /unmute ────────────────────────────
+
+@only_groups
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение пользователя: <code>/размут</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    cid    = update.effective_chat.id
+
+    try:
+        await context.bot.restrict_chat_member(cid, target.id, _FULL_PERMS)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await db_clear_mute(target.id, cid)
+    await msg.reply_text(
+        f"🔊 {mention(target.id, target.first_name)} — <b>мут снят</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /кик /kick ───────────────────────────────────────
+
+@only_groups
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg  = update.message
+    cid  = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/кик [причина]</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя кикнуть администратора")
+        return
+
+    reason = " ".join(context.args) if context.args else ""
+    try:
+        await context.bot.ban_chat_member(cid, target.id)
+        await asyncio.sleep(0.3)
+        await context.bot.unban_chat_member(cid, target.id)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"👢 {mention(target.id, target.first_name)} — <b>исключён</b>"
+        + (f"\n📝 {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /бан /ban ────────────────────────────────────────
+
+@only_groups
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg    = update.message
+    caller = update.effective_user
+    cid    = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text(
+            "📌 Ответь на сообщение:\n"
+            "<code>/бан [срок] [причина]</code>  (без срока = навсегда)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя забанить администратора")
+        return
+
+    dur, reason = _mod_dur(context.args if context.args else [])
+    # For ban default = permanent (not 7d like mute)
+    if context.args and dur and dur == timedelta(days=7) and not any(
+        context.args[0].lower().startswith(u)
+        for u in ["7д","7d","7н","7нед","7w","7 ","1н","1w"]
+    ):
+        # No recognisable duration → permanent
+        dur, reason = None, " ".join(context.args)
+    until_dt = datetime.now() + dur if dur else None
+
+    try:
+        await context.bot.ban_chat_member(
+            cid, target.id, until_date=until_dt, revoke_messages=False,
+        )
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"🚫 {mention(target.id, target.first_name)} — <b>заблокирован</b>\n"
+        f"⏱ Срок: <b>{_fmt_until(until_dt)}</b>"
+        + (f"\n📝 Причина: {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /разбан /unban ────────────────────────────────────
+
+@only_groups
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+
+    if not msg.reply_to_message:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/разбан</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    cid    = update.effective_chat.id
+
+    try:
+        await context.bot.unban_chat_member(cid, target.id, only_if_banned=True)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"✅ {mention(target.id, target.first_name)} — <b>разблокирован</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /варн /warn ──────────────────────────────────────
+
+@only_groups
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg    = update.message
+    caller = update.effective_user
+    cid    = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/варн [причина]</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя варнить администратора")
+        return
+
+    reason = " ".join(context.args) if context.args else ""
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+    count = await db_add_warn(target.id, cid, caller.id, reason)
+
+    filled  = "⚠️" * count
+    empty   = "□" * max(0, _WARN_LIMIT - count)
+    bar     = filled + empty
+
+    text = (
+        f"⚠️ {mention(target.id, target.first_name)} — <b>предупреждение</b>\n"
+        f"Варнов: <b>{count}/{_WARN_LIMIT}</b>  {bar}"
+        + (f"\n📝 Причина: {reason}" if reason else "")
+    )
+
+    if count >= _WARN_LIMIT:
+        try:
+            until_dt = datetime.now() + _WARN_AUTO_MUT
+            await context.bot.restrict_chat_member(
+                cid, target.id, _MUTED_PERMS, until_date=until_dt,
+            )
+            await db_log_mute(target.id, cid, caller.id, until_dt,
+                              f"Автомут — {count} варнов")
+            await db_clear_warns(target.id, cid)
+            text += f"\n\n🔇 <b>Лимит!</b> Автомут на {fmt_cd(int(_WARN_AUTO_MUT.total_seconds()))}"
+        except TelegramError:
+            pass
+
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ── /снятьварн /unwarn ────────────────────────────────
+
+@only_groups
+async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/снятьварн</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    ok = await db_remove_last_warn(target.id, cid)
+    if ok:
+        remaining = len(await db_get_user_warns(target.id, cid))
+        await msg.reply_text(
+            f"✅ Последний варн {mention(target.id, target.first_name)} снят. "
+            f"Осталось: <b>{remaining}/{_WARN_LIMIT}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await msg.reply_text(
+            f"❌ У {mention(target.id, target.first_name)} нет активных варнов",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── /снятьваны / снять все варны ─────────────────────
+
+@only_groups
+async def cmd_clearwarns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/снятьварны</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    count  = await db_clear_warns(target.id, cid)
+    await msg.reply_text(
+        f"✅ Сняты все варны (<b>{count}</b>) у {mention(target.id, target.first_name)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /варны — список варнов пользователя / чата ───────
+
+@only_groups
+async def cmd_warnlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    # Reply → show specific user's warns
+    if msg.reply_to_message and not msg.reply_to_message.from_user.is_bot:
+        target = msg.reply_to_message.from_user
+        warns  = await db_get_user_warns(target.id, cid)
+        if not warns:
+            await msg.reply_text(
+                f"✅ У {mention(target.id, target.first_name)} нет варнов",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        lines = [
+            f"{i+1}. <code>{w['warned_at'][:10]}</code>"
+            + (f" — {w['reason']}" if w.get("reason") else "")
+            for i, w in enumerate(warns)
+        ]
+        await msg.reply_text(
+            f"⚠️ Варны {mention(target.id, target.first_name)}: "
+            f"<b>{len(warns)}/{_WARN_LIMIT}</b>\n\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # No reply → chat-wide warn overview
+    rows = await db_get_chat_warns(cid)
+    if not rows:
+        await msg.reply_text("✅ Нет активных варнов в чате")
+        return
+    lines = [
+        f"• {mention(r['user_id'], 'id'+str(r['user_id']))} — "
+        f"<b>{r['cnt']}/{_WARN_LIMIT}</b> варн."
+        for r in rows
+    ]
+    await msg.reply_text(
+        f"⚠️ <b>Варны в чате</b>:\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /муты — список замутенных ─────────────────────────
+
+@only_groups
+async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid   = update.effective_chat.id
+    mutes = await db_get_mutes(cid)
+    if not mutes:
+        await update.message.reply_text("✅ Нет замутенных")
+        return
+    lines = []
+    for m in mutes[:20]:
+        until = datetime.fromisoformat(m["until"]) if m.get("until") else None
+        r     = m.get("reason", "")
+        lines.append(
+            f"• {mention(m['user_id'], 'id'+str(m['user_id']))} — "
+            f"⏱{_fmt_until(until)}"
+            + (f" [{r}]" if r else "")
+        )
+    await update.message.reply_text(
+        f"🔇 <b>Замутенные ({len(mutes)})</b>:\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#              ADMIN PANEL
+# ══════════════════════════════════════════════════════
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_group_or_bot_admin(update):
         await update.message.reply_text("❌ Нет доступа — только для администраторов")
@@ -3106,12 +3669,13 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика",    callback_data="ap:stats"),
-         InlineKeyboardButton("🏆 Топ VRF",      callback_data="ap:top")],
+         InlineKeyboardButton("🏆 Топ VRF",       callback_data="ap:top")],
         [InlineKeyboardButton("💑 Все браки",     callback_data="ap:marriages"),
-         InlineKeyboardButton("👮 Бот-админы",   callback_data="ap:admins")],
+         InlineKeyboardButton("👮 Бот-админы",    callback_data="ap:admins")],
         [InlineKeyboardButton("📋 Все команды",   callback_data="ap:cmds"),
          InlineKeyboardButton("ℹ️ Управление",   callback_data="ap:manage")],
-        [SBtn("Закрыть", style="danger",       callback_data="ap:close")],
+        [InlineKeyboardButton("🛡️ Модерация",    callback_data="ap:mod")],
+        [SBtn("Закрыть", style="danger",          callback_data="ap:close")],
     ])
     await update.message.reply_text(
         f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -3174,23 +3738,85 @@ async def cmd_takevrf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @only_groups
 async def cmd_givebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /givebear [N] — reply to give N bears (default 1)."""
     if not await is_group_or_bot_admin(update):
         await update.message.reply_text("❌ Только для администраторов")
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Ответь на сообщение пользователя")
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/givebear [кол-во]</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
+
+    # Parse optional count
+    count = 1
+    if context.args:
+        try:
+            count = int(context.args[0])
+        except ValueError:
+            pass
+    count = max(1, min(count, 1000))
+
     target = update.message.reply_to_message.from_user
     cid    = update.effective_chat.id
     await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET bears=bears+1 WHERE user_id=? AND chat_id=?",
-                         (target.id, cid))
+        await db.execute(
+            "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+            (count, target.id, cid),
+        )
         await db.commit()
+
     u = await db_get_user(target.id, cid)
     await update.message.reply_text(
-        f"{E_BEAR} {mention(target.id, target.first_name)} получает медведя!\n"
-        f"Всего {E_BEAR}: {u['bears']}",
+        f"🐻 {mention(target.id, target.first_name)} получает "
+        f"<b>{count}🐻</b>!\n"
+        f"Итого медведей: <b>{u['bears']}🐻</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@only_groups
+async def cmd_takebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /takebear [N] — reply to remove N bears (default 1)."""
+    if not await is_group_or_bot_admin(update):
+        await update.message.reply_text("❌ Только для администраторов")
+        return
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/takebear [кол-во]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    count = 1
+    if context.args:
+        try:
+            count = int(context.args[0])
+        except ValueError:
+            pass
+    count = max(1, min(count, 1000))
+
+    target = update.message.reply_to_message.from_user
+    cid    = update.effective_chat.id
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET bears=MAX(0, bears-?) WHERE user_id=? AND chat_id=?",
+            (count, target.id, cid),
+        )
+        await db.commit()
+
+    u = await db_get_user(target.id, cid)
+    await update.message.reply_text(
+        f"🐻 У {mention(target.id, target.first_name)} изъято "
+        f"<b>{count}🐻</b>.\n"
+        f"Осталось медведей: <b>{u['bears']}🐻</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -4856,7 +5482,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  InlineKeyboardButton("👮 Бот-админы",  callback_data="ap:admins")],
                 [InlineKeyboardButton("📋 Все команды",  callback_data="ap:cmds"),
                  InlineKeyboardButton("ℹ️ Управление",  callback_data="ap:manage")],
-                [SBtn("Закрыть", style="danger",      callback_data="ap:close")],
+                [InlineKeyboardButton("🛡️ Модерация",   callback_data="ap:mod")],
+                [SBtn("Закрыть", style="danger",         callback_data="ap:close")],
             ])
             await query.edit_message_text(
                 f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -4866,6 +5493,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif action == "close":
             await query.answer("Закрыто")
             await query.message.delete()
+
+        elif action == "mod":
+            await query.answer()
+            mutes = await db_get_mutes(cid)
+            warns = await db_get_chat_warns(cid)
+            m_cnt = len(mutes)
+            w_cnt = sum(r["cnt"] for r in warns)
+            mut_lines = ""
+            if mutes:
+                mut_lines = "\n<b>🔇 Замутены:</b>\n" + "\n".join(
+                    "  • " + mention(m["user_id"], "id" + str(m["user_id"])) + " — " +
+                    _fmt_until(datetime.fromisoformat(m["until"]) if m.get("until") else None) +
+                    (f" [{m['reason']}]" if m.get("reason") else "")
+                    for m in mutes[:10]
+                )
+            warn_lines = ""
+            if warns:
+                warn_lines = "\n<b>⚠️ Варны:</b>\n" + "\n".join(
+                    "  • " + mention(r["user_id"], "id" + str(r["user_id"])) +
+                    f" — {r['cnt']}/{_WARN_LIMIT}"
+                    for r in warns[:10]
+                )
+            mod_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔇 Замутить",    callback_data="ap:mod_help_mute"),
+                 InlineKeyboardButton("🔊 Размутить",   callback_data="ap:mod_help_unmute")],
+                [InlineKeyboardButton("⚠️ Варн",        callback_data="ap:mod_help_warn"),
+                 InlineKeyboardButton("✅ Снять варн",  callback_data="ap:mod_help_unwarn")],
+                [InlineKeyboardButton("👢 Кик",         callback_data="ap:mod_help_kick"),
+                 InlineKeyboardButton("🚫 Бан",         callback_data="ap:mod_help_ban")],
+                [SBtn("◀ Назад", style="primary",       callback_data="ap:back")],
+            ])
+            await query.edit_message_text(
+                f"🛡️ <b>Модерация</b>\n\n"
+                f"🔇 Замутено: <b>{m_cnt}</b>  ·  ⚠️ Всего варнов: <b>{w_cnt}</b>\n"
+                f"{mut_lines}{warn_lines}\n\n"
+                f"<b>Команды (ответом на сообщение):</b>\n"
+                f"<code>/мут [10м/2ч/1д/навсегда] [причина]</code>\n"
+                f"<code>/размут</code>\n"
+                f"<code>/варн [причина]</code>  →  лимит {_WARN_LIMIT} → автомут 24ч\n"
+                f"<code>/снятьварн</code>  ·  <code>/снятьварны</code>\n"
+                f"<code>/варны</code>  ·  <code>/муты</code>\n"
+                f"<code>/кик [причина]</code>\n"
+                f"<code>/бан [срок] [причина]</code>  ·  <code>/разбан</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=mod_kb,
+            )
+
+        elif action.startswith("mod_help_"):
+            await query.answer()  # no-op, info is already in the panel
 
         elif action == "stats":
             await query.answer()
@@ -5266,9 +5942,32 @@ def main() -> None:
     app.add_handler(CommandHandler("givevrf",      cmd_givevrf))
     app.add_handler(CommandHandler("takevrf",      cmd_takevrf))
     app.add_handler(CommandHandler("givebear",     cmd_givebear))
+    app.add_handler(CommandHandler("takebear",     cmd_takebear))
     app.add_handler(CommandHandler("addadmin",     cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
     app.add_handler(CommandHandler("listadmins",   cmd_listadmins))
+
+    # Moderation (hidden — not in BotCommand list or /help)
+    app.add_handler(CommandHandler(
+        ["мут", "mute", "заглушить", "заткнуть"], cmd_mute))
+    app.add_handler(CommandHandler(
+        ["размут", "анмут", "unmute", "разглушить"], cmd_unmute))
+    app.add_handler(CommandHandler(
+        ["кик", "kick"], cmd_kick))
+    app.add_handler(CommandHandler(
+        ["бан", "ban"], cmd_ban))
+    app.add_handler(CommandHandler(
+        ["разбан", "unban"], cmd_unban))
+    app.add_handler(CommandHandler(
+        ["варн", "warn", "пред"], cmd_warn))
+    app.add_handler(CommandHandler(
+        ["снятьварн", "unwarn", "unwarн"], cmd_unwarn))
+    app.add_handler(CommandHandler(
+        ["снятьварны", "clearwarns"], cmd_clearwarns))
+    app.add_handler(CommandHandler(
+        ["варны", "warnlist", "варнлист"], cmd_warnlist))
+    app.add_handler(CommandHandler(
+        ["муты", "mutelist", "мутлист"], cmd_mutelist))
 
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))

@@ -1221,49 +1221,45 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_groups
 async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send statistics as a styled image card."""
-    if update.message.reply_to_message and not update.message.reply_to_message.from_user.is_bot:
-        target = update.message.reply_to_message.from_user
-    else:
-        target = update.effective_user
+    """Send group activity chart (messages + games per day)."""
+    cid  = update.effective_chat.id
+    days = 30
+    if context.args:
+        try:
+            days = min(90, max(7, int(context.args[0])))
+        except ValueError:
+            pass
 
-    cid = update.effective_chat.id
-    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
-    u = await db_get_user(target.id, cid)
-    if not u:
-        return
-
-    display = f"@{u['username']}" if u.get("username") else u.get("first_name", "Игрок")
-
-    # Run in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    img_bytes = await loop.run_in_executor(None, _stats_image_sync, u, display)
-
-    if img_bytes is None:
+    rows = await db_get_activity(cid, days)
+    if not rows:
         await update.message.reply_text(
-            "❌ <b>Pillow не установлен!</b>\n\n"
-            "Добавь в <code>requirements.txt</code>:\n"
-            "<code>Pillow</code>",
+            "📊 <b>Данных пока нет</b>\n\n"
+            "Активность начнёт отслеживаться с этого момента. "
+            "Напишите что-нибудь в чат и запустите /statsimg снова!",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    lvl     = get_level(u["experience"])
-    wr      = round(u["wins"] / max(1, u["total_games"]) * 100, 1)
-    profit  = u["vrf"] - STARTING_VRF
-    p_sign  = "+" if profit >= 0 else ""
+    loop      = asyncio.get_event_loop()
+    img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
 
-    caption = (
-        f"📊 <b>Статистика {mention(target.id, u['first_name'])}</b>\n"
-        f"💎 {fmt(u['vrf'])} VRF  ·  Уровень {lvl} — {get_rank(lvl)}\n"
-        f"🏆 {u['wins']} побед ({wr}%)  ·  🎮 {u['total_games']} игр\n"
-        f"💰 Баланс от старта: <b>{p_sign}{fmt(profit)} VRF</b>"
-    )
+    if img_bytes is None:
+        await update.message.reply_text(
+            "❌ Установи matplotlib:\n<code>pip install matplotlib</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
+    total_msgs  = sum(r[1] for r in rows)
+    total_games = sum(r[2] for r in rows)
     await context.bot.send_photo(
         chat_id=cid,
         photo=io.BytesIO(img_bytes),
-        caption=caption,
+        caption=(
+            f"📈 <b>Статистика активности — {days} дн.</b>\n\n"
+            f"💬 Сообщений: <b>{fmt(total_msgs)}</b>\n"
+            f"🎮 Игр сыграно: <b>{fmt(total_games)}</b>"
+        ),
         parse_mode=ParseMode.HTML,
     )
 
@@ -4730,7 +4726,7 @@ async def on_startup(app: Application) -> None:
     cmds = [
         BotCommand("start",    "🏠 Старт / Главное меню"),
         BotCommand("profile",  "👤 Мой профиль"),
-        BotCommand("statsimg", "📊 Статистика картинкой"),
+        BotCommand("statsimg", "📈 График активности чата [дней]"),
         BotCommand("activity", "📈 График активности чата [дней]"),
         BotCommand("top",      "🏆 Топ игроков"),
         BotCommand("stats",    "📊 Статистика чата"),

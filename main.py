@@ -589,6 +589,14 @@ async def db_init() -> None:
                 added_at   TEXT    NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS daily_activity (
+                date     TEXT    NOT NULL,
+                chat_id  INTEGER NOT NULL,
+                messages INTEGER DEFAULT 0,
+                games    INTEGER DEFAULT 0,
+                PRIMARY KEY (date, chat_id)
+            );
+
 
         """)
         await db.commit()
@@ -610,6 +618,35 @@ async def db_init() -> None:
             except Exception:
                 pass
     log.info("Database initialised at %s", DB_PATH)
+
+
+async def db_log_activity(cid: int, msgs: int = 0, gms: int = 0) -> None:
+    """Increment daily message/game counters for a chat."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO daily_activity (date, chat_id, messages, games)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(date, chat_id) DO UPDATE SET
+                   messages = messages + excluded.messages,
+                   games    = games    + excluded.games""",
+            (today, cid, msgs, gms),
+        )
+        await db.commit()
+
+
+async def db_get_activity(cid: int, days: int = 30) -> list:
+    """Return (date, messages, games) rows for the last N days."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT date, messages, games
+               FROM daily_activity
+               WHERE chat_id = ?
+                 AND date >= date('now', ? || ' days')
+               ORDER BY date""",
+            (cid, f"-{days}"),
+        ) as cur:
+            return await cur.fetchall()
 
 
 # ── Users ──────────────────────────────────────────────
@@ -737,6 +774,10 @@ async def db_record_game(
                 (uid, cid),
             )
             await db.commit()
+
+    # Log one game per winner to daily activity chart
+    if won:
+        await db_log_activity(cid, gms=1)
 
 
 async def db_can_earn_xp(uid: int, cid: int) -> bool:
@@ -1223,6 +1264,156 @@ async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         chat_id=cid,
         photo=io.BytesIO(img_bytes),
         caption=caption,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#         ACTIVITY CHART COMMAND 📈
+# ══════════════════════════════════════════════════════
+
+def _activity_chart_sync(rows: list) -> Optional[bytes]:
+    """
+    Generate 'Статистика активности' bar chart using matplotlib.
+    rows: list of (date 'YYYY-MM-DD', messages: int, games: int)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from datetime import datetime as _dt, timedelta as _td
+    except ImportError:
+        return None
+
+    if not rows:
+        return None
+
+    # ── Fill all dates in range (0 for missing days) ──────
+    all_dates: dict = {}
+    if rows:
+        start = _dt.strptime(rows[0][0],  "%Y-%m-%d")
+        end   = _dt.strptime(rows[-1][0], "%Y-%m-%d")
+        cur   = start
+        while cur <= end:
+            all_dates[cur.strftime("%Y-%m-%d")] = [0, 0]
+            cur += _td(days=1)
+    for date_s, msg, gm in rows:
+        all_dates[date_s] = [int(msg), int(gm)]
+
+    sorted_dates = sorted(all_dates)
+    messages = [all_dates[d][0] for d in sorted_dates]
+    games    = [all_dates[d][1] for d in sorted_dates]
+    labels   = [d[8:10] + "." + d[5:7] for d in sorted_dates]   # DD.MM
+    n        = len(sorted_dates)
+    x        = np.arange(n)
+    bar_w    = 0.40
+
+    # ── Figure ────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    fig.patch.set_facecolor("#f4f4f4")
+    ax.set_facecolor("#f4f4f4")
+
+    # ── Bars ──────────────────────────────────────────────
+    # Lime-green for messages, orange for games
+    ax.bar(x - bar_w / 2, messages, bar_w,
+           color="#b5e61d", zorder=3, label="Сообщения")
+    ax.bar(x + bar_w / 2, games,    bar_w,
+           color="#f07030", zorder=3, label="Игры")
+
+    # ── X-axis: show label every ~2 days ─────────────────
+    step = max(1, n // 15)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels(labels[::step], fontsize=9, color="#444444")
+    ax.tick_params(axis="x", bottom=False, top=False)
+    ax.set_xlim(-0.7, n - 0.3)
+
+    # ── Y-axis left ───────────────────────────────────────
+    ax.tick_params(axis="y", labelsize=9, labelcolor="#444444",
+                   left=True, right=False)
+    ax.set_ylim(bottom=0)
+
+    # ── Twin Y-axis (right) with "Сообщения" label ────────
+    ax2 = ax.twinx()
+    ax2.set_ylim(ax.get_ylim())
+    yticks = ax.get_yticks()
+    ax2.set_yticks(yticks)
+    ax2.set_yticklabels(
+        [str(int(t)) if t >= 0 and t == int(t) else "" for t in yticks],
+        fontsize=9, color="#3344cc",
+    )
+    ax2.set_ylabel("Сообщения", fontsize=9, color="#3344cc",
+                   rotation=90, labelpad=8)
+    ax2.tick_params(axis="y", colors="#3344cc", right=True, width=0.5)
+    ax2.spines["right"].set_color("#3344cc")
+    ax2.spines["right"].set_linewidth(0.8)
+
+    # ── Grid ──────────────────────────────────────────────
+    ax.yaxis.grid(True, color="#cccccc", linestyle="-",
+                  linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    # ── Spines: hide all except right (handled by ax2) ───
+    for sp in ("top", "right", "left", "bottom"):
+        ax.spines[sp].set_visible(False)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["left"].set_visible(False)
+    ax2.spines["bottom"].set_visible(False)
+
+    # ── Title + legend ────────────────────────────────────
+    ax.set_title("Статистика активности", fontsize=13,
+                 color="#333333", pad=10)
+    ax.legend(loc="upper right", fontsize=9,
+              framealpha=0.7, frameon=True)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="PNG", dpi=130, bbox_inches="tight",
+                facecolor="#f4f4f4", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+@only_groups
+async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the group's activity chart (messages + games per day)."""
+    cid  = update.effective_chat.id
+    days = 30
+    if context.args:
+        try:
+            days = min(90, max(7, int(context.args[0])))
+        except ValueError:
+            pass
+
+    rows = await db_get_activity(cid, days)
+    if not rows:
+        await update.message.reply_text(
+            "📊 <b>Данных пока нет</b>\n\nАктивность начнёт отслеживаться с этого момента.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    loop      = asyncio.get_event_loop()
+    img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
+
+    if img_bytes is None:
+        await update.message.reply_text(
+            "❌ Установи matplotlib:\n<code>pip install matplotlib</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_msgs  = sum(r[1] for r in rows)
+    total_games = sum(r[2] for r in rows)
+    await context.bot.send_photo(
+        chat_id=cid,
+        photo=io.BytesIO(img_bytes),
+        caption=(
+            f"📈 <b>Активность чата — последние {days} дн.</b>\n\n"
+            f"💬 Сообщений: <b>{fmt(total_msgs)}</b>\n"
+            f"🎮 Игр сыграно: <b>{fmt(total_games)}</b>"
+        ),
         parse_mode=ParseMode.HTML,
     )
 
@@ -4495,6 +4686,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # ── XP from regular messages ──────────────────────────
+    # Log every message to the daily activity chart
+    await db_log_activity(cid, msgs=1)
+
     if not await db_can_earn_xp(u.id, cid):
         return
 
@@ -4537,6 +4731,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("start",    "🏠 Старт / Главное меню"),
         BotCommand("profile",  "👤 Мой профиль"),
         BotCommand("statsimg", "📊 Статистика картинкой"),
+        BotCommand("activity", "📈 График активности чата [дней]"),
         BotCommand("top",      "🏆 Топ игроков"),
         BotCommand("stats",    "📊 Статистика чата"),
         BotCommand("daily",    "⚡ Ежедневный бонус"),
@@ -4582,7 +4777,8 @@ def main() -> None:
 
     # Profile
     app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("statsimg", cmd_statsimg))
+    app.add_handler(CommandHandler("statsimg",  cmd_statsimg))
+    app.add_handler(CommandHandler("activity",  cmd_activity))
     app.add_handler(CommandHandler("top",     cmd_top))
     app.add_handler(CommandHandler(["leaderboard", "lb"], cmd_top))
     app.add_handler(CommandHandler("stats",   cmd_stats))

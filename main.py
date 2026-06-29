@@ -3306,7 +3306,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
         await msg.reply_text(
             "📌 Ответь на сообщение пользователя:\n"
-            "<code>/мут [10м / 2ч / 1д / навсегда] [причина]</code>\n"
+            "<code>/mute [10m / 2h / 1d / навсегда] [причина]</code>\n"
             "По умолчанию: 7 дней",
             parse_mode=ParseMode.HTML,
         )
@@ -3342,7 +3342,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ── /размут /анмут /unmute ────────────────────────────
+# ── /unmute /анмут /unmute ────────────────────────────
 
 @only_groups
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3351,7 +3351,7 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     msg = update.message
 
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
-        await msg.reply_text("📌 Ответь на сообщение пользователя: <code>/размут</code>",
+        await msg.reply_text("📌 Ответь на сообщение пользователя: <code>/unmute</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3381,7 +3381,7 @@ async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid  = update.effective_chat.id
 
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
-        await msg.reply_text("📌 Ответь на сообщение: <code>/кик [причина]</code>",
+        await msg.reply_text("📌 Ответь на сообщение: <code>/kick [причина]</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3419,7 +3419,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
         await msg.reply_text(
             "📌 Ответь на сообщение:\n"
-            "<code>/бан [срок] [причина]</code>  (без срока = навсегда)",
+            "<code>/ban [срок] [причина]</code>  (без срока = навсегда)",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -3455,7 +3455,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ── /разбан /unban ────────────────────────────────────
+# ── /unban /unban ────────────────────────────────────
 
 @only_groups
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3464,7 +3464,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
 
     if not msg.reply_to_message:
-        await msg.reply_text("📌 Ответь на сообщение: <code>/разбан</code>",
+        await msg.reply_text("📌 Ответь на сообщение: <code>/unban</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3494,7 +3494,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid    = update.effective_chat.id
 
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
-        await msg.reply_text("📌 Ответь на сообщение: <code>/варн [причина]</code>",
+        await msg.reply_text("📌 Ответь на сообщение: <code>/pred [причина]</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3533,7 +3533,7 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-# ── /снятьварн /unwarn ────────────────────────────────
+# ── /unpred /unwarn ────────────────────────────────
 
 @only_groups
 async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3543,7 +3543,7 @@ async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cid = update.effective_chat.id
 
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
-        await msg.reply_text("📌 Ответь на сообщение: <code>/снятьварн</code>",
+        await msg.reply_text("📌 Ответь на сообщение: <code>/unpred</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3573,7 +3573,7 @@ async def cmd_clearwarns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     cid = update.effective_chat.id
 
     if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
-        await msg.reply_text("📌 Ответь на сообщение: <code>/снятьварны</code>",
+        await msg.reply_text("📌 Ответь на сообщение: <code>/clearpred</code>",
                              parse_mode=ParseMode.HTML)
         return
 
@@ -3585,7 +3585,7 @@ async def cmd_clearwarns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
-# ── /варны — список варнов пользователя / чата ───────
+# ── /predlist — список варнов пользователя / чата ───────
 
 @only_groups
 async def cmd_warnlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3632,7 +3632,7 @@ async def cmd_warnlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-# ── /муты — список замутенных ─────────────────────────
+# ── /mutelist — список замутенных ─────────────────────────
 
 @only_groups
 async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5529,13 +5529,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🔇 Замутено: <b>{m_cnt}</b>  ·  ⚠️ Всего варнов: <b>{w_cnt}</b>\n"
                 f"{mut_lines}{warn_lines}\n\n"
                 f"<b>Команды (ответом на сообщение):</b>\n"
-                f"<code>/мут [10м/2ч/1д/навсегда] [причина]</code>\n"
-                f"<code>/размут</code>\n"
-                f"<code>/варн [причина]</code>  →  лимит {_WARN_LIMIT} → автомут 24ч\n"
-                f"<code>/снятьварн</code>  ·  <code>/снятьварны</code>\n"
-                f"<code>/варны</code>  ·  <code>/муты</code>\n"
-                f"<code>/кик [причина]</code>\n"
-                f"<code>/бан [срок] [причина]</code>  ·  <code>/разбан</code>",
+                f"<code>/mute [10m/2h/1d/навсегда] [причина]</code>\n"
+                f"<code>/unmute</code>\n"
+                f"<code>/pred [причина]</code>  →  лимит {_WARN_LIMIT} → автомут 24ч\n"
+                f"<code>/unpred</code>  ·  <code>/clearpred</code>\n"
+                f"<code>/predlist</code>  ·  <code>/mutelist</code>\n"
+                f"<code>/kick [причина]</code>\n"
+                f"<code>/ban [срок] [причина]</code>  ·  <code>/unban</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=mod_kb,
             )
@@ -5948,26 +5948,17 @@ def main() -> None:
     app.add_handler(CommandHandler("listadmins",   cmd_listadmins))
 
     # Moderation (hidden — not in BotCommand list or /help)
-    app.add_handler(CommandHandler(
-        ["мут", "mute", "заглушить", "заткнуть"], cmd_mute))
-    app.add_handler(CommandHandler(
-        ["размут", "анмут", "unmute", "разглушить"], cmd_unmute))
-    app.add_handler(CommandHandler(
-        ["кик", "kick"], cmd_kick))
-    app.add_handler(CommandHandler(
-        ["бан", "ban"], cmd_ban))
-    app.add_handler(CommandHandler(
-        ["разбан", "unban"], cmd_unban))
-    app.add_handler(CommandHandler(
-        ["варн", "warn", "пред"], cmd_warn))
-    app.add_handler(CommandHandler(
-        ["снятьварн", "unwarn", "unwarн"], cmd_unwarn))
-    app.add_handler(CommandHandler(
-        ["снятьварны", "clearwarns"], cmd_clearwarns))
-    app.add_handler(CommandHandler(
-        ["варны", "warnlist", "варнлист"], cmd_warnlist))
-    app.add_handler(CommandHandler(
-        ["муты", "mutelist", "мутлист"], cmd_mutelist))
+    # Note: Telegram only accepts [a-z0-9_] in command names
+    app.add_handler(CommandHandler(["mute",      "mut"],       cmd_mute))
+    app.add_handler(CommandHandler(["unmute",    "unmut"],     cmd_unmute))
+    app.add_handler(CommandHandler(["kick"],                   cmd_kick))
+    app.add_handler(CommandHandler(["ban"],                    cmd_ban))
+    app.add_handler(CommandHandler(["unban"],                  cmd_unban))
+    app.add_handler(CommandHandler(["pred",      "warn"],      cmd_warn))
+    app.add_handler(CommandHandler(["unpred",    "unwarn"],    cmd_unwarn))
+    app.add_handler(CommandHandler(["clearpred", "clearwarns"],cmd_clearwarns))
+    app.add_handler(CommandHandler(["predlist",  "warnlist"],  cmd_warnlist))
+    app.add_handler(CommandHandler(["mutelist"],               cmd_mutelist))
 
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))

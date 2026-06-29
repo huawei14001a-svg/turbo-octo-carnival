@@ -1745,68 +1745,77 @@ def _game_vrf(score: int) -> int:
 
 
 # ── Score API handler (aiohttp) ───────────────────────
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin":  "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
 async def handle_game_score(request: aio_web.Request) -> aio_web.Response:
-    """POST /api/game/score  — called by game.html when game ends."""
+    """POST /api/game/score — called by game HTML when game ends."""
     # CORS preflight
     if request.method == "OPTIONS":
-        return aio_web.Response(
-            headers={
-                "Access-Control-Allow-Origin":  "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
-            }
-        )
+        return aio_web.Response(headers=CORS_HEADERS)
+
     try:
         data = await request.json()
     except Exception:
         return aio_web.json_response({"ok": False, "error": "bad json"},
-                                     status=400)
+                                     headers=CORS_HEADERS, status=400)
 
     token = str(data.get("token", ""))
-    uid   = int(data.get("uid", 0))
+    uid   = int(data.get("uid",   0))
     score = max(0, min(int(data.get("score", 0)), 999_999))
+
+    log.info("Game score received: uid=%s score=%s token=%s…", uid, score, token[:8])
 
     info = game_tokens.pop(token, None)
     if not info or info["uid"] != uid:
+        log.warning("Invalid/expired game token: %s", token[:8])
         return aio_web.json_response({"ok": False, "error": "invalid token"},
-                                     status=403)
+                                     headers=CORS_HEADERS, status=403)
 
-    # Expire after 90 minutes
-    if time.time() - info["created"] > 5400:
+    if time.time() - info["created"] > 5400:   # 90 min
         return aio_web.json_response({"ok": False, "error": "token expired"},
-                                     status=403)
+                                     headers=CORS_HEADERS, status=403)
 
-    cid    = info["cid"]
-    msg_id = info["msg_id"]
-    bot    = info["bot"]
+    cid      = info["cid"]
+    msg_id   = info["msg_id"]
+    username = info.get("username", "")
+    fname    = info.get("first_name", "")
+    bot      = info["bot"]
 
-    # setGameScore
+    # ── setGameScore → обновляет счёт в сообщении чата ──
+    score_set = False
     try:
         await bot.set_game_score(
             user_id=uid, score=score,
             chat_id=cid, message_id=msg_id,
             force=True,
         )
+        score_set = True
+        log.info("setGameScore OK: uid=%s score=%s", uid, score)
     except Exception as e:
-        log.warning("setGameScore failed: %s", e)
+        log.warning("setGameScore FAILED: %s", e)
 
-    # Award VRF
-    vrf = _game_vrf(score)
+    # ── Award VRF ─────────────────────────────────────────
+    vrf      = _game_vrf(score)
     msg_text = ""
     if vrf > 0:
         try:
-            await db_ensure_user(uid, cid, "", "")
-            new_bal = await db_add_vrf(uid, cid, vrf)
+            if username or fname:
+                await db_ensure_user(uid, cid, username, fname)
+            new_bal  = await db_add_vrf(uid, cid, vrf)
             await db_add_xp(uid, cid, XP_PER_WIN if score >= 200 else XP_PER_GAME)
             msg_text = f"Баланс: {fmt(new_bal)} VRF"
+            log.info("VRF awarded: uid=%s vrf=%s bal=%s", uid, vrf, new_bal)
         except Exception as e:
             log.warning("VRF award failed: %s", e)
 
-    resp = aio_web.json_response(
-        {"ok": True, "vrf_earned": vrf, "message": msg_text},
-        headers={"Access-Control-Allow-Origin": "*"},
+    return aio_web.json_response(
+        {"ok": True, "vrf_earned": vrf, "message": msg_text, "score_set": score_set},
+        headers=CORS_HEADERS,
     )
-    return resp
 
 
 # ── /game command ─────────────────────────────────────
@@ -1856,11 +1865,13 @@ async def on_game_callback(update: Update,
     # Create signed token
     token = str(uuid.uuid4())
     game_tokens[token] = {
-        "uid":     user.id,
-        "cid":     cid,
-        "msg_id":  msg_id,
-        "bot":     context.bot,
-        "created": time.time(),
+        "uid":        user.id,
+        "cid":        cid,
+        "msg_id":     msg_id,
+        "username":   user.username or "",
+        "first_name": user.first_name or "",
+        "bot":        context.bot,
+        "created":    time.time(),
     }
 
     # Expire old tokens (simple cleanup)

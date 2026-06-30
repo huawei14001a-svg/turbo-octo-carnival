@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 import aiosqlite
 from telegram import (
     ChatPermissions,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -161,6 +162,7 @@ giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
 giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
 crash_rounds: dict    = {}   # key: cid (int) — Crash multiplier game
 crash_setups: dict    = {}   # key: setup_id (str) — Crash setup wizard
+crash_custom_pending: dict = {}  # key: (cid, uid) — waiting for a custom bet amount
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -1773,14 +1775,17 @@ def _crash_flavor(mult: float) -> str:
 
 
 # ══════════════════════════════════════════════════════
-#   CRASH — Rocket image generator 🎨  (Pillow)
+#   CRASH — Rocket image generator 🎨  (Pillow, 640×360)
 # ══════════════════════════════════════════════════════
-# Draws the live rocket-ascent scene as a PNG. mode:
+# Draws the live rocket-ascent scene as a landscape PNG. The rocket
+# travels along a fixed diagonal from the pad (bottom-left) to deep
+# space (top-right) — this uses a 640×360 canvas far better than a
+# purely vertical ascent would. mode:
 #   "pad"    — idle on the launch pad (sent once at round start)
 #   "flight" — ascending, multiplier baked into the picture (every tick)
 #   "crash"  — explosion burst at the final multiplier (round end)
 
-_CR_W, _CR_H = 640, 860
+_CR_W, _CR_H = 640, 360
 _CR_PAD_BG   = (22, 33, 62)
 _CR_MID_BG   = (13, 27, 62)
 _CR_SPACE_BG = (5, 8, 26)
@@ -1792,6 +1797,15 @@ _CR_CLOUD    = (207, 216, 227)
 _CR_FLAME_LO = (255, 233, 168)
 _CR_FLAME_MD = (240, 160, 48)
 _CR_FLAME_HI = (255, 91, 53)
+
+# Diagonal flight path: pad (bottom-left) → deep space (top-right)
+_CR_PAD_X, _CR_PAD_Y = 96, 250
+_CR_TOP_X, _CR_TOP_Y = 540, 46
+_CR_DX = _CR_TOP_X - _CR_PAD_X
+_CR_DY = _CR_TOP_Y - _CR_PAD_Y
+_CR_DIST = math.hypot(_CR_DX, _CR_DY)
+_CR_UX, _CR_UY = _CR_DX / _CR_DIST, _CR_DY / _CR_DIST   # unit: direction of travel
+_CR_PX, _CR_PY = -_CR_UY, _CR_UX                          # perpendicular (trail width)
 
 _crash_star_pool_cache: Optional[list] = None
 
@@ -1814,16 +1828,16 @@ def _cr_flame_color(frac: float) -> tuple:
 
 
 def _cr_star_pool() -> list:
-    """Fixed star field (deterministic, doesn't touch the global RNG)."""
+    """Fixed star field biased toward the upper-right sky (deterministic, local RNG)."""
     global _crash_star_pool_cache
     if _crash_star_pool_cache is not None:
         return _crash_star_pool_cache
-    rng  = random.Random(7)
+    rng  = random.Random(11)
     pool = []
-    for _ in range(46):
-        x = rng.uniform(20, _CR_W - 20)
-        y = rng.uniform(20, _CR_H * 0.62)
-        r = rng.uniform(0.8, 2.2)
+    for _ in range(34):
+        x = rng.uniform(140, _CR_W - 15)
+        y = rng.uniform(8, _CR_H * 0.62)
+        r = rng.uniform(0.7, 1.9)
         op = rng.uniform(0.35, 0.95)
         reveal = rng.uniform(0.0, 0.85)
         pool.append((x, y, r, op, reveal))
@@ -1840,43 +1854,48 @@ def _cr_draw_stars(draw, frac: float) -> None:
                      fill=(shade, shade, min(255, shade + 12)))
 
 
-def _cr_draw_trail(draw, cx, top_y, bottom_y, top_w, bottom_w,
+def _cr_draw_trail(draw, tip_x, tip_y, length, near_w, far_w,
                     near_color, bg_color, segs: int = 5) -> None:
+    """Tapered exhaust trail extending backward along the flight diagonal."""
     for i in range(segs):
         t0, t1 = i / segs, (i + 1) / segs
-        y0 = top_y + (bottom_y - top_y) * t0
-        y1 = top_y + (bottom_y - top_y) * t1
-        w0 = top_w + (bottom_w - top_w) * t0
-        w1 = top_w + (bottom_w - top_w) * t1
+        x0, y0 = tip_x - _CR_UX*length*t0, tip_y - _CR_UY*length*t0
+        x1, y1 = tip_x - _CR_UX*length*t1, tip_y - _CR_UY*length*t1
+        w0 = near_w + (far_w - near_w) * t0
+        w1 = near_w + (far_w - near_w) * t1
         col = _cr_lerp(near_color, bg_color, t0 * 0.9)
         draw.polygon([
-            (cx - w0/2, y0), (cx + w0/2, y0),
-            (cx + w1/2, y1), (cx - w1/2, y1),
+            (x0 - _CR_PX*w0/2, y0 - _CR_PY*w0/2), (x0 + _CR_PX*w0/2, y0 + _CR_PY*w0/2),
+            (x1 + _CR_PX*w1/2, y1 + _CR_PY*w1/2), (x1 - _CR_PX*w1/2, y1 - _CR_PY*w1/2),
         ], fill=col)
 
 
 def _cr_draw_rocket(draw, cx, nose_y, flame_color, flame_len, bg_color,
                      trail_len: float = 0) -> None:
-    bw, bh, nh = 30, 58, 30
+    bw, bh, nh = 19, 37, 19
     draw.polygon([(cx, nose_y), (cx-bw/2, nose_y+nh), (cx+bw/2, nose_y+nh)],
                  fill=_CR_WHITE)
     body_top, body_bot = nose_y + nh, nose_y + nh + bh
     draw.rounded_rectangle([cx-bw/2, body_top, cx+bw/2, body_bot],
-                           radius=8, fill=_CR_WHITE)
-    wr, wcy = 7, body_top + bh * 0.34
+                           radius=5, fill=_CR_WHITE)
+    wr, wcy = 4.5, body_top + bh * 0.34
     draw.ellipse([cx-wr, wcy-wr, cx+wr, wcy+wr], fill=_CR_WINDOW)
     fin_top = body_top + bh * 0.62
-    draw.polygon([(cx-bw/2, fin_top), (cx-bw/2-16, body_bot), (cx-bw/2, body_bot)],
+    draw.polygon([(cx-bw/2, fin_top), (cx-bw/2-10, body_bot), (cx-bw/2, body_bot)],
                  fill=_CR_FIN)
-    draw.polygon([(cx+bw/2, fin_top), (cx+bw/2+16, body_bot), (cx+bw/2, body_bot)],
+    draw.polygon([(cx+bw/2, fin_top), (cx+bw/2+10, body_bot), (cx+bw/2, body_bot)],
                  fill=_CR_FIN)
-    fw = bw * 0.55
-    flame_tip_y = body_bot + flame_len
-    draw.polygon([(cx-fw/2, body_bot), (cx+fw/2, body_bot), (cx, flame_tip_y)],
-                 fill=flame_color)
+    # Flame + trail emanate backward along the diagonal from body bottom-center
+    fw = bw * 0.6
+    flame_tip = (cx - _CR_UX*flame_len, body_bot - _CR_UY*flame_len)
+    draw.polygon([
+        (cx - _CR_PX*fw/2, body_bot - _CR_PY*fw/2),
+        (cx + _CR_PX*fw/2, body_bot + _CR_PY*fw/2),
+        flame_tip,
+    ], fill=flame_color)
     if trail_len > 0:
-        _cr_draw_trail(draw, cx, flame_tip_y, flame_tip_y + trail_len,
-                       fw*0.7, fw*2.6, flame_color, bg_color)
+        _cr_draw_trail(draw, flame_tip[0], flame_tip[1], trail_len,
+                       fw*0.7, fw*2.4, flame_color, bg_color)
 
 
 def _cr_font(paths: list, size: int):
@@ -1894,7 +1913,7 @@ def _cr_font(paths: list, size: int):
 
 def _crash_image_sync(mode: str, value: float = 1.0,
                       label_main: str = "", label_sub: str = "") -> Optional[bytes]:
-    """Render the rocket scene as PNG bytes. Returns None if Pillow is missing."""
+    """Render the rocket scene as 640×360 PNG bytes. None if Pillow is missing."""
     try:
         from PIL import Image, ImageDraw
     except ImportError:
@@ -1908,46 +1927,42 @@ def _crash_image_sync(mode: str, value: float = 1.0,
     _cr_draw_stars(d, frac)
 
     if frac < 0.12:
-        d.rounded_rectangle([60, _CR_H-70, _CR_W-60, _CR_H-40], radius=6, fill=_CR_GROUND)
+        d.rounded_rectangle([30, _CR_PAD_Y+34, 200, _CR_PAD_Y+50], radius=5, fill=_CR_GROUND)
     elif 0.15 < frac < 0.55:
-        cw = 0.4 + frac
-        d.ellipse([_CR_W*0.14, _CR_H*0.58, _CR_W*0.14+150*cw, _CR_H*0.58+60*cw], fill=_CR_CLOUD)
-        d.ellipse([_CR_W*0.6, _CR_H*0.66, _CR_W*0.6+130*cw, _CR_H*0.66+50*cw], fill=_CR_CLOUD)
+        cw = 0.35 + frac
+        d.ellipse([260, 200, 260+90*cw, 200+36*cw], fill=_CR_CLOUD)
+        d.ellipse([380, 150, 380+80*cw, 150+32*cw], fill=_CR_CLOUD)
 
-    cx = _CR_W / 2
-    nose_y = (_CR_H - 190) - frac * ((_CR_H - 190) - 120)
-    fcol   = _cr_flame_color(frac)
+    cx  = _CR_PAD_X + frac * _CR_DX
+    ny  = _CR_PAD_Y + frac * _CR_DY
+    fcol = _cr_flame_color(frac)
 
     if mode == "crash":
-        bx, by = cx, nose_y + 70
+        bx, by = cx, ny + 34
         rng2 = random.Random(99)
-        for i in range(18):
-            ang = (i / 18) * 2 * math.pi + rng2.uniform(-0.05, 0.05)
-            ln  = rng2.uniform(45, 95)
-            sx, sy = bx + math.cos(ang)*92, by + math.sin(ang)*92
-            ex, ey = bx + math.cos(ang)*(92+ln), by + math.sin(ang)*(92+ln)
-            d.line([(sx, sy), (ex, ey)], fill=_CR_FLAME_HI, width=5)
-        d.ellipse([bx-110, by-110, bx+110, by+110], outline=_CR_FLAME_MD, width=3)
-        for rad, col in [(85, _CR_FLAME_HI), (55, _CR_FLAME_MD), (28, (255, 255, 255))]:
+        for i in range(16):
+            ang = (i / 16) * 2 * math.pi + rng2.uniform(-0.05, 0.05)
+            ln  = rng2.uniform(22, 48)
+            sx, sy = bx + math.cos(ang)*46, by + math.sin(ang)*46
+            ex, ey = bx + math.cos(ang)*(46+ln), by + math.sin(ang)*(46+ln)
+            d.line([(sx, sy), (ex, ey)], fill=_CR_FLAME_HI, width=4)
+        d.ellipse([bx-55, by-55, bx+55, by+55], outline=_CR_FLAME_MD, width=3)
+        for rad, col in [(42, _CR_FLAME_HI), (27, _CR_FLAME_MD), (13, (255, 255, 255))]:
             d.ellipse([bx-rad, by-rad, bx+rad, by+rad], fill=col)
     else:
-        flame_len = 26 + frac * 30
-        trail_len = 40 + frac * (_CR_H - 260)
-        _cr_draw_rocket(d, cx, nose_y, fcol, flame_len, bg, trail_len=trail_len)
+        flame_len = 16 + frac * 16
+        trail_len = 26 + frac * (_CR_DIST - 40)
+        _cr_draw_rocket(d, cx, ny, fcol, flame_len, bg, trail_len=trail_len)
 
     _BOLD = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
     _REG  = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
     if label_main:
-        f_num = _cr_font(_BOLD, 64)
-        bbox  = d.textbbox((0, 0), label_main, font=f_num)
-        tw    = bbox[2] - bbox[0]
+        f_num = _cr_font(_BOLD, 40)
         col   = _CR_WHITE if mode == "pad" else (fcol if mode == "flight" else _CR_FLAME_HI)
-        d.text((cx - tw/2, 50), label_main, font=f_num, fill=col)
+        d.text((22, 14), label_main, font=f_num, fill=col)
     if label_sub:
-        f_sub = _cr_font(_REG, 20)
-        bbox  = d.textbbox((0, 0), label_sub, font=f_sub)
-        tw    = bbox[2] - bbox[0]
-        d.text((cx - tw/2, 128), label_sub, font=f_sub, fill=(180, 190, 210))
+        f_sub = _cr_font(_REG, 15)
+        d.text((24, 60), label_sub, font=f_sub, fill=(178, 188, 208))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
@@ -1999,6 +2014,7 @@ def _crash_join_kb(cid: int) -> InlineKeyboardMarkup:
             for a in CRASH_BET_PRESETS[3:]]
     return InlineKeyboardMarkup([
         row1, row2,
+        [SBtn("✏️ Своя сумма", style="primary", callback_data=f"cr:custom:{cid}")],
         [SBtn("Отменить раунд", style="danger", callback_data=f"cr:cancel:{cid}")],
     ])
 
@@ -2067,26 +2083,45 @@ def _crash_flight_text(rnd: dict, mult: float) -> str:
     )
 
 
-def _crash_result_text(crash_point: float, winners: list, losers: list) -> str:
-    """Caption for the final explosion photo."""
+def _crash_result_cards(crash_point: float, winners: list, losers: list) -> tuple:
+    """
+    Final results as a profile-style rich table card.
+    Returns (rich_html, fallback_html) — same convention as /profile.
+    """
+    total_pot = sum(p for _, _, p in winners) + sum(b for _, b in losers)
+    rows_rich = "".join(
+        f"<tr><td>💰 {name}</td><td><b>×{m:.2f}</b> &rarr; <mark>+{fmt(payout)}</mark></td></tr>"
+        for name, m, payout in winners
+    ) + "".join(
+        f"<tr><td>💥 {name}</td><td><b>-{fmt(bet)} VRF</b></td></tr>"
+        for name, bet in losers
+    )
+    if not rows_rich:
+        rows_rich = "<tr><td colspan='2'><i>Никто не участвовал</i></td></tr>"
+
+    rich_h = (
+        f"<h2>💥 Краш — взрыв на ×{crash_point:.2f}!</h2>"
+        "<table bordered striped>"
+        f"{rows_rich}"
+        "</table>"
+        f"<blockquote>🎮 Игроков: <b>{len(winners)+len(losers)}</b>"
+        f"  ·  💎 В обороте: <b>{fmt(total_pot)} VRF</b></blockquote>"
+    )
+
     win_lines = "\n".join(
         f"💰 {name} — ×{m:.2f} → <b>+{fmt(payout)} VRF</b>"
-        for name, m, payout in winners[:8]
+        for name, m, payout in winners
     ) or "<i>Никто не успел забрать...</i>"
-    if len(winners) > 8:
-        win_lines += f"\n<i>+{len(winners)-8} ещё</i>"
-
     lose_lines = "\n".join(
-        f"💥 {name} — <b>-{fmt(bet)} VRF</b>" for name, bet in losers[:8]
+        f"💥 {name} — <b>-{fmt(bet)} VRF</b>" for name, bet in losers
     ) or "<i>Все успели забрать вовремя!</i>"
-    if len(losers) > 8:
-        lose_lines += f"\n<i>+{len(losers)-8} ещё</i>"
-
-    return (
-        f"<blockquote>{win_lines}</blockquote>"
-        f"<blockquote>{lose_lines}</blockquote>"
+    fb_h = (
+        f"💥 <b>Краш — взрыв на ×{crash_point:.2f}!</b>\n\n"
+        f"{win_lines}\n{lose_lines}\n\n"
+        f"🎮 Игроков: <b>{len(winners)+len(losers)}</b>\n\n"
         f"🚀 Хочешь снова? /crash"
     )
+    return rich_h, fb_h
 
 
 # ── Round end (shared by timeout-crash and all-cashed-out) ──
@@ -2118,21 +2153,24 @@ async def _crash_end(bot, cid: int, final_mult: float) -> None:
         None, _crash_image_sync, "crash", crash_point,
         f"×{crash_point:.2f}", "ВЗРЫВ!",
     )
-    caption = _crash_result_text(crash_point, winners, losers)
+    light_caption = f"💥 <b>Взрыв на ×{crash_point:.2f}!</b>\nРезультаты ⬇️"
     try:
         if img:
             await bot.edit_message_media(
                 chat_id=cid, message_id=rnd["msg_id"],
                 media=InputMediaPhoto(media=io.BytesIO(img),
-                                      caption=caption, parse_mode=ParseMode.HTML),
+                                      caption=light_caption, parse_mode=ParseMode.HTML),
             )
         else:
             await bot.edit_message_caption(
                 chat_id=cid, message_id=rnd["msg_id"],
-                caption=caption, parse_mode=ParseMode.HTML,
+                caption=light_caption, parse_mode=ParseMode.HTML,
             )
     except TelegramError:
         pass
+
+    rich_h, fb_h = _crash_result_cards(crash_point, winners, losers)
+    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h)
 
 
 # ── Background tasks ───────────────────────────────────
@@ -2223,6 +2261,55 @@ async def _crash_flight_loop(bot, cid: int) -> None:
     except Exception:
         log.exception("Crash flight loop failed (cid=%s)", cid)
         crash_rounds.pop(cid, None)
+
+
+# ── Shared join logic (preset buttons AND custom-amount replies) ──
+
+async def _crash_join_player(context: ContextTypes.DEFAULT_TYPE, rcid: int,
+                              user, amount: int) -> tuple:
+    """
+    Validate + add a player to an open round. Returns (ok: bool, message: str).
+    Used by both the preset bet buttons and the custom-amount text flow.
+    """
+    rnd = crash_rounds.get(rcid)
+    if not rnd or rnd["state"] != "joining":
+        return False, "❌ Окно ставок закрыто!"
+    if user.id in rnd["players"]:
+        return False, "Ты уже сделал ставку в этом раунде!"
+    if amount < MIN_BET or amount > MAX_BET:
+        return False, f"❌ Ставка должна быть от {MIN_BET} до {MAX_BET} VRF"
+
+    await db_ensure_user(user.id, rcid, user.username or "", user.first_name)
+    u = await db_get_user(user.id, rcid)
+    if not u or u["vrf"] < amount:
+        return False, f"❌ Недостаточно VRF! Нужно {amount}."
+
+    ok = await db_deduct_vrf(user.id, rcid, amount)
+    if not ok:
+        return False, "❌ Недостаточно VRF!"
+
+    rnd["players"][user.id] = {
+        "name": user.first_name, "bet": amount,
+        "cashed": False, "mult": None,
+    }
+
+    # Players-mode: launch instantly once the target is reached
+    if (rnd["join_mode"] == "players"
+            and rnd["state"] == "joining"
+            and len(rnd["players"]) >= rnd["target_players"]):
+        rnd["state"]        = "flying"
+        rnd["flight_start"] = datetime.now()
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=rcid, message_id=rnd["msg_id"],
+                caption=f"✅ <b>Собрали {rnd['target_players']} игроков! Старт! 🚀</b>",
+                parse_mode=ParseMode.HTML, reply_markup=None,
+            )
+        except TelegramError:
+            pass
+        context.application.create_task(_crash_flight_loop(context.bot, rcid))
+
+    return True, f"✅ Ставка {amount} VRF принята! Удачи 🍀"
 
 
 # ── Launch a configured round (called from the wizard) ──
@@ -6149,42 +6236,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if action == "join":
             amount = int(parts[3])
+            ok, msg = await _crash_join_player(context, rcid, who, amount)
+            await query.answer(msg, show_alert=not ok)
+            return
+
+        if action == "custom":
             if not rnd or rnd["state"] != "joining":
                 await query.answer("❌ Окно ставок закрыто!", show_alert=True)
                 return
             if who.id in rnd["players"]:
                 await query.answer("Ты уже сделал ставку в этом раунде!", show_alert=True)
                 return
-            await db_ensure_user(who.id, rcid, who.username or "", who.first_name)
-            u = await db_get_user(who.id, rcid)
-            if not u or u["vrf"] < amount:
-                await query.answer(f"❌ Недостаточно VRF! Нужно {amount}.", show_alert=True)
-                return
-            ok = await db_deduct_vrf(who.id, rcid, amount)
-            if not ok:
-                await query.answer("❌ Недостаточно VRF!", show_alert=True)
-                return
-            rnd["players"][who.id] = {
-                "name": who.first_name, "bet": amount,
-                "cashed": False, "mult": None,
+            crash_custom_pending[(rcid, who.id)] = {
+                "expires": datetime.now() + timedelta(seconds=60),
             }
-            await query.answer(f"✅ Ставка {amount} VRF принята! Удачи 🍀")
-
-            # Players-mode: launch instantly once the target is reached
-            if (rnd["join_mode"] == "players"
-                    and rnd["state"] == "joining"
-                    and len(rnd["players"]) >= rnd["target_players"]):
-                rnd["state"]        = "flying"
-                rnd["flight_start"] = datetime.now()
-                try:
-                    await context.bot.edit_message_caption(
-                        chat_id=rcid, message_id=rnd["msg_id"],
-                        caption=f"✅ <b>Собрали {rnd['target_players']} игроков! Старт! 🚀</b>",
-                        parse_mode=ParseMode.HTML, reply_markup=None,
-                    )
-                except TelegramError:
-                    pass
-                context.application.create_task(_crash_flight_loop(context.bot, rcid))
+            try:
+                await context.bot.send_message(
+                    rcid,
+                    f"✏️ {mention(who.id, who.first_name)}, напиши сумму ставки "
+                    f"(от <b>{MIN_BET}</b> до <b>{MAX_BET}</b> VRF) ответом на это сообщение:",
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=rnd["msg_id"],
+                    reply_markup=ForceReply(selective=True, input_field_placeholder="Например: 150"),
+                )
+            except TelegramError:
+                pass
+            await query.answer("✍️ Напиши сумму в чат")
             return
 
         if action == "cancel":
@@ -6443,6 +6520,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     word = pts[0] if pts else ""
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+
+    # ── Crash: custom bet amount reply ─────────────────────
+    pend_key = (cid, u.id)
+    if pend_key in crash_custom_pending:
+        pend = crash_custom_pending[pend_key]
+        if datetime.now() > pend["expires"]:
+            crash_custom_pending.pop(pend_key, None)
+        else:
+            digits = text.replace(" ", "")
+            if digits.isdigit():
+                crash_custom_pending.pop(pend_key, None)
+                amount  = int(digits)
+                ok, msg = await _crash_join_player(context, cid, u, amount)
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+                return
+            else:
+                await update.message.reply_text(
+                    f"❌ Нужно число от {MIN_BET} до {MAX_BET}. Попробуй ещё раз:",
+                )
+                return
 
     # ── Text shortcuts ────────────────────────────────────
     # б / баланс → balance

@@ -24,6 +24,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InputMediaPhoto,
     InputTextMessageContent,
     ReactionTypeEmoji,
     Update,
@@ -159,6 +160,7 @@ battle_games: dict    = {}   # key: game_id (str)  — Battleship
 giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
 giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
 crash_rounds: dict    = {}   # key: cid (int) — Crash multiplier game
+crash_setups: dict    = {}   # key: setup_id (str) — Crash setup wizard
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -1762,7 +1764,231 @@ def _crash_emoji(mult: float) -> str:
     return "🚀"
 
 
-# ── Keyboards ──────────────────────────────────────────
+def _crash_flavor(mult: float) -> str:
+    if mult < 1.5: return "Взлёт!"
+    if mult < 3:   return "Набираем высоту"
+    if mult < 8:   return "Открытый космос"
+    if mult < 20:  return "Глубокий космос"
+    return "На пределе!"
+
+
+# ══════════════════════════════════════════════════════
+#   CRASH — Rocket image generator 🎨  (Pillow)
+# ══════════════════════════════════════════════════════
+# Draws the live rocket-ascent scene as a PNG. mode:
+#   "pad"    — idle on the launch pad (sent once at round start)
+#   "flight" — ascending, multiplier baked into the picture (every tick)
+#   "crash"  — explosion burst at the final multiplier (round end)
+
+_CR_W, _CR_H = 640, 860
+_CR_PAD_BG   = (22, 33, 62)
+_CR_MID_BG   = (13, 27, 62)
+_CR_SPACE_BG = (5, 8, 26)
+_CR_WHITE    = (232, 238, 245)
+_CR_WINDOW   = (91, 143, 217)
+_CR_FIN      = (205, 216, 232)
+_CR_GROUND   = (42, 53, 80)
+_CR_CLOUD    = (207, 216, 227)
+_CR_FLAME_LO = (255, 233, 168)
+_CR_FLAME_MD = (240, 160, 48)
+_CR_FLAME_HI = (255, 91, 53)
+
+_crash_star_pool_cache: Optional[list] = None
+
+
+def _cr_lerp(a: tuple, b: tuple, t: float) -> tuple:
+    t = max(0.0, min(1.0, t))
+    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _cr_bg_color(frac: float) -> tuple:
+    if frac < 0.5:
+        return _cr_lerp(_CR_PAD_BG, _CR_MID_BG, frac / 0.5)
+    return _cr_lerp(_CR_MID_BG, _CR_SPACE_BG, (frac - 0.5) / 0.5)
+
+
+def _cr_flame_color(frac: float) -> tuple:
+    if frac < 0.45:
+        return _cr_lerp(_CR_FLAME_LO, _CR_FLAME_MD, frac / 0.45)
+    return _cr_lerp(_CR_FLAME_MD, _CR_FLAME_HI, min(1.0, (frac - 0.45) / 0.55))
+
+
+def _cr_star_pool() -> list:
+    """Fixed star field (deterministic, doesn't touch the global RNG)."""
+    global _crash_star_pool_cache
+    if _crash_star_pool_cache is not None:
+        return _crash_star_pool_cache
+    rng  = random.Random(7)
+    pool = []
+    for _ in range(46):
+        x = rng.uniform(20, _CR_W - 20)
+        y = rng.uniform(20, _CR_H * 0.62)
+        r = rng.uniform(0.8, 2.2)
+        op = rng.uniform(0.35, 0.95)
+        reveal = rng.uniform(0.0, 0.85)
+        pool.append((x, y, r, op, reveal))
+    _crash_star_pool_cache = pool
+    return pool
+
+
+def _cr_draw_stars(draw, frac: float) -> None:
+    for x, y, r, op, reveal in _cr_star_pool():
+        if reveal > frac:
+            continue
+        shade = round(255 * op)
+        draw.ellipse([x - r, y - r, x + r, y + r],
+                     fill=(shade, shade, min(255, shade + 12)))
+
+
+def _cr_draw_trail(draw, cx, top_y, bottom_y, top_w, bottom_w,
+                    near_color, bg_color, segs: int = 5) -> None:
+    for i in range(segs):
+        t0, t1 = i / segs, (i + 1) / segs
+        y0 = top_y + (bottom_y - top_y) * t0
+        y1 = top_y + (bottom_y - top_y) * t1
+        w0 = top_w + (bottom_w - top_w) * t0
+        w1 = top_w + (bottom_w - top_w) * t1
+        col = _cr_lerp(near_color, bg_color, t0 * 0.9)
+        draw.polygon([
+            (cx - w0/2, y0), (cx + w0/2, y0),
+            (cx + w1/2, y1), (cx - w1/2, y1),
+        ], fill=col)
+
+
+def _cr_draw_rocket(draw, cx, nose_y, flame_color, flame_len, bg_color,
+                     trail_len: float = 0) -> None:
+    bw, bh, nh = 30, 58, 30
+    draw.polygon([(cx, nose_y), (cx-bw/2, nose_y+nh), (cx+bw/2, nose_y+nh)],
+                 fill=_CR_WHITE)
+    body_top, body_bot = nose_y + nh, nose_y + nh + bh
+    draw.rounded_rectangle([cx-bw/2, body_top, cx+bw/2, body_bot],
+                           radius=8, fill=_CR_WHITE)
+    wr, wcy = 7, body_top + bh * 0.34
+    draw.ellipse([cx-wr, wcy-wr, cx+wr, wcy+wr], fill=_CR_WINDOW)
+    fin_top = body_top + bh * 0.62
+    draw.polygon([(cx-bw/2, fin_top), (cx-bw/2-16, body_bot), (cx-bw/2, body_bot)],
+                 fill=_CR_FIN)
+    draw.polygon([(cx+bw/2, fin_top), (cx+bw/2+16, body_bot), (cx+bw/2, body_bot)],
+                 fill=_CR_FIN)
+    fw = bw * 0.55
+    flame_tip_y = body_bot + flame_len
+    draw.polygon([(cx-fw/2, body_bot), (cx+fw/2, body_bot), (cx, flame_tip_y)],
+                 fill=flame_color)
+    if trail_len > 0:
+        _cr_draw_trail(draw, cx, flame_tip_y, flame_tip_y + trail_len,
+                       fw*0.7, fw*2.6, flame_color, bg_color)
+
+
+def _cr_font(paths: list, size: int):
+    from PIL import ImageFont
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except (OSError, IOError):
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _crash_image_sync(mode: str, value: float = 1.0,
+                      label_main: str = "", label_sub: str = "") -> Optional[bytes]:
+    """Render the rocket scene as PNG bytes. Returns None if Pillow is missing."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    frac = 0.0 if mode == "pad" else min(1.0, math.log(max(1.01, value)) / math.log(40))
+    bg   = _cr_bg_color(frac)
+    img  = Image.new("RGB", (_CR_W, _CR_H), bg)
+    d    = ImageDraw.Draw(img)
+
+    _cr_draw_stars(d, frac)
+
+    if frac < 0.12:
+        d.rounded_rectangle([60, _CR_H-70, _CR_W-60, _CR_H-40], radius=6, fill=_CR_GROUND)
+    elif 0.15 < frac < 0.55:
+        cw = 0.4 + frac
+        d.ellipse([_CR_W*0.14, _CR_H*0.58, _CR_W*0.14+150*cw, _CR_H*0.58+60*cw], fill=_CR_CLOUD)
+        d.ellipse([_CR_W*0.6, _CR_H*0.66, _CR_W*0.6+130*cw, _CR_H*0.66+50*cw], fill=_CR_CLOUD)
+
+    cx = _CR_W / 2
+    nose_y = (_CR_H - 190) - frac * ((_CR_H - 190) - 120)
+    fcol   = _cr_flame_color(frac)
+
+    if mode == "crash":
+        bx, by = cx, nose_y + 70
+        rng2 = random.Random(99)
+        for i in range(18):
+            ang = (i / 18) * 2 * math.pi + rng2.uniform(-0.05, 0.05)
+            ln  = rng2.uniform(45, 95)
+            sx, sy = bx + math.cos(ang)*92, by + math.sin(ang)*92
+            ex, ey = bx + math.cos(ang)*(92+ln), by + math.sin(ang)*(92+ln)
+            d.line([(sx, sy), (ex, ey)], fill=_CR_FLAME_HI, width=5)
+        d.ellipse([bx-110, by-110, bx+110, by+110], outline=_CR_FLAME_MD, width=3)
+        for rad, col in [(85, _CR_FLAME_HI), (55, _CR_FLAME_MD), (28, (255, 255, 255))]:
+            d.ellipse([bx-rad, by-rad, bx+rad, by+rad], fill=col)
+    else:
+        flame_len = 26 + frac * 30
+        trail_len = 40 + frac * (_CR_H - 260)
+        _cr_draw_rocket(d, cx, nose_y, fcol, flame_len, bg, trail_len=trail_len)
+
+    _BOLD = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    _REG  = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    if label_main:
+        f_num = _cr_font(_BOLD, 64)
+        bbox  = d.textbbox((0, 0), label_main, font=f_num)
+        tw    = bbox[2] - bbox[0]
+        col   = _CR_WHITE if mode == "pad" else (fcol if mode == "flight" else _CR_FLAME_HI)
+        d.text((cx - tw/2, 50), label_main, font=f_num, fill=col)
+    if label_sub:
+        f_sub = _cr_font(_REG, 20)
+        bbox  = d.textbbox((0, 0), label_sub, font=f_sub)
+        tw    = bbox[2] - bbox[0]
+        d.text((cx - tw/2, 128), label_sub, font=f_sub, fill=(180, 190, 210))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ── Setup wizard keyboards ──────────────────────────────
+
+def _crash_setup_mode_kb(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [SBtn("⏱ По времени",  style="primary", callback_data=f"crs:{sid}:mode:time")],
+        [SBtn("👥 По игрокам", style="primary", callback_data=f"crs:{sid}:mode:players")],
+        [SBtn("Отмена", style="danger", callback_data=f"crs:{sid}:cancel")],
+    ])
+
+
+def _crash_setup_time_kb(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [SBtn("10 сек", style="primary", callback_data=f"crs:{sid}:time:10"),
+         SBtn("20 сек", style="primary", callback_data=f"crs:{sid}:time:20"),
+         SBtn("30 сек", style="primary", callback_data=f"crs:{sid}:time:30")],
+        [SBtn("45 сек", style="primary", callback_data=f"crs:{sid}:time:45"),
+         SBtn("60 сек", style="primary", callback_data=f"crs:{sid}:time:60")],
+        [SBtn("◀ Назад", style="primary", callback_data=f"crs:{sid}:back"),
+         SBtn("Отмена",  style="danger",  callback_data=f"crs:{sid}:cancel")],
+    ])
+
+
+def _crash_setup_players_kb(sid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [SBtn("2 чел.",  style="primary", callback_data=f"crs:{sid}:players:2"),
+         SBtn("3 чел.",  style="primary", callback_data=f"crs:{sid}:players:3"),
+         SBtn("5 чел.",  style="primary", callback_data=f"crs:{sid}:players:5")],
+        [SBtn("8 чел.",  style="primary", callback_data=f"crs:{sid}:players:8"),
+         SBtn("10 чел.", style="primary", callback_data=f"crs:{sid}:players:10")],
+        [SBtn("◀ Назад", style="primary", callback_data=f"crs:{sid}:back"),
+         SBtn("Отмена",  style="danger",  callback_data=f"crs:{sid}:cancel")],
+    ])
+
+
+# ── Round keyboards ──────────────────────────────────────
 
 def _crash_join_kb(cid: int) -> InlineKeyboardMarkup:
     row1 = [SBtn(f"{a} VRF", style="primary",
@@ -1786,59 +2012,79 @@ def _crash_flight_kb(cid: int) -> InlineKeyboardMarkup:
 # ── Text builders ──────────────────────────────────────
 
 def _crash_join_text(rnd: dict) -> str:
+    """Caption for the pad photo during the join window."""
     players = rnd["players"]
     total   = sum(p["bet"] for p in players.values())
-    remain  = max(0, int((rnd["join_deadline"] - datetime.now()).total_seconds()))
+    items   = list(players.items())
     plist   = "\n".join(
-        f"• {mention(uid, p['name'])} — <b>{fmt(p['bet'])} VRF</b>"
-        for uid, p in players.items()
+        f"• {mention(uid, p['name'])} — <code>{fmt(p['bet'])}</code> VRF"
+        for uid, p in items[:8]
     ) or "<i>Пока никто не зашёл...</i>"
+    if len(items) > 8:
+        plist += f"\n<i>+{len(items)-8} ещё...</i>"
+
+    if rnd["join_mode"] == "players":
+        target = rnd["target_players"]
+        have   = len(players)
+        status = f"👥 <b>{have}/{target}</b> игроков" + (" ✅" if have >= target else "")
+    else:
+        remain = max(0, int((rnd["join_deadline"] - datetime.now()).total_seconds()))
+        status = f"⏱ <b>{remain} сек</b> до старта"
+
     return (
-        f"🚀 <b>КРАШ — РАУНД ОТКРЫТ!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Делай ставку, лови момент и забирай выигрыш до взрыва! 💥\n\n"
-        f"⏱ До старта: <b>{remain} сек</b>\n"
-        f"👥 Игроков: <b>{len(players)}</b>  ·  💰 Банк: <b>{fmt(total)} VRF</b>\n\n"
+        f"🚀 <b>КРАШ — ставки открыты!</b>\n"
+        f"<i>Лови момент, забирай выигрыш до взрыва</i>\n\n"
+        f"{status}\n"
+        f"<blockquote>💰 Банк: <b>{fmt(total)} VRF</b></blockquote>\n"
         f"{plist}\n\n"
-        f"⬇️ Выбери ставку, чтобы войти:"
+        f"⬇️ Жми сумму, чтобы войти"
     )
 
 
 def _crash_flight_text(rnd: dict, mult: float) -> str:
+    """Caption for the flight photo — the multiplier itself lives in the image."""
     players = rnd["players"]
-    emoji   = _crash_emoji(mult)
+    in_p    = [p for p in players.values() if not p["cashed"]]
+    out_p   = [p for p in players.values() if p["cashed"]]
+
     in_list = "\n".join(
-        f"🟢 {p['name']} — {fmt(p['bet'])} VRF"
-        for p in players.values() if not p["cashed"]
+        f"🟢 {p['name']} — <code>{fmt(p['bet'])}</code> VRF" for p in in_p[:6]
     ) or "—"
+    if len(in_p) > 6:
+        in_list += f"\n<i>+{len(in_p)-6} ещё</i>"
+
     out_list = "\n".join(
-        f"💰 {p['name']} — ×{p['mult']:.2f} (+{fmt(round(p['bet']*p['mult']))} VRF)"
-        for p in players.values() if p["cashed"]
+        f"💰 {p['name']} — ×{p['mult']:.2f} → <b>+{fmt(round(p['bet']*p['mult']))}</b>"
+        for p in out_p[:6]
     ) or "—"
+    if len(out_p) > 6:
+        out_list += f"\n<i>+{len(out_p)-6} ещё</i>"
+
     return (
-        f"{emoji} <b>РАКЕТА ЛЕТИТ!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>×{mult:.2f}</b>\n\n"
-        f"<b>🟢 В игре:</b>\n{in_list}\n\n"
-        f"<b>💰 Уже забрали:</b>\n{out_list}\n\n"
+        f"<blockquote>🟢 В игре:\n{in_list}</blockquote>"
+        f"<blockquote>💰 Уже забрали:\n{out_list}</blockquote>"
         f"👇 Жми, пока не поздно!"
     )
 
 
 def _crash_result_text(crash_point: float, winners: list, losers: list) -> str:
+    """Caption for the final explosion photo."""
     win_lines = "\n".join(
         f"💰 {name} — ×{m:.2f} → <b>+{fmt(payout)} VRF</b>"
-        for name, m, payout in winners
+        for name, m, payout in winners[:8]
     ) or "<i>Никто не успел забрать...</i>"
+    if len(winners) > 8:
+        win_lines += f"\n<i>+{len(winners)-8} ещё</i>"
+
     lose_lines = "\n".join(
-        f"💥 {name} — потерял <b>{fmt(bet)} VRF</b>"
-        for name, bet in losers
+        f"💥 {name} — <b>-{fmt(bet)} VRF</b>" for name, bet in losers[:8]
     ) or "<i>Все успели забрать вовремя!</i>"
+    if len(losers) > 8:
+        lose_lines += f"\n<i>+{len(losers)-8} ещё</i>"
+
     return (
-        f"💥 <b>ВЗРЫВ на ×{crash_point:.2f}!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{win_lines}\n\n"
-        f"{lose_lines}\n\n"
+        f"<blockquote>{win_lines}</blockquote>"
+        f"<blockquote>{lose_lines}</blockquote>"
         f"🚀 Хочешь снова? /crash"
     )
 
@@ -1866,12 +2112,25 @@ async def _crash_end(bot, cid: int, final_mult: float) -> None:
                 pass
 
     crash_rounds.pop(cid, None)
+
+    loop = asyncio.get_event_loop()
+    img  = await loop.run_in_executor(
+        None, _crash_image_sync, "crash", crash_point,
+        f"×{crash_point:.2f}", "ВЗРЫВ!",
+    )
+    caption = _crash_result_text(crash_point, winners, losers)
     try:
-        await bot.edit_message_text(
-            _crash_result_text(crash_point, winners, losers),
-            chat_id=cid, message_id=rnd["msg_id"],
-            parse_mode=ParseMode.HTML,
-        )
+        if img:
+            await bot.edit_message_media(
+                chat_id=cid, message_id=rnd["msg_id"],
+                media=InputMediaPhoto(media=io.BytesIO(img),
+                                      caption=caption, parse_mode=ParseMode.HTML),
+            )
+        else:
+            await bot.edit_message_caption(
+                chat_id=cid, message_id=rnd["msg_id"],
+                caption=caption, parse_mode=ParseMode.HTML,
+            )
     except TelegramError:
         pass
 
@@ -1892,9 +2151,10 @@ async def _crash_join_loop(bot, cid: int) -> None:
             if not rnd or rnd["state"] != "joining":
                 return
             try:
-                await bot.edit_message_text(
-                    _crash_join_text(rnd), chat_id=cid, message_id=rnd["msg_id"],
-                    parse_mode=ParseMode.HTML, reply_markup=_crash_join_kb(cid),
+                await bot.edit_message_caption(
+                    chat_id=cid, message_id=rnd["msg_id"],
+                    caption=_crash_join_text(rnd), parse_mode=ParseMode.HTML,
+                    reply_markup=_crash_join_kb(cid),
                 )
             except TelegramError:
                 pass
@@ -1906,9 +2166,10 @@ async def _crash_join_loop(bot, cid: int) -> None:
         if not rnd["players"]:
             crash_rounds.pop(cid, None)
             try:
-                await bot.edit_message_text(
-                    "🚀 <b>Раунд отменён</b> — никто не присоединился.",
-                    chat_id=cid, message_id=rnd["msg_id"], parse_mode=ParseMode.HTML,
+                await bot.edit_message_caption(
+                    chat_id=cid, message_id=rnd["msg_id"],
+                    caption="🚀 <b>Раунд отменён</b> — никто не присоединился.",
+                    parse_mode=ParseMode.HTML, reply_markup=None,
                 )
             except TelegramError:
                 pass
@@ -1924,6 +2185,7 @@ async def _crash_join_loop(bot, cid: int) -> None:
 
 async def _crash_flight_loop(bot, cid: int) -> None:
     try:
+        loop = asyncio.get_event_loop()
         while True:
             await asyncio.sleep(CRASH_TICK_SECONDS)
             rnd = crash_rounds.get(cid)
@@ -1937,12 +2199,25 @@ async def _crash_flight_loop(bot, cid: int) -> None:
                 await _crash_end(bot, cid, min(cur_mult, rnd["crash_point"]))
                 return
 
+            img = await loop.run_in_executor(
+                None, _crash_image_sync, "flight", cur_mult,
+                f"×{cur_mult:.2f}", _crash_flavor(cur_mult),
+            )
             try:
-                await bot.edit_message_text(
-                    _crash_flight_text(rnd, cur_mult),
-                    chat_id=cid, message_id=rnd["msg_id"],
-                    parse_mode=ParseMode.HTML, reply_markup=_crash_flight_kb(cid),
-                )
+                if img:
+                    await bot.edit_message_media(
+                        chat_id=cid, message_id=rnd["msg_id"],
+                        media=InputMediaPhoto(media=io.BytesIO(img),
+                                              caption=_crash_flight_text(rnd, cur_mult),
+                                              parse_mode=ParseMode.HTML),
+                        reply_markup=_crash_flight_kb(cid),
+                    )
+                else:
+                    await bot.edit_message_caption(
+                        chat_id=cid, message_id=rnd["msg_id"],
+                        caption=_crash_flight_text(rnd, cur_mult),
+                        parse_mode=ParseMode.HTML, reply_markup=_crash_flight_kb(cid),
+                    )
             except TelegramError:
                 pass
     except Exception:
@@ -1950,7 +2225,75 @@ async def _crash_flight_loop(bot, cid: int) -> None:
         crash_rounds.pop(cid, None)
 
 
-# ── /crash command ─────────────────────────────────────
+# ── Launch a configured round (called from the wizard) ──
+
+async def _crash_launch(context: ContextTypes.DEFAULT_TYPE, query,
+                         cid: int, setup: dict, mode: str,
+                         join_seconds: Optional[int] = None,
+                         target_players: Optional[int] = None) -> None:
+    existing = crash_rounds.get(cid)
+    if existing and existing["state"] != "ended":
+        try:
+            await query.edit_message_text(
+                "⏳ Кто-то уже запустил раунд в этом чате — присоединяйся к нему выше!"
+            )
+        except TelegramError:
+            pass
+        return
+
+    now      = datetime.now()
+    deadline = now + timedelta(seconds=join_seconds if mode == "time" else JOIN_TIMEOUT)
+
+    # The wizard prompt is a text message — it can't be converted into a
+    # photo via edit, so confirm it briefly and send the round as a new photo.
+    try:
+        await query.edit_message_text("🚀 Раунд запущен ⬇️")
+    except TelegramError:
+        pass
+
+    rnd_stub = {
+        "join_mode": mode, "join_deadline": deadline,
+        "target_players": target_players, "players": {},
+    }
+    loop = asyncio.get_event_loop()
+    img  = await loop.run_in_executor(
+        None, _crash_image_sync, "pad", 1.0, "", "Заправка топливом...",
+    )
+    caption = _crash_join_text(rnd_stub)
+
+    try:
+        if img:
+            msg = await context.bot.send_photo(
+                chat_id=cid, photo=io.BytesIO(img),
+                caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=_crash_join_kb(cid),
+            )
+        else:
+            msg = await context.bot.send_message(
+                cid, caption, parse_mode=ParseMode.HTML,
+                reply_markup=_crash_join_kb(cid),
+            )
+    except TelegramError:
+        return
+
+    crash_rounds[cid] = {
+        "cid": cid, "state": "joining",
+        "starter_id": setup["starter_id"], "starter_name": setup["starter_name"],
+        "msg_id": msg.message_id,
+        "players": {},
+        "crash_point": _crash_point(),
+        "join_mode": mode,
+        "join_seconds": join_seconds,
+        "target_players": target_players,
+        "join_started": now,
+        "join_deadline": deadline,
+        "flight_start": None,
+    }
+
+    context.application.create_task(_crash_join_loop(context.bot, cid))
+
+
+# ── /crash command — opens the setup wizard ─────────────
 
 @only_groups
 async def cmd_crash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1968,22 +2311,17 @@ async def cmd_crash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
 
-    crash_rounds[cid] = {
-        "cid": cid, "state": "joining",
-        "starter_id": u.id, "starter_name": u.first_name,
-        "msg_id": None, "players": {},
-        "crash_point": _crash_point(),
-        "join_deadline": datetime.now() + timedelta(seconds=CRASH_JOIN_SECONDS),
-        "flight_start": None,
+    sid = str(uuid.uuid4())[:8]
+    crash_setups[sid] = {
+        "cid": cid, "starter_id": u.id, "starter_name": u.first_name,
     }
-    rnd = crash_rounds[cid]
 
-    msg = await update.message.reply_text(
-        _crash_join_text(rnd), parse_mode=ParseMode.HTML,
-        reply_markup=_crash_join_kb(cid),
+    await update.message.reply_text(
+        "🚀 <b>Краш</b>\n\n"
+        "Как набираем игроков перед стартом ракеты?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_crash_setup_mode_kb(sid),
     )
-    rnd["msg_id"] = msg.message_id
-    context.application.create_task(_crash_join_loop(context.bot, cid))
 
 
 # ══════════════════════════════════════════════════════
@@ -5727,6 +6065,81 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Crash 🚀 — setup wizard ───────────────────────────
+    if data.startswith("crs:"):
+        parts = data.split(":")
+        sid   = parts[1]
+        step  = parts[2]
+        setup = crash_setups.get(sid)
+
+        if not setup:
+            await query.answer("❌ Сессия настройки истекла", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            return
+        if who.id != setup["starter_id"]:
+            await query.answer("❌ Это не твой раунд!", show_alert=True)
+            return
+
+        if step == "cancel":
+            crash_setups.pop(sid, None)
+            await query.answer("Отменено")
+            await query.edit_message_text("❌ Запуск краша отменён.")
+            return
+
+        if step == "back":
+            await query.answer()
+            await query.edit_message_text(
+                "🚀 <b>Краш</b>\n\nКак набираем игроков перед стартом ракеты?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_crash_setup_mode_kb(sid),
+            )
+            return
+
+        if step == "mode":
+            mode = parts[3]
+            await query.answer("⏱ По времени" if mode == "time" else "👥 По игрокам")
+            if mode == "time":
+                await query.edit_message_text(
+                    "🚀 <b>Краш</b>\n\n⏱ Сколько ждём перед стартом ракеты?",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_crash_setup_time_kb(sid),
+                )
+            else:
+                await query.edit_message_text(
+                    "🚀 <b>Краш</b>\n\n👥 Сколько игроков ждём перед стартом?",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_crash_setup_players_kb(sid),
+                )
+            return
+
+        if step == "time":
+            seconds = int(parts[3])
+            setup   = crash_setups.pop(sid, None)
+            if not setup:
+                await query.answer("❌ Сессия истекла", show_alert=True)
+                return
+            await query.answer(f"⏱ {seconds} сек")
+            await _crash_launch(context, query, setup["cid"], setup,
+                                mode="time", join_seconds=seconds)
+            return
+
+        if step == "players":
+            target = int(parts[3])
+            setup  = crash_setups.pop(sid, None)
+            if not setup:
+                await query.answer("❌ Сессия истекла", show_alert=True)
+                return
+            await query.answer(f"👥 Ждём {target} чел.")
+            await _crash_launch(context, query, setup["cid"], setup,
+                                mode="players", target_players=target)
+            return
+
+        await query.answer()
+        return
+
     # ── Crash 🚀 ──────────────────────────────────────────
     if data.startswith("cr:"):
         parts   = data.split(":")
@@ -5756,6 +6169,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "cashed": False, "mult": None,
             }
             await query.answer(f"✅ Ставка {amount} VRF принята! Удачи 🍀")
+
+            # Players-mode: launch instantly once the target is reached
+            if (rnd["join_mode"] == "players"
+                    and rnd["state"] == "joining"
+                    and len(rnd["players"]) >= rnd["target_players"]):
+                rnd["state"]        = "flying"
+                rnd["flight_start"] = datetime.now()
+                try:
+                    await context.bot.edit_message_caption(
+                        chat_id=rcid, message_id=rnd["msg_id"],
+                        caption=f"✅ <b>Собрали {rnd['target_players']} игроков! Старт! 🚀</b>",
+                        parse_mode=ParseMode.HTML, reply_markup=None,
+                    )
+                except TelegramError:
+                    pass
+                context.application.create_task(_crash_flight_loop(context.bot, rcid))
             return
 
         if action == "cancel":
@@ -5770,9 +6199,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             crash_rounds.pop(rcid, None)
             await query.answer("Раунд отменён, ставки возвращены")
             try:
-                await query.edit_message_text(
-                    "🚫 <b>Раунд отменён организатором.</b>\nВсе ставки возвращены.",
-                    parse_mode=ParseMode.HTML,
+                await query.edit_message_caption(
+                    caption="🚫 <b>Раунд отменён организатором.</b>\nВсе ставки возвращены.",
+                    parse_mode=ParseMode.HTML, reply_markup=None,
                 )
             except TelegramError:
                 pass
@@ -5807,8 +6236,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer(f"💰 Забрал ×{cur_mult:.2f}! +{fmt(payout)} VRF")
 
             try:
-                await query.edit_message_text(
-                    _crash_flight_text(rnd, cur_mult),
+                await query.edit_message_caption(
+                    caption=_crash_flight_text(rnd, cur_mult),
                     parse_mode=ParseMode.HTML,
                     reply_markup=_crash_flight_kb(rcid),
                 )

@@ -552,7 +552,14 @@ async def send_rich(
 # ══════════════════════════════════════════════════════
 
 async def db_init() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
+        # WAL mode lets readers and a writer work concurrently instead of
+        # blocking each other, and busy_timeout makes SQLite retry for a
+        # bit instead of instantly raising "database is locked" — this was
+        # causing button taps (mines, crash, etc.) to silently fail when
+        # several people played at the same time.
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=10000;")
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id      INTEGER,
@@ -664,7 +671,7 @@ async def db_init() -> None:
 async def db_log_activity(cid: int, msgs: int = 0, gms: int = 0) -> None:
     """Increment daily message/game counters for a chat."""
     today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             """INSERT INTO daily_activity (date, chat_id, messages, games)
                VALUES (?, ?, ?, ?)
@@ -678,7 +685,7 @@ async def db_log_activity(cid: int, msgs: int = 0, gms: int = 0) -> None:
 
 async def db_get_activity(cid: int, days: int = 30) -> list:
     """Return (date, messages, games) rows for the last N days."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute(
             """SELECT date, messages, games
                FROM daily_activity
@@ -693,7 +700,7 @@ async def db_get_activity(cid: int, days: int = 30) -> list:
 # ── Users ──────────────────────────────────────────────
 
 async def db_ensure_user(uid: int, cid: int, username: str, first_name: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             """INSERT INTO users (user_id, chat_id, username, first_name, vrf)
                VALUES (?,?,?,?,?)
@@ -727,7 +734,7 @@ async def db_claim_referral(new_uid: int, inviter_id: int) -> bool:
     user_id is ever claimed (caller should pay out bonuses), False if
     already claimed before (no-op — prevents repeat/duplicate farming).
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         try:
             await db.execute(
                 "INSERT INTO referrals (user_id, inviter_id, claimed_at) VALUES (?,?,?)",
@@ -741,7 +748,7 @@ async def db_claim_referral(new_uid: int, inviter_id: int) -> bool:
 
 
 async def db_get_user(uid: int, cid: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM users WHERE user_id=? AND chat_id=?", (uid, cid)
@@ -752,7 +759,7 @@ async def db_get_user(uid: int, cid: int) -> Optional[dict]:
 
 async def db_add_vrf(uid: int, cid: int, amount: int) -> int:
     """Add VRF. Returns new balance."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET vrf=vrf+? WHERE user_id=? AND chat_id=?",
             (amount, uid, cid),
@@ -766,7 +773,7 @@ async def db_add_vrf(uid: int, cid: int, amount: int) -> int:
 
 
 async def db_set_vrf(uid: int, cid: int, amount: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET vrf=? WHERE user_id=? AND chat_id=?",
             (max(0, amount), uid, cid),
@@ -780,7 +787,7 @@ async def db_deduct_vrf(uid: int, cid: int, amount: int) -> bool:
     u = await db_get_user(uid, cid)
     if not u or u["vrf"] < amount:
         return False
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET vrf=vrf-? WHERE user_id=? AND chat_id=?",
             (amount, uid, cid),
@@ -797,7 +804,7 @@ async def db_add_xp(uid: int, cid: int, amount: int) -> Tuple[int, bool]:
     old_lvl = get_level(u["experience"])
     new_xp   = u["experience"] + amount
     new_lvl  = get_level(new_xp)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET experience=?, level=?, last_xp=? WHERE user_id=? AND chat_id=?",
             (new_xp, new_lvl, _now(), uid, cid),
@@ -822,7 +829,7 @@ async def db_record_game(
     elif not draw and streak_reset:
         streak = 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         if won:
             await db.execute(
                 """UPDATE users SET wins=wins+1, total_games=total_games+1,
@@ -845,7 +852,7 @@ async def db_record_game(
     # Bears milestone: every 10th win
     u2 = await db_get_user(uid, cid)
     if u2 and won and u2["wins"] % 10 == 0:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(DB_PATH, timeout=10) as db:
             await db.execute(
                 "UPDATE users SET bears=bears+1 WHERE user_id=? AND chat_id=?",
                 (uid, cid),
@@ -868,7 +875,7 @@ async def db_can_earn_xp(uid: int, cid: int) -> bool:
 
 async def db_top(cid: int, sort: str = "vrf", limit: int = 10) -> list:
     col = {"vrf": "vrf", "level": "experience", "wins": "wins"}.get(sort, "vrf")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             f"SELECT * FROM users WHERE chat_id=? ORDER BY {col} DESC LIMIT ?",
@@ -878,7 +885,7 @@ async def db_top(cid: int, sort: str = "vrf", limit: int = 10) -> list:
 
 
 async def db_rank_pos(uid: int, cid: int, col: str = "vrf") -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute(
             f"""SELECT COUNT(*)+1 FROM users
                 WHERE chat_id=? AND {col}>(SELECT {col} FROM users WHERE user_id=? AND chat_id=?)""",
@@ -889,13 +896,13 @@ async def db_rank_pos(uid: int, cid: int, col: str = "vrf") -> int:
 
 
 async def db_count_users(cid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute("SELECT COUNT(*) FROM users WHERE chat_id=?", (cid,)) as cur:
             return (await cur.fetchone())[0]
 
 
 async def db_find_user_by_username(username: str, cid: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM users WHERE LOWER(username)=? AND chat_id=?",
@@ -908,7 +915,7 @@ async def db_find_user_by_username(username: str, cid: int) -> Optional[dict]:
 # ── Marriages ──────────────────────────────────────────
 
 async def db_get_marriage(uid: int, cid: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM marriages WHERE (user1_id=? OR user2_id=?) AND chat_id=?",
@@ -919,7 +926,7 @@ async def db_get_marriage(uid: int, cid: int) -> Optional[dict]:
 
 
 async def db_get_proposal_to(target_id: int, cid: int) -> Optional[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM proposals WHERE target_id=? AND chat_id=?", (target_id, cid)
@@ -929,7 +936,7 @@ async def db_get_proposal_to(target_id: int, cid: int) -> Optional[dict]:
 
 
 async def db_create_marriage(uid1: int, uid2: int, cid: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT INTO marriages (user1_id,user2_id,chat_id,married_at) VALUES(?,?,?,?)",
             (uid1, uid2, cid, _now()),
@@ -942,13 +949,13 @@ async def db_create_marriage(uid1: int, uid2: int, cid: int) -> None:
 
 
 async def db_delete_marriage(mid: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM marriages WHERE id=?", (mid,))
         await db.commit()
 
 
 async def db_all_marriages(cid: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM marriages WHERE chat_id=? ORDER BY married_at DESC", (cid,)
@@ -959,7 +966,7 @@ async def db_all_marriages(cid: int) -> list:
 # ── Admins ─────────────────────────────────────────────
 
 async def db_add_admin(uid: int, username: str, first_name: str, added_by: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR REPLACE INTO admins(user_id,username,first_name,added_by,added_at) VALUES(?,?,?,?,?)",
             (uid, username or "", first_name or "", added_by, _now()),
@@ -968,14 +975,14 @@ async def db_add_admin(uid: int, username: str, first_name: str, added_by: int) 
 
 
 async def db_remove_admin(uid: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         cur = await db.execute("DELETE FROM admins WHERE user_id=?", (uid,))
         await db.commit()
         return cur.rowcount > 0
 
 
 async def db_list_admins() -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM admins ORDER BY added_at") as cur:
             return [dict(r) for r in await cur.fetchall()]
@@ -984,7 +991,7 @@ async def db_list_admins() -> list:
 async def is_bot_admin(uid: int) -> bool:
     if uid in ADMIN_IDS:
         return True
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)) as cur:
             return bool(await cur.fetchone())
 
@@ -1090,7 +1097,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 claimed = await db_claim_referral(u.id, inviter_id)
                 if claimed:
                     # Credit the inviter across every chat they're already in
-                    async with aiosqlite.connect(DB_PATH) as db:
+                    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                         await db.execute(
                             "UPDATE users SET vrf=vrf+?, referral_count=referral_count+1 "
                             "WHERE user_id=?",
@@ -1108,7 +1115,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     if has_rows:
                         # Already has a group row somewhere — pay out now.
-                        async with aiosqlite.connect(DB_PATH) as db:
+                        async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                             await db.execute(
                                 "UPDATE users SET vrf=vrf+? WHERE user_id=?",
                                 (REFERRAL_BONUS_NEW, u.id),
@@ -1611,7 +1618,7 @@ async def _end_giveaway(bot, key: str) -> None:
 
     # ── No participants → return bears ────────────────
     if not parts:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(DB_PATH, timeout=10) as db:
             await db.execute(
                 "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
                 (bears * winners_n, org_id, cid),
@@ -1633,7 +1640,7 @@ async def _end_giveaway(bot, key: str) -> None:
     actual = min(winners_n, len(parts))
     winners = random.sample(parts, actual)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         for w_id in winners:
             await db.execute(
                 "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
@@ -2161,7 +2168,8 @@ def _crash_join_kb(cid: int) -> InlineKeyboardMarkup:
             for a in CRASH_BET_PRESETS[3:]]
     return InlineKeyboardMarkup([
         row1, row2,
-        [SBtn("✏️ Своя сумма", style="primary", callback_data=f"cr:custom:{cid}")],
+        [SBtn("✏️ Своя сумма", style="primary", callback_data=f"cr:custom:{cid}"),
+         SBtn("🎰 Ва-банк", style="danger", callback_data=f"cr:allin:{cid}")],
         [SBtn("Отменить раунд", style="danger", callback_data=f"cr:cancel:{cid}")],
     ])
 
@@ -2435,13 +2443,13 @@ async def _crash_join_player(context: ContextTypes.DEFAULT_TYPE, rcid: int,
         return False, "❌ Окно ставок закрыто!"
     if user.id in rnd["players"]:
         return False, "Ты уже сделал ставку в этом раунде!"
-    if amount < MIN_BET or amount > MAX_BET:
-        return False, f"❌ Ставка должна быть от {MIN_BET} до {MAX_BET} VRF"
+    if amount < MIN_BET:
+        return False, f"❌ Минимальная ставка — {MIN_BET} VRF"
 
     await db_ensure_user(user.id, rcid, user.username or "", user.first_name)
     u = await db_get_user(user.id, rcid)
     if not u or u["vrf"] < amount:
-        return False, f"❌ Недостаточно VRF! Нужно {amount}."
+        return False, f"❌ Недостаточно VRF! У тебя {u['vrf'] if u else 0}, нужно {amount}."
 
     ok = await db_deduct_vrf(user.id, rcid, amount)
     if not ok:
@@ -2587,7 +2595,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     q_text  = (query.query or "").strip().lower()
 
     # Try to fetch the user's data from any chat they've played in
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM users WHERE user_id=? ORDER BY vrf DESC LIMIT 1", (uid,)
@@ -2788,7 +2796,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid   = update.effective_chat.id
     total = await db_count_users(cid)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute("SELECT COUNT(*) FROM marriages WHERE chat_id=?", (cid,)) as cur:
             marriages = (await cur.fetchone())[0]
         async with db.execute("SELECT SUM(total_games) FROM users WHERE chat_id=?", (cid,)) as cur:
@@ -2796,7 +2804,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async with db.execute("SELECT SUM(vrf) FROM users WHERE chat_id=?", (cid,)) as cur:
             total_vrf = (await cur.fetchone())[0] or 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM users WHERE chat_id=? ORDER BY vrf DESC LIMIT 1", (cid,)
@@ -2899,7 +2907,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             marry_bonus  = DAILY_MARRIED_BONUS if m else 0
             promo_total  = DAILY_BONUS_BASE + streak_bonus + marry_bonus
 
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                 await db.execute(
                     "UPDATE users SET last_bio_bonus=? WHERE user_id=? AND chat_id=?",
                     (_now(), u_obj.id, cid),
@@ -2951,7 +2959,7 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     marry_bonus  = DAILY_MARRIED_BONUS if m else 0
     total        = DAILY_BONUS_BASE + streak_bonus + marry_bonus
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET last_daily=?, daily_streak=? WHERE user_id=? AND chat_id=?",
             (_now(), streak, u_obj.id, cid),
@@ -3089,7 +3097,7 @@ async def cmd_gift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     new_bal = await db_add_vrf(target.id, cid, reward)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE users SET last_gift=? WHERE user_id=? AND chat_id=?",
                          (_now(), sender.id, cid))
         await db.commit()
@@ -3137,7 +3145,7 @@ async def cmd_love(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await db_add_vrf(sender.id, cid, s_reward)
     new_bal = await db_add_vrf(target.id, cid, r_reward)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("UPDATE users SET last_love=? WHERE user_id=? AND chat_id=?",
                          (_now(), sender.id, cid))
         await db.commit()
@@ -3201,7 +3209,7 @@ async def cmd_marry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _react(update, "🎊")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT OR REPLACE INTO proposals(proposer_id,target_id,chat_id,created_at) VALUES(?,?,?,?)",
             (proposer.id, target.id, cid, _now()),
@@ -3253,7 +3261,7 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     pu    = await db_get_user(prop["proposer_id"], cid)
     pname = pu["first_name"] if pu else "Пользователь"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM proposals WHERE target_id=? AND chat_id=?", (u.id, cid))
         await db.commit()
     await update.message.reply_text(
@@ -3870,12 +3878,15 @@ def _mines_grid_kb(uid: int, cid: int, game: dict) -> InlineKeyboardMarkup:
         for c in range(5):
             i = r * 5 + c
             if rev[i]:
-                txt = "💣" if grid[i] else "💎"
-                cb  = "mg:noop"
+                # Already opened: 💣 mine → red, 💎 diamond → blue
+                if grid[i]:
+                    txt, style = "💣", "danger"
+                else:
+                    txt, style = "💎", "primary"
+                row.append(SBtn(txt, style=style, callback_data="mg:noop"))
             else:
-                txt = "⬜"
-                cb  = f"mg:c:{uid}:{cid}:{i}"
-            row.append(InlineKeyboardButton(txt, callback_data=cb))
+                cb = f"mg:c:{uid}:{cid}:{i}"
+                row.append(InlineKeyboardButton("⬜", callback_data=cb))
         rows.append(row)
     mult   = calc_mines_mult(game["safe_revealed"], game["mines_count"])
     payout = int(game["bet"] * mult)
@@ -3898,14 +3909,13 @@ def _mines_dead_kb(game: dict, boom_idx: int = -1) -> InlineKeyboardMarkup:
         for c in range(5):
             i = r * 5 + c
             if i == boom_idx:
-                txt = E_BOOM
+                row.append(SBtn(E_BOOM, style="danger", callback_data="mg:noop"))
             elif grid[i]:
-                txt = "💣"
+                row.append(SBtn("💣", style="danger", callback_data="mg:noop"))
             elif rev[i]:
-                txt = "💎"
+                row.append(SBtn("💎", style="primary", callback_data="mg:noop"))
             else:
-                txt = "⬛"
-            row.append(InlineKeyboardButton(txt, callback_data="mg:noop"))
+                row.append(InlineKeyboardButton("⬛", callback_data="mg:noop"))
         rows.append(row)
     rows.append([SBtn("Играть снова 🎮", style="success", callback_data="mg:new")])
     return InlineKeyboardMarkup(rows)
@@ -3924,6 +3934,26 @@ def _mines_header(game: dict) -> str:
         f"🔍 Осталось безопасных: <b>{safe_left}</b>\n\n"
         f"Нажимай ⬜ — ищи 💎, избегай 💣!"
     )
+
+
+async def _mines_safe_edit(query, context: ContextTypes.DEFAULT_TYPE, cid: int,
+                            text: str, reply_markup: InlineKeyboardMarkup) -> None:
+    """Edit the mines message; if Telegram rejects the edit (rate limit,
+    stale message, etc.) fall back to sending a fresh message so the
+    player always sees the result instead of the click silently 'doing
+    nothing'."""
+    try:
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+        )
+    except TelegramError as e:
+        log.warning(f"Mines edit failed, sending new message instead: {e}")
+        try:
+            await context.bot.send_message(
+                cid, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+            )
+        except TelegramError:
+            pass
 
 
 def _mines_bet_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
@@ -4043,7 +4073,7 @@ async def _is_protected(chat, uid: int) -> bool:
 
 async def db_log_mute(uid: int, cid: int, by: int,
                       until: Optional[datetime], reason: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             """INSERT INTO mutes (user_id,chat_id,muted_by,muted_at,until,reason)
                VALUES (?,?,?,?,?,?)
@@ -4057,13 +4087,13 @@ async def db_log_mute(uid: int, cid: int, by: int,
 
 
 async def db_clear_mute(uid: int, cid: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute("DELETE FROM mutes WHERE user_id=? AND chat_id=?", (uid, cid))
         await db.commit()
 
 
 async def db_get_mutes(cid: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM mutes WHERE chat_id=? ORDER BY muted_at DESC", (cid,)
@@ -4073,7 +4103,7 @@ async def db_get_mutes(cid: int) -> list:
 
 async def db_add_warn(uid: int, cid: int, by: int, reason: str) -> int:
     """Add a warning and return total active warn count."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "INSERT INTO warns (user_id,chat_id,warned_by,warned_at,reason) VALUES (?,?,?,?,?)",
             (uid, cid, by, _now(), reason),
@@ -4087,7 +4117,7 @@ async def db_add_warn(uid: int, cid: int, by: int, reason: str) -> int:
 
 
 async def db_remove_last_warn(uid: int, cid: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute(
             "SELECT id FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC LIMIT 1",
             (uid, cid),
@@ -4101,7 +4131,7 @@ async def db_remove_last_warn(uid: int, cid: int) -> bool:
 
 
 async def db_clear_warns(uid: int, cid: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=? AND active=1",
             (uid, cid),
@@ -4115,7 +4145,7 @@ async def db_clear_warns(uid: int, cid: int) -> int:
 
 
 async def db_get_user_warns(uid: int, cid: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC",
@@ -4125,7 +4155,7 @@ async def db_get_user_warns(uid: int, cid: int) -> list:
 
 
 async def db_get_chat_warns(cid: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """SELECT user_id, COUNT(*) AS cnt FROM warns
@@ -4615,7 +4645,7 @@ async def cmd_givebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cid    = update.effective_chat.id
     await db_ensure_user(target.id, cid, target.username or "", target.first_name)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
             (count, target.id, cid),
@@ -4657,7 +4687,7 @@ async def cmd_takebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cid    = update.effective_chat.id
     await db_ensure_user(target.id, cid, target.username or "", target.first_name)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=10) as db:
         await db.execute(
             "UPDATE users SET bears=MAX(0, bears-?) WHERE user_id=? AND chat_id=?",
             (count, target.id, cid),
@@ -5162,7 +5192,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=ParseMode.HTML,
             )
         else:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                 await db.execute("DELETE FROM proposals WHERE target_id=? AND chat_id=?",
                                  (t_id, cid))
                 await db.commit()
@@ -5744,12 +5774,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer()
             uu = await db_get_user(who.id, cid)
             bal = uu["vrf"] if uu else 0
-            await query.edit_message_text(
+            await _mines_safe_edit(
+                query, context, cid,
                 f"💣 <b>Мины</b>\n\n"
                 f"💎 Баланс: <b>{fmt(bal)} VRF</b>\n\n"
                 f"Выбери ставку:",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_mines_bet_kb(who.id, cid),
+                _mines_bet_kb(who.id, cid),
             )
             return
 
@@ -5781,13 +5811,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  for mc in [10, 15]],
                 [SBtn("Назад", style="primary", callback_data="mg:new")],
             ])
-            await query.edit_message_text(
+            await _mines_safe_edit(
+                query, context, cid2,
                 f"💣 <b>Мины</b>  ·  Ставка: <b>{bet} VRF</b>\n\n"
                 f"Выбери количество мин:\n"
                 f"(больше мин = выше риск = выше множитель)\n\n"
                 + "\n".join(hint_rows),
-                parse_mode=ParseMode.HTML,
-                reply_markup=mines_kb,
+                mines_kb,
             )
             return
 
@@ -5800,10 +5830,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await query.answer("❌ Это не твоя кнопка!", show_alert=True)
                 return
             key = f"{uid2}:{cid2}"
-            if key in mines_games and mines_games[key]["state"] == "active":
+            if key in mines_games and mines_games[key]["state"] in ("active", "starting"):
                 await query.answer("❌ У тебя уже есть активная игра!", show_alert=True)
                 return
+            # Reserve the slot *synchronously* (no await before this line)
+            # so two rapid taps can't both pass the check above and end up
+            # double-deducting / double-starting a game.
+            mines_games[key] = {"state": "starting"}
             if not await db_deduct_vrf(uid2, cid2, bet):
+                mines_games.pop(key, None)
                 await query.answer("❌ Недостаточно VRF!", show_alert=True)
                 return
             # Generate grid
@@ -5815,10 +5850,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "safe_revealed": 0, "state": "active",
             }
             await query.answer("🎮 Игра началась!")
-            await query.edit_message_text(
+            await _mines_safe_edit(
+                query, context, cid2,
                 _mines_header(mines_games[key]),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_mines_grid_kb(uid2, cid2, mines_games[key]),
+                _mines_grid_kb(uid2, cid2, mines_games[key]),
             )
             return
 
@@ -5828,6 +5863,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             idx  = int(parts[4])
             if who.id != uid2:
                 await query.answer("❌ Это не твоя игра!", show_alert=True)
+                return
+            if not (0 <= idx < MINES_TOTAL):
+                await query.answer("❌ Некорректная клетка", show_alert=True)
                 return
             key  = f"{uid2}:{cid2}"
             game = mines_games.get(key)
@@ -5845,7 +5883,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await db_add_xp(uid2, cid2, XP_PER_GAME)
                 await db_record_game(uid2, cid2, won=False)
                 await query.answer("💥 БУМ!", show_alert=True)
-                await query.edit_message_text(
+                await _mines_safe_edit(
+                    query, context, cid2,
                     f"<h2>{E_BOOM} БУМ! Мина!</h2>"
                     f"<table bordered>"
                     f"<tr><td>💎 Ставка</td><td align=\"right\"><s>{fmt(game['bet'])} VRF</s></td></tr>"
@@ -5853,8 +5892,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"<tr><td>💣 Мин на поле</td><td align=\"right\"><b>{game['mines_count']}</b></td></tr>"
                     f"</table>"
                     f"<blockquote>Ставка <b>{fmt(game['bet'])} VRF</b> потеряна 😢</blockquote>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=_mines_dead_kb(game, boom_idx=idx),
+                    _mines_dead_kb(game, boom_idx=idx),
                 )
             else:  # 💎 SAFE
                 game["safe_revealed"] += 1
@@ -5868,22 +5906,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await db_add_xp(uid2, cid2, XP_PER_WIN)
                     await db_record_game(uid2, cid2, won=True)
                     await query.answer("🏆 Идеальная игра!", show_alert=True)
-                    await query.edit_message_text(
+                    await _mines_safe_edit(
+                        query, context, cid2,
                         f"🏆 <b>ИДЕАЛЬНО! Все клетки открыты!</b>\n\n"
                         f"💎 Ставка: <b>{fmt(game['bet'])} VRF</b>\n"
                         f"⚡ Множитель: <b>{mult}×</b>\n"
                         f"🏆 Выигрыш: <b>{fmt(payout)} VRF</b>\n"
                         f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=_mines_dead_kb(game),
+                        _mines_dead_kb(game),
                     )
                 else:
                     mult = calc_mines_mult(game["safe_revealed"], game["mines_count"])
                     await query.answer(f"💎 Безопасно! Множитель: {mult}×")
-                    await query.edit_message_text(
+                    await _mines_safe_edit(
+                        query, context, cid2,
                         _mines_header(game),
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=_mines_grid_kb(uid2, cid2, game),
+                        _mines_grid_kb(uid2, cid2, game),
                     )
             return
 
@@ -5910,7 +5948,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await db_add_xp(uid2, cid2, XP_PER_WIN)
             await db_record_game(uid2, cid2, won=True)
             await query.answer(f"💸 Забрал {fmt(payout)} VRF!", show_alert=True)
-            await query.edit_message_text(
+            await _mines_safe_edit(
+                query, context, cid2,
                 f"<h3>💸 Выигрыш в Минах!</h3>"
                 f"<table bordered striped>"
                 f"<tr><td>💎 Ставка</td><td align=\"right\"><b>{fmt(game['bet'])} VRF</b></td></tr>"
@@ -5921,8 +5960,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"</td></tr>"
                 f"<tr><td>💰 Баланс</td><td align=\"right\"><b>{fmt(new_bal)} VRF</b></td></tr>"
                 f"</table>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_mines_dead_kb(game),
+                _mines_dead_kb(game),
             )
             return
 
@@ -5941,12 +5979,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             del mines_games[key]
             await db_record_game(uid2, cid2, won=False)
             await query.answer("🏳 Сдался")
-            await query.edit_message_text(
+            await _mines_safe_edit(
+                query, context, cid2,
                 f"🏳 <b>Игра прекращена</b>\n\n"
                 f"💎 Ставка <b>{fmt(game['bet'])} VRF</b> потеряна\n"
                 f"✅ Было открыто: <b>{game['safe_revealed']}</b> клеток",
-                parse_mode=ParseMode.HTML,
-                reply_markup=_mines_dead_kb(game),
+                _mines_dead_kb(game),
             )
             return
 
@@ -6262,7 +6300,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
 
             # Deduct bears immediately
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                 await db.execute(
                     "UPDATE users SET bears=bears-? WHERE user_id=? AND chat_id=?",
                     (cost, setup["org_id"], cid),
@@ -6404,6 +6442,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer(msg, show_alert=not ok)
             return
 
+        if action == "allin":
+            if not rnd or rnd["state"] != "joining":
+                await query.answer("❌ Окно ставок закрыто!", show_alert=True)
+                return
+            if who.id in rnd["players"]:
+                await query.answer("Ты уже сделал ставку в этом раунде!", show_alert=True)
+                return
+            await db_ensure_user(who.id, rcid, who.username or "", who.first_name)
+            uu = await db_get_user(who.id, rcid)
+            bal = uu["vrf"] if uu else 0
+            if bal < MIN_BET:
+                await query.answer(f"❌ Недостаточно VRF! Есть: {bal}", show_alert=True)
+                return
+            ok, msg = await _crash_join_player(context, rcid, who, bal)
+            await query.answer(msg, show_alert=not ok)
+            return
+
         if action == "custom":
             if not rnd or rnd["state"] != "joining":
                 await query.answer("❌ Окно ставок закрыто!", show_alert=True)
@@ -6418,7 +6473,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await context.bot.send_message(
                     rcid,
                     f"✏️ {mention(who.id, who.first_name)}, напиши сумму ставки "
-                    f"(от <b>{MIN_BET}</b> до <b>{MAX_BET}</b> VRF) ответом на это сообщение:",
+                    f"(минимум <b>{MIN_BET}</b> VRF, максимум — твой баланс) ответом на это сообщение:",
                     parse_mode=ParseMode.HTML,
                     reply_to_message_id=rnd["msg_id"],
                     reply_markup=ForceReply(selective=True, input_field_placeholder="Например: 150"),
@@ -6585,7 +6640,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif action == "stats":
             await query.answer()
             total = await db_count_users(cid)
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                 async with db.execute("SELECT COUNT(*) FROM marriages WHERE chat_id=?", (cid,)) as cur:
                     marriages = (await cur.fetchone())[0]
                 async with db.execute("SELECT SUM(total_games),SUM(vrf),SUM(wins) FROM users WHERE chat_id=?", (cid,)) as cur:
@@ -6704,7 +6759,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return
             else:
                 await update.message.reply_text(
-                    f"❌ Нужно число от {MIN_BET} до {MAX_BET}. Попробуй ещё раз:",
+                    f"❌ Нужно целое число, минимум {MIN_BET}. Попробуй ещё раз:",
                 )
                 return
 
@@ -6754,7 +6809,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             # "пер @username 500"
             uname_query = pts[1].lstrip("@").lower()
             amount_str  = pts[2] if len(pts) > 2 else ""
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=10) as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(
                     "SELECT * FROM users WHERE LOWER(username)=? AND chat_id=? LIMIT 1",

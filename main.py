@@ -158,6 +158,7 @@ ttt_games: dict       = {}   # key: game_id (str)
 battle_games: dict    = {}   # key: game_id (str)  — Battleship
 giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
 giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
+crash_rounds: dict    = {}   # key: cid (int) — Crash multiplier game
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -1119,6 +1120,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики <i>(ответом)</i></li>"
         "<li>/seabattle — 🚢 Морской Бой <i>(ответом, PvP в ЛС)</i></li>"
+        "<li>/crash — 🚀 Краш <i>(весь чат, лови множитель!)</i></li>"
         "<li>/daily — ⚡ Ежедневный бонус</li>"
         "</ul>"
         "<footer>📖 /help — посмотреть все команды</footer>"
@@ -1159,6 +1161,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики</li>"
         "<li>/seabattle — 🚢 Морской Бой <i>(PvP в ЛС)</i></li>"
+        "<li>/crash — 🚀 Краш <i>(множитель растёт, забери до взрыва — весь чат)</i></li>"
         "<li>/giveaway — 🎁 Розыгрыш медведей среди реакций</li>"
         "</ul>"
         "<h3>💒 Браки</h3>"
@@ -1721,6 +1724,266 @@ async def cmd_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         reply_markup=_gw_kb_react(sid),
     )
+
+
+# ══════════════════════════════════════════════════════
+#              CRASH 🚀  (live multiplier, whole-chat)
+# ══════════════════════════════════════════════════════
+# Every player in the chat can join one round with their own bet.
+# A multiplier climbs in real time; cash out before the rocket
+# crashes to win bet × multiplier. Miss the window and you lose
+# the bet. The whole chat plays the SAME round simultaneously.
+
+CRASH_JOIN_SECONDS    = 20
+CRASH_TICK_SECONDS    = 1.2
+CRASH_GROWTH_K        = math.log(2) / 7        # multiplier doubles ~every 7s
+CRASH_MAX_MULT        = 100.0
+CRASH_INSTANT_CHANCE  = 0.04                    # 4% instant 1.00x crash
+CRASH_RTP             = 0.96
+CRASH_BET_PRESETS     = [25, 50, 100, 250, 500]
+
+
+def _crash_point() -> float:
+    """Provably-fair-style crash point generator (house edge baked in)."""
+    r = random.random()
+    if r < CRASH_INSTANT_CHANCE:
+        return 1.00
+    cp = CRASH_RTP / (1 - r)
+    return round(min(CRASH_MAX_MULT, max(1.00, cp)), 2)
+
+
+def _crash_mult_at(elapsed: float) -> float:
+    return round(min(CRASH_MAX_MULT, math.exp(CRASH_GROWTH_K * elapsed)), 2)
+
+
+def _crash_emoji(mult: float) -> str:
+    if mult >= 10: return "⚡"
+    if mult >= 5:  return "🔥"
+    return "🚀"
+
+
+# ── Keyboards ──────────────────────────────────────────
+
+def _crash_join_kb(cid: int) -> InlineKeyboardMarkup:
+    row1 = [SBtn(f"{a} VRF", style="primary",
+                 callback_data=f"cr:join:{cid}:{a}")
+            for a in CRASH_BET_PRESETS[:3]]
+    row2 = [SBtn(f"{a} VRF", style="primary",
+                 callback_data=f"cr:join:{cid}:{a}")
+            for a in CRASH_BET_PRESETS[3:]]
+    return InlineKeyboardMarkup([
+        row1, row2,
+        [SBtn("Отменить раунд", style="danger", callback_data=f"cr:cancel:{cid}")],
+    ])
+
+
+def _crash_flight_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        SBtn("💰 ЗАБРАТЬ СТАВКУ", style="success", callback_data=f"cr:cashout:{cid}")
+    ]])
+
+
+# ── Text builders ──────────────────────────────────────
+
+def _crash_join_text(rnd: dict) -> str:
+    players = rnd["players"]
+    total   = sum(p["bet"] for p in players.values())
+    remain  = max(0, int((rnd["join_deadline"] - datetime.now()).total_seconds()))
+    plist   = "\n".join(
+        f"• {mention(uid, p['name'])} — <b>{fmt(p['bet'])} VRF</b>"
+        for uid, p in players.items()
+    ) or "<i>Пока никто не зашёл...</i>"
+    return (
+        f"🚀 <b>КРАШ — РАУНД ОТКРЫТ!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Делай ставку, лови момент и забирай выигрыш до взрыва! 💥\n\n"
+        f"⏱ До старта: <b>{remain} сек</b>\n"
+        f"👥 Игроков: <b>{len(players)}</b>  ·  💰 Банк: <b>{fmt(total)} VRF</b>\n\n"
+        f"{plist}\n\n"
+        f"⬇️ Выбери ставку, чтобы войти:"
+    )
+
+
+def _crash_flight_text(rnd: dict, mult: float) -> str:
+    players = rnd["players"]
+    emoji   = _crash_emoji(mult)
+    in_list = "\n".join(
+        f"🟢 {p['name']} — {fmt(p['bet'])} VRF"
+        for p in players.values() if not p["cashed"]
+    ) or "—"
+    out_list = "\n".join(
+        f"💰 {p['name']} — ×{p['mult']:.2f} (+{fmt(round(p['bet']*p['mult']))} VRF)"
+        for p in players.values() if p["cashed"]
+    ) or "—"
+    return (
+        f"{emoji} <b>РАКЕТА ЛЕТИТ!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>×{mult:.2f}</b>\n\n"
+        f"<b>🟢 В игре:</b>\n{in_list}\n\n"
+        f"<b>💰 Уже забрали:</b>\n{out_list}\n\n"
+        f"👇 Жми, пока не поздно!"
+    )
+
+
+def _crash_result_text(crash_point: float, winners: list, losers: list) -> str:
+    win_lines = "\n".join(
+        f"💰 {name} — ×{m:.2f} → <b>+{fmt(payout)} VRF</b>"
+        for name, m, payout in winners
+    ) or "<i>Никто не успел забрать...</i>"
+    lose_lines = "\n".join(
+        f"💥 {name} — потерял <b>{fmt(bet)} VRF</b>"
+        for name, bet in losers
+    ) or "<i>Все успели забрать вовремя!</i>"
+    return (
+        f"💥 <b>ВЗРЫВ на ×{crash_point:.2f}!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{win_lines}\n\n"
+        f"{lose_lines}\n\n"
+        f"🚀 Хочешь снова? /crash"
+    )
+
+
+# ── Round end (shared by timeout-crash and all-cashed-out) ──
+
+async def _crash_end(bot, cid: int, final_mult: float) -> None:
+    rnd = crash_rounds.get(cid)
+    if not rnd or rnd["state"] == "ended":
+        return
+    rnd["state"]    = "ended"
+    crash_point     = round(final_mult, 2)
+    winners, losers = [], []
+
+    for uid, p in rnd["players"].items():
+        if p["cashed"]:
+            payout = round(p["bet"] * p["mult"])
+            winners.append((p["name"], p["mult"], payout))
+        else:
+            losers.append((p["name"], p["bet"]))
+            try:
+                await db_add_xp(uid, cid, XP_PER_GAME)
+                await db_record_game(uid, cid, won=False)
+            except Exception:
+                pass
+
+    crash_rounds.pop(cid, None)
+    try:
+        await bot.edit_message_text(
+            _crash_result_text(crash_point, winners, losers),
+            chat_id=cid, message_id=rnd["msg_id"],
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        pass
+
+
+# ── Background tasks ───────────────────────────────────
+
+async def _crash_join_loop(bot, cid: int) -> None:
+    try:
+        while True:
+            rnd = crash_rounds.get(cid)
+            if not rnd or rnd["state"] != "joining":
+                return
+            remain = (rnd["join_deadline"] - datetime.now()).total_seconds()
+            if remain <= 0:
+                break
+            await asyncio.sleep(min(4, max(0.6, remain)))
+            rnd = crash_rounds.get(cid)
+            if not rnd or rnd["state"] != "joining":
+                return
+            try:
+                await bot.edit_message_text(
+                    _crash_join_text(rnd), chat_id=cid, message_id=rnd["msg_id"],
+                    parse_mode=ParseMode.HTML, reply_markup=_crash_join_kb(cid),
+                )
+            except TelegramError:
+                pass
+
+        rnd = crash_rounds.get(cid)
+        if not rnd or rnd["state"] != "joining":
+            return
+
+        if not rnd["players"]:
+            crash_rounds.pop(cid, None)
+            try:
+                await bot.edit_message_text(
+                    "🚀 <b>Раунд отменён</b> — никто не присоединился.",
+                    chat_id=cid, message_id=rnd["msg_id"], parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
+        rnd["state"]        = "flying"
+        rnd["flight_start"] = datetime.now()
+        await _crash_flight_loop(bot, cid)
+    except Exception:
+        log.exception("Crash join loop failed (cid=%s)", cid)
+        crash_rounds.pop(cid, None)
+
+
+async def _crash_flight_loop(bot, cid: int) -> None:
+    try:
+        while True:
+            await asyncio.sleep(CRASH_TICK_SECONDS)
+            rnd = crash_rounds.get(cid)
+            if not rnd or rnd["state"] != "flying":
+                return
+            elapsed  = (datetime.now() - rnd["flight_start"]).total_seconds()
+            cur_mult = _crash_mult_at(elapsed)
+
+            still_in = any(not p["cashed"] for p in rnd["players"].values())
+            if cur_mult >= rnd["crash_point"] or not still_in:
+                await _crash_end(bot, cid, min(cur_mult, rnd["crash_point"]))
+                return
+
+            try:
+                await bot.edit_message_text(
+                    _crash_flight_text(rnd, cur_mult),
+                    chat_id=cid, message_id=rnd["msg_id"],
+                    parse_mode=ParseMode.HTML, reply_markup=_crash_flight_kb(cid),
+                )
+            except TelegramError:
+                pass
+    except Exception:
+        log.exception("Crash flight loop failed (cid=%s)", cid)
+        crash_rounds.pop(cid, None)
+
+
+# ── /crash command ─────────────────────────────────────
+
+@only_groups
+async def cmd_crash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cid = update.effective_chat.id
+    u   = update.effective_user
+
+    existing = crash_rounds.get(cid)
+    if existing and existing["state"] != "ended":
+        await update.message.reply_text(
+            "⏳ Раунд уже идёт! Присоединяйся к нему выше ☝️"
+            if existing["state"] == "joining" else
+            "🚀 Ракета уже летит! Дождись следующего раунда.",
+        )
+        return
+
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+
+    crash_rounds[cid] = {
+        "cid": cid, "state": "joining",
+        "starter_id": u.id, "starter_name": u.first_name,
+        "msg_id": None, "players": {},
+        "crash_point": _crash_point(),
+        "join_deadline": datetime.now() + timedelta(seconds=CRASH_JOIN_SECONDS),
+        "flight_start": None,
+    }
+    rnd = crash_rounds[cid]
+
+    msg = await update.message.reply_text(
+        _crash_join_text(rnd), parse_mode=ParseMode.HTML,
+        reply_markup=_crash_join_kb(cid),
+    )
+    rnd["msg_id"] = msg.message_id
+    context.application.create_task(_crash_join_loop(context.bot, cid))
 
 
 # ══════════════════════════════════════════════════════
@@ -4249,6 +4512,14 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             del battle_games[k]
             cancelled.append("🚢 Морской Бой")
 
+    # Crash (joining phase, starter only — refunds everyone)
+    crash_rnd = crash_rounds.get(cid)
+    if crash_rnd and crash_rnd["state"] == "joining" and crash_rnd["starter_id"] == uid:
+        for puid, p in crash_rnd["players"].items():
+            await db_add_vrf(puid, cid, p["bet"])
+        crash_rounds.pop(cid, None)
+        cancelled.append("🚀 Краш (ставки возвращены)")
+
     if cancelled:
         await update.message.reply_text(
             f"✅ <b>Отменено:</b> {', '.join(cancelled)}",
@@ -5456,6 +5727,101 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Crash 🚀 ──────────────────────────────────────────
+    if data.startswith("cr:"):
+        parts   = data.split(":")
+        action  = parts[1]
+        rcid    = int(parts[2])
+        rnd     = crash_rounds.get(rcid)
+
+        if action == "join":
+            amount = int(parts[3])
+            if not rnd or rnd["state"] != "joining":
+                await query.answer("❌ Окно ставок закрыто!", show_alert=True)
+                return
+            if who.id in rnd["players"]:
+                await query.answer("Ты уже сделал ставку в этом раунде!", show_alert=True)
+                return
+            await db_ensure_user(who.id, rcid, who.username or "", who.first_name)
+            u = await db_get_user(who.id, rcid)
+            if not u or u["vrf"] < amount:
+                await query.answer(f"❌ Недостаточно VRF! Нужно {amount}.", show_alert=True)
+                return
+            ok = await db_deduct_vrf(who.id, rcid, amount)
+            if not ok:
+                await query.answer("❌ Недостаточно VRF!", show_alert=True)
+                return
+            rnd["players"][who.id] = {
+                "name": who.first_name, "bet": amount,
+                "cashed": False, "mult": None,
+            }
+            await query.answer(f"✅ Ставка {amount} VRF принята! Удачи 🍀")
+            return
+
+        if action == "cancel":
+            if not rnd or rnd["state"] != "joining":
+                await query.answer("❌ Раунд уже идёт или завершён", show_alert=True)
+                return
+            if who.id != rnd["starter_id"]:
+                await query.answer("❌ Только организатор может отменить раунд", show_alert=True)
+                return
+            for puid, p in rnd["players"].items():
+                await db_add_vrf(puid, rcid, p["bet"])
+            crash_rounds.pop(rcid, None)
+            await query.answer("Раунд отменён, ставки возвращены")
+            try:
+                await query.edit_message_text(
+                    "🚫 <b>Раунд отменён организатором.</b>\nВсе ставки возвращены.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "cashout":
+            if not rnd or rnd["state"] != "flying":
+                await query.answer("❌ Раунд не активен", show_alert=True)
+                return
+            p = rnd["players"].get(who.id)
+            if not p:
+                await query.answer("❌ Ты не участвуешь в этом раунде!", show_alert=True)
+                return
+            if p["cashed"]:
+                await query.answer(f"Ты уже забрал ×{p['mult']:.2f}!", show_alert=True)
+                return
+
+            elapsed  = (datetime.now() - rnd["flight_start"]).total_seconds()
+            cur_mult = _crash_mult_at(elapsed)
+            if cur_mult >= rnd["crash_point"]:
+                await query.answer("💥 Поздно! Ракета уже взорвалась...", show_alert=True)
+                if rnd["state"] == "flying":
+                    await _crash_end(context.bot, rcid, rnd["crash_point"])
+                return
+
+            p["cashed"] = True
+            p["mult"]   = cur_mult
+            payout      = round(p["bet"] * cur_mult)
+            await db_add_vrf(who.id, rcid, payout)
+            await db_add_xp(who.id, rcid, XP_PER_WIN)
+            await db_record_game(who.id, rcid, won=True)
+            await query.answer(f"💰 Забрал ×{cur_mult:.2f}! +{fmt(payout)} VRF")
+
+            try:
+                await query.edit_message_text(
+                    _crash_flight_text(rnd, cur_mult),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_crash_flight_kb(rcid),
+                )
+            except TelegramError:
+                pass
+
+            if all(pl["cashed"] for pl in rnd["players"].values()):
+                await _crash_end(context.bot, rcid, cur_mult)
+            return
+
+        await query.answer()
+        return
+
     # ── Admin panel ──────────────────────────────────────
     if data.startswith("ap:"):
         uid   = who.id
@@ -5870,6 +6236,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
         BotCommand("seabattle","🚢 Морской Бой (ответом, PvP в ЛС)"),
+        BotCommand("crash",    "🚀 Краш — весь чат, лови множитель!"),
         BotCommand("giveaway", "🎁 Розыгрыш медведей среди реакций"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
@@ -5934,6 +6301,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mines",   cmd_mines))
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
+    app.add_handler(CommandHandler("crash",     cmd_crash))
     app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 

@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import aiosqlite
 from telegram import (
+    ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -36,8 +37,38 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
+
+
+# ══════════════════════════════════════════════════════
+#  STYLED BUTTON — InlineKeyboardButton + style field
+# ══════════════════════════════════════════════════════
+# Telegram Bot API supports: style="success" 🟢  "danger" 🔴  "primary" 🔵
+# python-telegram-bot may not expose `style` yet, so we inject it via to_dict.
+
+class SBtn(InlineKeyboardButton):
+    """
+    InlineKeyboardButton с официальным параметром Telegram API `style`.
+    Значения: "success" (зелёный) | "danger" (красный) | "primary" (синий)
+    """
+    _cache: dict = {}  # id(self) → style str
+
+    def __init__(self, text: str, *, style: str = None, **kwargs):
+        super().__init__(text, **kwargs)
+        if style:
+            SBtn._cache[id(self)] = style
+
+    def to_dict(self, **kwargs) -> dict:
+        d = super().to_dict(**kwargs)
+        s = SBtn._cache.get(id(self))
+        if s:
+            d["style"] = s
+        return d
+
+    def __del__(self) -> None:
+        SBtn._cache.pop(id(self), None)
 
 # ══════════════════════════════════════════════════════
 #                       CONFIG
@@ -125,6 +156,8 @@ slot_games: dict      = {}   # key: game_id (str)
 mines_games: dict     = {}   # key: f"{uid}:{cid}"
 ttt_games: dict       = {}   # key: game_id (str)
 battle_games: dict    = {}   # key: game_id (str)  — Battleship
+giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
+giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
 
 # ══════════════════════════════════════════════════════
 #               LEVEL / RANK SYSTEM
@@ -232,146 +265,211 @@ log = logging.getLogger("verifure")
 #          STATISTICS IMAGE GENERATOR 📊
 # ══════════════════════════════════════════════════════
 
-# Chart palette (matches dark Telegram theme)
-_C_BG     = '#0d1117'
-_C_CARD   = '#161b22'
-_C_GOLD   = '#e3b341'
-_C_GREEN  = '#3fb950'
-_C_RED    = '#f85149'
-_C_BLUE   = '#2a78d6'
-_C_GRAY   = '#484f58'
-_C_WHITE  = '#c9d1d9'
-_C_ORANGE = '#d29922'
-_C_PURPLE = '#8b5cf6'
-
-
 def _stats_image_sync(u: dict, display_name: str) -> Optional[bytes]:
-    """Sync matplotlib image — call via run_in_executor."""
+    """
+    Draw a stats card using Pillow (PIL).
+    Falls back to None if Pillow is not installed.
+    Add 'Pillow' to requirements.txt to enable.
+    """
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.gridspec import GridSpec
+        from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return None
 
-    wins   = int(u.get("wins", 0))
-    losses = int(u.get("losses", 0))
-    draws  = int(u.get("draws", 0))
+    # ── Palette ───────────────────────────────────────────
+    BG      = (13,  17,  23)
+    CARD    = (22,  27,  34)
+    TRACK   = (33,  38,  45)
+    BORDER  = (48,  54,  61)
+    WHITE   = (201, 209, 217)
+    MUTED   = (125, 133, 144)
+    GOLD    = (227, 179,  65)
+    GREEN   = (63,  185,  80)
+    RED     = (248,  81,  73)
+    BLUE    = (42,  120, 214)
+    GRAY    = (72,   79,  88)
+    ORANGE  = (210, 159,  34)
+    BROWN   = (161, 136, 127)
+
+    # ── Data ──────────────────────────────────────────────
+    wins   = int(u.get("wins",        0))
+    losses = int(u.get("losses",      0))
+    draws  = int(u.get("draws",       0))
     total  = int(u.get("total_games", 0))
-    vrf    = int(u.get("vrf", 0))
-    streak = int(u.get("win_streak", 0))
-    mstrk  = int(u.get("max_streak", 0))
-    bears  = int(u.get("bears", 0))
-    xp     = int(u.get("experience", 0))
+    vrf    = int(u.get("vrf",         0))
+    streak = int(u.get("win_streak",  0))
+    mstrk  = int(u.get("max_streak",  0))
+    bears  = int(u.get("bears",       0))
+    xp     = int(u.get("experience",  0))
     lvl    = get_level(xp)
     rnk    = get_rank(lvl)
     _, c_xp, n_xp, pct = get_progress(xp)
     wr     = round(wins / max(1, total) * 100, 1)
     profit = vrf - STARTING_VRF
     p_sign = "+" if profit >= 0 else ""
-    p_col  = _C_GREEN if profit >= 0 else _C_RED
+    p_col  = GREEN if profit >= 0 else RED
 
-    fig = plt.figure(figsize=(10.5, 5.5), facecolor=_C_BG, dpi=120)
-    gs  = GridSpec(2, 3, figure=fig, wspace=0.38, hspace=0.52,
-                   left=0.05, right=0.97, top=0.82, bottom=0.13)
+    # ── Canvas ────────────────────────────────────────────
+    W, H = 900, 538
+    img  = Image.new("RGB", (W, H), BG)
+    d    = ImageDraw.Draw(img)
 
-    # ── Header ────────────────────────────────────────────
-    fig.text(0.5, 0.96, display_name, fontsize=18,
-             color=_C_WHITE, ha="center", va="top", fontweight="bold")
-    fig.text(0.5, 0.90,
-             f"💎 {fmt(vrf)} VRF   ·   Уровень {lvl} — {rnk}   ·   W/R {wr}%",
-             fontsize=10.5, color=_C_GOLD, ha="center", va="top")
-
-    # ── PIE — W / L / D ──────────────────────────────────
-    ax_pie = fig.add_subplot(gs[:, 0])
-    ax_pie.set_facecolor(_C_CARD)
-    pairs = [(wins, _C_GREEN, f"Победы\n{wins}"),
-             (losses, _C_RED, f"Пораж.\n{losses}"),
-             (draws, _C_GRAY, f"Ничья\n{draws}")]
-    nz = [(v, c, l) for v, c, l in pairs if v > 0]
-    if nz:
-        vals, cols, lbls = zip(*nz)
-        wedges, _, auts = ax_pie.pie(
-            vals, colors=cols, autopct="%1.0f%%", startangle=90,
-            pctdistance=0.70,
-            wedgeprops={"linewidth": 2.5, "edgecolor": _C_BG},
-            textprops={"color": _C_WHITE, "fontsize": 8.5},
-        )
-        ax_pie.legend(wedges, lbls, loc="lower center",
-                      bbox_to_anchor=(0.5, -0.20),
-                      fontsize=8, frameon=False,
-                      labelcolor=_C_WHITE, ncol=len(nz))
-    else:
-        ax_pie.text(0, 0, "Нет игр", ha="center", va="center",
-                    color=_C_GRAY, fontsize=11)
-        ax_pie.set_aspect("equal")
-    ax_pie.set_title("W / L / D", color=_C_WHITE, fontsize=9.5, pad=4)
-
-    # ── KEY STATS ─────────────────────────────────────────
-    ax_st = fig.add_subplot(gs[0, 1])
-    ax_st.set_facecolor(_C_CARD)
-    ax_st.axis("off")
-    ax_st.set_title("Показатели", color=_C_WHITE, fontsize=9.5, pad=4)
-    rows = [
-        ("🏆 Побед",     f"{wins}  ({wr}%)", _C_GREEN),
-        ("❌ Поражений", f"{losses}",          _C_RED),
-        ("🎮 Всего игр", f"{total}",           _C_WHITE),
-        ("🔥 Стрик",     f"{streak}  (рек. {mstrk})", _C_ORANGE),
-        ("🐻 Медведей",  f"{bears}",           "#a1887f"),
+    # ── Fonts (DejaVu is standard on Ubuntu/Railway) ──────
+    _REG = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ]
+    _BOLD = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ]
+
+    def _font(paths: list, size: int):
+        for p in paths:
+            try:
+                return ImageFont.truetype(p, size)
+            except (OSError, IOError):
+                continue
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    f10  = _font(_REG,  10); f11 = _font(_REG,  11)
+    f12  = _font(_REG,  12); f14 = _font(_REG,  14)
+    fb12 = _font(_BOLD, 12); fb14 = _font(_BOLD, 14)
+    fb20 = _font(_BOLD, 20); fb24 = _font(_BOLD, 24)
+    fb28 = _font(_BOLD, 28)
+
+    # ── Draw helpers ──────────────────────────────────────
+    def _tw(s: str, font) -> int:
+        b = d.textbbox((0, 0), s, font=font)
+        return b[2] - b[0]
+
+    def tl(x, y, s, font, fill=WHITE):
+        d.text((x, y), s, font=font, fill=fill)
+
+    def tr(x, y, s, font, fill=WHITE):
+        d.text((x - _tw(s, font), y), s, font=font, fill=fill)
+
+    def tc(cx, y, s, font, fill=WHITE):
+        d.text((cx - _tw(s, font) // 2, y), s, font=font, fill=fill)
+
+    def rr(x1, y1, x2, y2, fill=CARD, r=10, outline=None):
+        try:
+            d.rounded_rectangle(
+                [x1, y1, x2, y2], radius=r, fill=fill,
+                outline=outline, width=1 if outline else 0,
+            )
+        except AttributeError:
+            d.rectangle([x1, y1, x2, y2], fill=fill, outline=outline)
+
+    def hrule(y, x1=25, x2=W-25):
+        d.line([(x1, y), (x2, y)], fill=TRACK, width=1)
+
+    # ══════════════════════════════════════════════════════
+    # HEADER
+    # ══════════════════════════════════════════════════════
+    tc(W//2, 12, display_name, fb24)
+    tc(W//2, 46,
+       f"{fmt(vrf)} VRF   |   Ур.{lvl} — {rnk}   |   W/R {wr}%",
+       f14, GOLD)
+
+    # ══════════════════════════════════════════════════════
+    # METRIC CARDS  (Победы / Поражения / Ничьи)
+    # ══════════════════════════════════════════════════════
+    CY1, CY2 = 76, 170
+    CW = (W - 40) // 3
+    for i, (lbl, val, col) in enumerate([
+        ("Победы",    wins,   GREEN),
+        ("Поражения", losses, RED),
+        ("Ничьи",     draws,  GRAY),
+    ]):
+        cx1 = 15 + i * (CW + 5)
+        cx2 = cx1 + CW
+        mid = (cx1 + cx2) // 2
+        rr(cx1, CY1, cx2, CY2)
+        tc(mid, CY1 + 8,  lbl, f11, MUTED)
+        tc(mid, CY1 + 30, str(val), fb28, col)
+        pv = round(val / max(1, total) * 100, 1)
+        tc(mid, CY1 + 74, f"{pv}%", f10, MUTED)
+
+    # ══════════════════════════════════════════════════════
+    # LEVEL PROGRESS BAR
+    # ══════════════════════════════════════════════════════
+    LY1 = 178
+    rr(15, LY1, W-15, LY1 + 56)
+    tl(25, LY1 + 8, f"Уровень {lvl} → {lvl+1}", f12, MUTED)
+    tr(W-25, LY1 + 8,
+       f"{int(pct*100)}%   |   {xp-c_xp:,} / {n_xp-c_xp:,} XP", f12, MUTED)
+    rr(25, LY1+32, W-25, LY1+50, fill=TRACK, r=9)
+    fw = max(18, int((W-50) * pct))
+    rr(25, LY1+32, 25+fw, LY1+50, fill=BLUE, r=9)
+
+    # ══════════════════════════════════════════════════════
+    # W / L / D  RATIO BAR
+    # ══════════════════════════════════════════════════════
+    WY1 = 242
+    rr(15, WY1, W-15, WY1 + 62)
+    tl(25, WY1 + 8, "W / L / D", f12, MUTED)
+
+    BX, BW = 25, W - 50
+    BY1, BY2 = WY1+30, WY1+46
+
+    rr(BX, BY1, BX+BW, BY2, fill=TRACK, r=8)   # track
+    if total > 0:
+        ww = int(BW * wins   / total)
+        lw = int(BW * losses / total)
+        dw = BW - ww - lw
+        gap = 3
+        # Wins
+        if ww > 0:
+            rr(BX, BY1, BX+ww, BY2, fill=GREEN, r=8)
+        # Losses
+        if lw > 0:
+            xl = BX + ww + (gap if ww else 0)
+            d.rectangle([xl, BY1, xl+lw, BY2], fill=RED)
+            if dw <= 0:  # round right end
+                rr(BX+BW-8, BY1, BX+BW, BY2, fill=RED, r=8)
+        # Draws
+        if dw > 0:
+            xd = BX + ww + lw + (gap*2 if (ww+lw) else 0)
+            d.rectangle([xd, BY1, BX+BW, BY2], fill=GRAY)
+            rr(BX+BW-8, BY1, BX+BW, BY2, fill=GRAY, r=8)
+        # Legend
+        lx = BX
+        for lc, lt, lv in [(GREEN,"Победы",wins),(RED,"Пор.",losses),(GRAY,"Ничья",draws)]:
+            d.ellipse([lx, BY2+5, lx+8, BY2+13], fill=lc)
+            tl(lx+12, BY2+4, f"{lt}: {lv}", f10, MUTED)
+            lx += 130
+    else:
+        tc(BX + BW//2, BY1+4, "Нет игр", f11, MUTED)
+
+    # ══════════════════════════════════════════════════════
+    # STATS TABLE
+    # ══════════════════════════════════════════════════════
+    TY = 312
+    rows = [
+        ("Всего игр",       str(total),                   WHITE),
+        ("Текущий стрик",   f"{streak}  (рекорд: {mstrk})", ORANGE),
+        ("Медведей",        str(bears),                   BROWN),
+        ("VRF от старта",   f"{p_sign}{fmt(profit)}",     p_col),
+        ("Всего побед",     str(wins),                    GREEN),
+    ]
+    RH = 40
+    TH = len(rows) * RH + 16
+    rr(15, TY, W-15, TY+TH)
     for i, (lbl, val, col) in enumerate(rows):
-        y = 0.84 - i * 0.175
-        ax_st.text(0.05, y, lbl, transform=ax_st.transAxes,
-                   color=_C_GRAY, fontsize=8.5)
-        ax_st.text(0.97, y, val, transform=ax_st.transAxes,
-                   color=col, fontsize=8.5, ha="right", fontweight="bold")
-
-    # ── LEVEL PROGRESS ────────────────────────────────────
-    ax_lv = fig.add_subplot(gs[0, 2])
-    ax_lv.set_facecolor(_C_CARD)
-    ax_lv.axis("off")
-    ax_lv.set_title(f"Ур. {lvl} → {lvl+1}", color=_C_WHITE, fontsize=9.5, pad=4)
-    # Track
-    ax_lv.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.30), 0.90, 0.22, boxstyle="round,pad=0.01",
-        linewidth=0, facecolor="#21262d", transform=ax_lv.transAxes, clip_on=False))
-    # Fill
-    fill_w = max(0.008, 0.90 * pct)
-    ax_lv.add_patch(mpatches.FancyBboxPatch(
-        (0.05, 0.30), fill_w, 0.22, boxstyle="round,pad=0.01",
-        linewidth=0, facecolor=_C_BLUE, transform=ax_lv.transAxes, clip_on=False))
-    ax_lv.text(0.5, 0.72, f"{int(pct*100)}%",
-               ha="center", color=_C_WHITE, fontsize=15, fontweight="bold",
-               transform=ax_lv.transAxes)
-    ax_lv.text(0.5, 0.12,
-               f"{xp - c_xp:,} / {n_xp - c_xp:,} XP",
-               ha="center", color=_C_GRAY, fontsize=8.5, transform=ax_lv.transAxes)
-
-    # ── VRF BAR: start vs now ─────────────────────────────
-    ax_bar = fig.add_subplot(gs[1, 1:])
-    ax_bar.set_facecolor(_C_CARD)
-    cats  = [f"Старт\n{fmt(STARTING_VRF)}", f"Сейчас\n{fmt(vrf)}"]
-    vals2 = [STARTING_VRF, vrf]
-    bcols = [_C_GRAY, _C_GREEN if vrf >= STARTING_VRF else _C_RED]
-    bars  = ax_bar.bar(cats, vals2, color=bcols, width=0.42,
-                        edgecolor=_C_BG, linewidth=2)
-    for bar, val in zip(bars, vals2):
-        ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(vals2) * 0.03,
-                    fmt(val), ha="center", va="bottom",
-                    color=_C_WHITE, fontsize=10, fontweight="bold")
-    ax_bar.set_title(f"VRF Баланс  ({p_sign}{fmt(profit)} от старта)",
-                     color=p_col, fontsize=9.5, pad=4)
-    ax_bar.tick_params(colors=_C_WHITE, labelsize=8.5)
-    ax_bar.spines[:].set_visible(False)
-    ax_bar.set_yticks([])
-    ax_bar.set_facecolor(_C_CARD)
+        ry = TY + 10 + i * RH
+        tl(25, ry, lbl, f14, MUTED)
+        tr(W-25, ry, val, fb14, col)
+        if i < len(rows)-1:
+            hrule(ry + RH - 2)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="PNG", dpi=120, bbox_inches="tight", facecolor=_C_BG)
-    plt.close(fig)
+    img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf.read()
 
@@ -495,6 +593,34 @@ async def db_init() -> None:
                 added_at   TEXT    NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS daily_activity (
+                date     TEXT    NOT NULL,
+                chat_id  INTEGER NOT NULL,
+                messages INTEGER DEFAULT 0,
+                games    INTEGER DEFAULT 0,
+                PRIMARY KEY (date, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mutes (
+                user_id  INTEGER NOT NULL,
+                chat_id  INTEGER NOT NULL,
+                muted_by INTEGER NOT NULL,
+                muted_at TEXT    NOT NULL,
+                until    TEXT    DEFAULT NULL,
+                reason   TEXT    DEFAULT '',
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS warns (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL,
+                chat_id   INTEGER NOT NULL,
+                warned_by INTEGER NOT NULL,
+                warned_at TEXT    NOT NULL,
+                reason    TEXT    DEFAULT '',
+                active    INTEGER DEFAULT 1
+            );
+
 
         """)
         await db.commit()
@@ -516,6 +642,35 @@ async def db_init() -> None:
             except Exception:
                 pass
     log.info("Database initialised at %s", DB_PATH)
+
+
+async def db_log_activity(cid: int, msgs: int = 0, gms: int = 0) -> None:
+    """Increment daily message/game counters for a chat."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO daily_activity (date, chat_id, messages, games)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(date, chat_id) DO UPDATE SET
+                   messages = messages + excluded.messages,
+                   games    = games    + excluded.games""",
+            (today, cid, msgs, gms),
+        )
+        await db.commit()
+
+
+async def db_get_activity(cid: int, days: int = 30) -> list:
+    """Return (date, messages, games) rows for the last N days."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT date, messages, games
+               FROM daily_activity
+               WHERE chat_id = ?
+                 AND date >= date('now', ? || ' days')
+               ORDER BY date""",
+            (cid, f"-{days}"),
+        ) as cur:
+            return await cur.fetchall()
 
 
 # ── Users ──────────────────────────────────────────────
@@ -643,6 +798,10 @@ async def db_record_game(
                 (uid, cid),
             )
             await db.commit()
+
+    # Log one game per winner to daily activity chart
+    if won:
+        await db_log_activity(cid, gms=1)
 
 
 async def db_can_earn_xp(uid: int, cid: int) -> bool:
@@ -1000,6 +1159,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
         "<li>/tictac — ❌⭕ Крестики-нолики</li>"
         "<li>/seabattle — 🚢 Морской Бой <i>(PvP в ЛС)</i></li>"
+        "<li>/giveaway — 🎁 Розыгрыш медведей среди реакций</li>"
         "</ul>"
         "<h3>💒 Браки</h3>"
         "<ul>"
@@ -1086,50 +1246,480 @@ async def cmd_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_groups
 async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send statistics as a styled image card."""
-    if update.message.reply_to_message and not update.message.reply_to_message.from_user.is_bot:
-        target = update.message.reply_to_message.from_user
-    else:
-        target = update.effective_user
+    """Send group activity chart (messages + games per day)."""
+    cid  = update.effective_chat.id
+    days = 30
+    if context.args:
+        try:
+            days = min(90, max(7, int(context.args[0])))
+        except ValueError:
+            pass
 
-    cid = update.effective_chat.id
-    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
-    u = await db_get_user(target.id, cid)
-    if not u:
-        return
-
-    display = f"@{u['username']}" if u.get("username") else u.get("first_name", "Игрок")
-
-    # Run in executor to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    img_bytes = await loop.run_in_executor(None, _stats_image_sync, u, display)
-
-    if img_bytes is None:
+    rows = await db_get_activity(cid, days)
+    if not rows:
         await update.message.reply_text(
-            "❌ <b>matplotlib не установлен!</b>\n\n"
-            "Добавь в <code>requirements.txt</code>:\n"
-            "<code>matplotlib</code>",
+            "📊 <b>Данных пока нет</b>\n\n"
+            "Активность начнёт отслеживаться с этого момента. "
+            "Напишите что-нибудь в чат и запустите /statsimg снова!",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    lvl     = get_level(u["experience"])
-    wr      = round(u["wins"] / max(1, u["total_games"]) * 100, 1)
-    profit  = u["vrf"] - STARTING_VRF
-    p_sign  = "+" if profit >= 0 else ""
+    loop      = asyncio.get_event_loop()
+    img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
 
-    caption = (
-        f"📊 <b>Статистика {mention(target.id, u['first_name'])}</b>\n"
-        f"💎 {fmt(u['vrf'])} VRF  ·  Уровень {lvl} — {get_rank(lvl)}\n"
-        f"🏆 {u['wins']} побед ({wr}%)  ·  🎮 {u['total_games']} игр\n"
-        f"💰 Баланс от старта: <b>{p_sign}{fmt(profit)} VRF</b>"
-    )
+    if img_bytes is None:
+        await update.message.reply_text(
+            "❌ Установи matplotlib:\n<code>pip install matplotlib</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
+    total_msgs  = sum(r[1] for r in rows)
+    total_games = sum(r[2] for r in rows)
     await context.bot.send_photo(
         chat_id=cid,
         photo=io.BytesIO(img_bytes),
-        caption=caption,
+        caption=(
+            f"📈 <b>Статистика активности — {days} дн.</b>\n\n"
+            f"💬 Сообщений: <b>{fmt(total_msgs)}</b>\n"
+            f"🎮 Игр сыграно: <b>{fmt(total_games)}</b>"
+        ),
         parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#         ACTIVITY CHART COMMAND 📈
+# ══════════════════════════════════════════════════════
+
+def _activity_chart_sync(rows: list) -> Optional[bytes]:
+    """
+    Generate 'Статистика активности' bar chart using matplotlib.
+    rows: list of (date 'YYYY-MM-DD', messages: int, games: int)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from datetime import datetime as _dt, timedelta as _td
+    except ImportError:
+        return None
+
+    if not rows:
+        return None
+
+    # ── Fill all dates in range (0 for missing days) ──────
+    all_dates: dict = {}
+    if rows:
+        start = _dt.strptime(rows[0][0],  "%Y-%m-%d")
+        end   = _dt.strptime(rows[-1][0], "%Y-%m-%d")
+        cur   = start
+        while cur <= end:
+            all_dates[cur.strftime("%Y-%m-%d")] = [0, 0]
+            cur += _td(days=1)
+    for date_s, msg, gm in rows:
+        all_dates[date_s] = [int(msg), int(gm)]
+
+    sorted_dates = sorted(all_dates)
+    messages = [all_dates[d][0] for d in sorted_dates]
+    games    = [all_dates[d][1] for d in sorted_dates]
+    labels   = [d[8:10] + "." + d[5:7] for d in sorted_dates]   # DD.MM
+    n        = len(sorted_dates)
+    x        = np.arange(n)
+    bar_w    = 0.40
+
+    # ── Figure ────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    fig.patch.set_facecolor("#f4f4f4")
+    ax.set_facecolor("#f4f4f4")
+
+    # ── Bars ──────────────────────────────────────────────
+    # Lime-green for messages, orange for games
+    ax.bar(x - bar_w / 2, messages, bar_w,
+           color="#b5e61d", zorder=3, label="Сообщения")
+    ax.bar(x + bar_w / 2, games,    bar_w,
+           color="#f07030", zorder=3, label="Игры")
+
+    # ── X-axis: show label every ~2 days ─────────────────
+    step = max(1, n // 15)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels(labels[::step], fontsize=9, color="#444444")
+    ax.tick_params(axis="x", bottom=False, top=False)
+    ax.set_xlim(-0.7, n - 0.3)
+
+    # ── Y-axis left ───────────────────────────────────────
+    ax.tick_params(axis="y", labelsize=9, labelcolor="#444444",
+                   left=True, right=False)
+    ax.set_ylim(bottom=0)
+
+    # ── Twin Y-axis (right) with "Сообщения" label ────────
+    ax2 = ax.twinx()
+    ax2.set_ylim(ax.get_ylim())
+    yticks = ax.get_yticks()
+    ax2.set_yticks(yticks)
+    ax2.set_yticklabels(
+        [str(int(t)) if t >= 0 and t == int(t) else "" for t in yticks],
+        fontsize=9, color="#3344cc",
+    )
+    ax2.set_ylabel("Сообщения", fontsize=9, color="#3344cc",
+                   rotation=90, labelpad=8)
+    ax2.tick_params(axis="y", colors="#3344cc", right=True, width=0.5)
+    ax2.spines["right"].set_color("#3344cc")
+    ax2.spines["right"].set_linewidth(0.8)
+
+    # ── Grid ──────────────────────────────────────────────
+    ax.yaxis.grid(True, color="#cccccc", linestyle="-",
+                  linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    # ── Spines: hide all except right (handled by ax2) ───
+    for sp in ("top", "right", "left", "bottom"):
+        ax.spines[sp].set_visible(False)
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["left"].set_visible(False)
+    ax2.spines["bottom"].set_visible(False)
+
+    # ── Title + legend ────────────────────────────────────
+    ax.set_title("Статистика активности", fontsize=13,
+                 color="#333333", pad=10)
+    ax.legend(loc="upper right", fontsize=9,
+              framealpha=0.7, frameon=True)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="PNG", dpi=130, bbox_inches="tight",
+                facecolor="#f4f4f4", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+@only_groups
+async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the group's activity chart (messages + games per day)."""
+    cid  = update.effective_chat.id
+    days = 30
+    if context.args:
+        try:
+            days = min(90, max(7, int(context.args[0])))
+        except ValueError:
+            pass
+
+    rows = await db_get_activity(cid, days)
+    if not rows:
+        await update.message.reply_text(
+            "📊 <b>Данных пока нет</b>\n\nАктивность начнёт отслеживаться с этого момента.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    loop      = asyncio.get_event_loop()
+    img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
+
+    if img_bytes is None:
+        await update.message.reply_text(
+            "❌ Установи matplotlib:\n<code>pip install matplotlib</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_msgs  = sum(r[1] for r in rows)
+    total_games = sum(r[2] for r in rows)
+    await context.bot.send_photo(
+        chat_id=cid,
+        photo=io.BytesIO(img_bytes),
+        caption=(
+            f"📈 <b>Активность чата — последние {days} дн.</b>\n\n"
+            f"💬 Сообщений: <b>{fmt(total_msgs)}</b>\n"
+            f"🎮 Игр сыграно: <b>{fmt(total_games)}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#              BEAR GIVEAWAY 🐻🎁
+# ══════════════════════════════════════════════════════
+
+GW_REACT_EMOJIS = [
+    "❤", "👍", "🔥", "🎉", "🥰", "👏",
+    "😁", "🤔", "💯", "⚡", "🏆", "🐳",
+    "😢", "🤩", "🙏", "👌", "😍", "🎃",
+    "🤣", "💔", "😱", "🤩", "🥱", "😎",
+]
+
+# ── Keyboard builders ─────────────────────────────────
+
+def _gw_kb_react(sid: str) -> InlineKeyboardMarkup:
+    """Step 1: choose reaction (or any)."""
+    rows = []
+    for i in range(0, len(GW_REACT_EMOJIS), 6):
+        rows.append([
+            SBtn(e, style="primary", callback_data=f"gws:{sid}:r:{e}")
+            for e in GW_REACT_EMOJIS[i:i+6]
+        ])
+    rows.append([SBtn("✨ Любую реакцию", style="success",
+                      callback_data=f"gws:{sid}:r:any")])
+    rows.append([SBtn("Отмена", style="danger",
+                      callback_data=f"gws:{sid}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _gw_kb_bw(sid: str, max_bears: int) -> InlineKeyboardMarkup:
+    """Step 2: bears per winner × number of winners."""
+    presets = [(1,1),(1,2),(1,3),(2,1),(2,2),(3,1),(5,1),(3,3),(5,5),(10,1)]
+    rows, row = [], []
+    for b, w in presets:
+        if b * w > max_bears:
+            continue
+        row.append(SBtn(f"{b}🐻×{w}", style="primary",
+                        callback_data=f"gws:{sid}:bw:{b}:{w}"))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows.append([SBtn("1🐻×1", style="primary",
+                          callback_data=f"gws:{sid}:bw:1:1")])
+    rows.append([SBtn("Отмена", style="danger",
+                      callback_data=f"gws:{sid}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _gw_kb_time(sid: str) -> InlineKeyboardMarkup:
+    """Step 3: choose duration."""
+    return InlineKeyboardMarkup([
+        [
+            SBtn("1 мин",  style="primary", callback_data=f"gws:{sid}:t:1"),
+            SBtn("3 мин",  style="primary", callback_data=f"gws:{sid}:t:3"),
+            SBtn("5 мин",  style="primary", callback_data=f"gws:{sid}:t:5"),
+        ],
+        [
+            SBtn("10 мин", style="primary", callback_data=f"gws:{sid}:t:10"),
+            SBtn("15 мин", style="primary", callback_data=f"gws:{sid}:t:15"),
+            SBtn("30 мин", style="primary", callback_data=f"gws:{sid}:t:30"),
+        ],
+        [SBtn("Отмена", style="danger", callback_data=f"gws:{sid}:cancel")],
+    ])
+
+
+def _gw_kb_confirm(sid: str) -> InlineKeyboardMarkup:
+    """Step 4: confirm & launch."""
+    return InlineKeyboardMarkup([
+        [SBtn("🚀 Запустить розыгрыш!", style="success",
+              callback_data=f"gws:{sid}:go")],
+        [SBtn("Отмена", style="danger",
+              callback_data=f"gws:{sid}:cancel")],
+    ])
+
+
+def _gw_active_text(gw: dict) -> str:
+    """Live text for the giveaway message."""
+    react_str  = f"«{gw['reaction']}»" if gw.get("reaction") else "любую реакцию"
+    elapsed    = (datetime.now() - gw["start_time"]).total_seconds()
+    remaining  = max(0, gw["minutes"] * 60 - elapsed)
+    return (
+        f"🐻 <b>РОЗЫГРЫШ МЕДВЕДЕЙ!</b>\n\n"
+        f"🎁 Приз: <b>{gw['bears']}🐻</b> каждому из <b>{gw['winners']}</b> победителей\n"
+        f"👇 Поставь {react_str} на это сообщение!\n\n"
+        f"⏱ Осталось: <b>{fmt_cd(int(remaining))}</b>\n"
+        f"👥 Участников: <b>{len(gw['participants'])}</b>\n\n"
+        f"🔮 Победители выбираются случайно!"
+    )
+
+
+# ── Core giveaway logic ───────────────────────────────
+
+async def _end_giveaway(bot, key: str) -> None:
+    """Pick winners, award bears, edit the giveaway message."""
+    gw = giveaway_active.pop(key, None)
+    if not gw or gw["state"] != "active":
+        return
+    gw["state"] = "ended"
+
+    cid       = gw["cid"]
+    msg_id    = gw["msg_id"]
+    org_id    = gw["org_id"]
+    bears     = gw["bears"]
+    winners_n = gw["winners"]
+    parts     = list(gw["participants"])
+
+    # ── No participants → return bears ────────────────
+    if not parts:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (bears * winners_n, org_id, cid),
+            )
+            await db.commit()
+        try:
+            await bot.edit_message_text(
+                f"🐻 <b>Розыгрыш завершён</b>\n\n"
+                f"😔 Никто не поставил реакцию...\n"
+                f"🐻 Медведи возвращены организатору.",
+                chat_id=cid, message_id=msg_id,
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    # ── Pick random winners ───────────────────────────
+    actual = min(winners_n, len(parts))
+    winners = random.sample(parts, actual)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for w_id in winners:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (bears, w_id, cid),
+            )
+        unused = (winners_n - actual) * bears
+        if unused > 0:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (unused, org_id, cid),
+            )
+        await db.commit()
+
+    # ── Announce ──────────────────────────────────────
+    lines = "\n".join(
+        f"{'🥇' if i==0 else '🏆'} {mention(w_id, f'Победитель {i+1}')}"
+        for i, w_id in enumerate(winners)
+    )
+    result = (
+        f"🐻🎉 <b>РОЗЫГРЫШ ЗАВЕРШЁН!</b>\n\n"
+        f"Победители ({actual} из {len(parts)} участников):\n"
+        f"{lines}\n\n"
+        f"🎁 Каждый получает: <b>{bears}🐻</b>"
+    )
+    try:
+        await bot.edit_message_text(
+            result, chat_id=cid, message_id=msg_id,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        try:
+            await bot.send_message(cid, result,
+                                   parse_mode=ParseMode.HTML,
+                                   reply_to_message_id=msg_id)
+        except TelegramError:
+            pass
+
+    # React with 🎉 on the finished giveaway message
+    try:
+        await bot.set_message_reaction(
+            chat_id=cid, message_id=msg_id,
+            reaction=[ReactionTypeEmoji("🎉")],
+        )
+    except TelegramError:
+        pass
+
+
+async def _giveaway_timer(bot, key: str, sid: str) -> None:
+    """Background task: countdown updates + end trigger."""
+    gw = giveaway_active.get(key)
+    if not gw:
+        return
+
+    total   = gw["minutes"] * 60
+    elapsed = 0
+    step    = 60   # update interval (seconds)
+
+    while elapsed < total:
+        sleep_for = min(step, total - elapsed)
+        await asyncio.sleep(sleep_for)
+        elapsed += sleep_for
+
+        gw = giveaway_active.get(key)
+        if not gw or gw["state"] != "active":
+            return
+
+        if elapsed < total:
+            # Update countdown
+            try:
+                await bot.edit_message_text(
+                    _gw_active_text(gw),
+                    chat_id=gw["cid"], message_id=gw["msg_id"],
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+
+    await _end_giveaway(bot, key)
+    giveaway_setups.pop(sid, None)
+
+
+# ── Reaction tracking handler ─────────────────────────
+
+async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle MessageReactionUpdated — track giveaway participants."""
+    mr   = update.message_reaction
+    if not mr:
+        return
+    user = mr.user
+    if not user or user.is_bot:
+        return   # Anonymous or bot reactions can't be tracked
+
+    key = f"{mr.chat.id}:{mr.message_id}"
+    gw  = giveaway_active.get(key)
+    if not gw or gw["state"] != "active":
+        return
+
+    required = gw["reaction"]   # None = accept any reaction
+
+    def _has(reactions: list) -> bool:
+        if not reactions:
+            return False
+        if required is None:
+            return True
+        for r in reactions:
+            if isinstance(r, ReactionTypeEmoji) and r.emoji == required:
+                return True
+        return False
+
+    had = _has(mr.old_reaction)
+    has = _has(mr.new_reaction)
+
+    if has and not had:
+        gw["participants"].add(user.id)
+    elif had and not has:
+        gw["participants"].discard(user.id)
+
+
+# ── /giveaway command ─────────────────────────────────
+
+@only_groups
+async def cmd_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Launch the bear giveaway wizard."""
+    u   = update.effective_user
+    cid = update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    uu  = await db_get_user(u.id, cid)
+
+    if not uu or uu.get("bears", 0) < 1:
+        await update.message.reply_text(
+            f"❌ <b>Нет медведей для розыгрыша!</b>\n\n"
+            f"🐻 Медведи выдаются за каждые <b>10 побед</b> в играх.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sid = str(uuid.uuid4())[:8]
+    giveaway_setups[sid] = {
+        "cid": cid, "org_id": u.id, "org_name": u.first_name,
+        "reaction": None, "bears": 1, "winners": 1, "minutes": 5,
+        "bears_avail": uu["bears"],
+    }
+
+    await update.message.reply_text(
+        f"🐻 <b>Розыгрыш медведей</b>\n\n"
+        f"У тебя: <b>{uu['bears']}🐻</b>\n\n"
+        f"<b>Шаг 1 / 3</b> — Выбери реакцию для участия:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_gw_kb_react(sid),
     )
 
 
@@ -1290,9 +1880,9 @@ async def _show_top(update_or_query, context, cid: int, sort: str, edit: bool = 
     title  = titles.get(sort, "VRF")
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔵 💎 VRF",     callback_data=f"top:vrf:{cid}"),
-        InlineKeyboardButton("🔵 ⭐ Уровень", callback_data=f"top:level:{cid}"),
-        InlineKeyboardButton("🔵 🏆 Победы", callback_data=f"top:wins:{cid}"),
+        SBtn("💎 VRF",    style="primary", callback_data=f"top:vrf:{cid}"),
+        SBtn("⭐ Уровень", style="primary", callback_data=f"top:level:{cid}"),
+        SBtn("🏆 Победы", style="primary", callback_data=f"top:wins:{cid}"),
     ]])
 
     col_hdr = {"vrf": "VRF", "level": "Уровень / XP", "wins": "Побед"}.get(sort, "VRF")
@@ -1771,8 +2361,8 @@ async def cmd_marry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(target.id, target.first_name)}!\n\nПримешь предложение?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Да! 💍", callback_data=f"ma:{proposer.id}:{target.id}"),
-            InlineKeyboardButton("🔴 Нет 💔", callback_data=f"mr:{proposer.id}:{target.id}"),
+            SBtn("Да! 💍", style="success", callback_data=f"ma:{proposer.id}:{target.id}"),
+            SBtn("Нет 💔", style="danger", callback_data=f"mr:{proposer.id}:{target.id}"),
         ]]),
     )
 
@@ -1941,8 +2531,8 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{mention(opponent.id, opponent.first_name)}, принимаешь?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять ⚔️",    callback_data=f"da:{challenger.id}:{opponent.id}"),
-            InlineKeyboardButton("🔴 Отклонить", callback_data=f"dd:{challenger.id}:{opponent.id}"),
+            SBtn("Принять ⚔️", style="success",    callback_data=f"da:{challenger.id}:{opponent.id}"),
+            SBtn("Отклонить", style="danger", callback_data=f"dd:{challenger.id}:{opponent.id}"),
         ]]),
     )
 
@@ -2079,8 +2669,8 @@ async def cmd_cubes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🟢 Принять 🎲 {bet} VRF", callback_data=f"cj:{game_id}"),
-        InlineKeyboardButton("🔴 Отказать", callback_data=f"cd:{game_id}"),
+        SBtn(f"Принять 🎲 {bet} VRF", style="success", callback_data=f"cj:{game_id}"),
+        SBtn("Отказать", style="danger", callback_data=f"cd:{game_id}"),
     ]])
 
     msg = await update.message.reply_text(
@@ -2235,8 +2825,8 @@ async def _cmd_sport(update: Update, context: ContextTypes.DEFAULT_TYPE, game_ty
         f"💎 Ставка: <b>{bet} VRF</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"🟢 Принять {emoji}", callback_data=f"sj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sd:{game_id}"),
+            SBtn(f"Принять {emoji}", style="success", callback_data=f"sj:{game_id}"),
+            SBtn("Отказать", style="danger",       callback_data=f"sd:{game_id}"),
         ]]),
     )
 
@@ -2394,8 +2984,8 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 Лучшая комбинация побеждает!",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять 🎰", callback_data=f"slj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",       callback_data=f"sld:{game_id}"),
+            SBtn("Принять 🎰", style="success", callback_data=f"slj:{game_id}"),
+            SBtn("Отказать", style="danger",       callback_data=f"sld:{game_id}"),
         ]]),
     )
 
@@ -2441,7 +3031,7 @@ def _mines_grid_kb(uid: int, cid: int, game: dict) -> InlineKeyboardMarkup:
             f"💸 Забрать {fmt(payout)} VRF  ({mult}×)",
             callback_data=f"mg:co:{uid}:{cid}",
         ),
-        InlineKeyboardButton("🔴 Сдаться 🏳", callback_data=f"mg:q:{uid}:{cid}"),
+        SBtn("Сдаться", style="danger", callback_data=f"mg:q:{uid}:{cid}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -2464,7 +3054,7 @@ def _mines_dead_kb(game: dict, boom_idx: int = -1) -> InlineKeyboardMarkup:
                 txt = "⬛"
             row.append(InlineKeyboardButton(txt, callback_data="mg:noop"))
         rows.append(row)
-    rows.append([InlineKeyboardButton("🟢 Играть снова 🎮", callback_data="mg:new")])
+    rows.append([SBtn("Играть снова 🎮", style="success", callback_data="mg:new")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2489,7 +3079,7 @@ def _mines_bet_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
     row2 = [InlineKeyboardButton(f"💎 {v} VRF",
             callback_data=f"mg:b:{uid}:{cid}:{v}") for v in [100, 200, 500]]
     return InlineKeyboardMarkup([row1, row2,
-        [InlineKeyboardButton("🔴 Отмена", callback_data="mg:cancel")]])
+        [SBtn("Отмена", style="danger", callback_data="mg:cancel")]])
 
 
 @only_groups
@@ -2525,11 +3115,553 @@ async def cmd_mines(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
 # ══════════════════════════════════════════════════════
 #              ADMIN COMMANDS
 # ══════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════
+#           MODERATION SYSTEM 🛡️  (hidden — admin only)
+# ══════════════════════════════════════════════════════
+
+_WARN_LIMIT = 3          # auto-mute after N warns
+_WARN_AUTO_MUT = timedelta(hours=24)   # auto-mute duration
+
+
+# ── Duration parser ───────────────────────────────────
+
+def _mod_dur(args: list) -> tuple:
+    """
+    Parse duration from command args.
+    Returns (Optional[timedelta], reason: str).
+    Default (no args) → 7 days.
+    """
+    FOREVER = {"навсегда", "perma", "forever", "перм", "perm", "inf", "∞"}
+    SECS: dict = {
+        frozenset({"с", "сек", "sec", "s"}):                                 1,
+        frozenset({"мин", "мин.", "м", "min", "m", "minute", "minutes"}):   60,
+        frozenset({"ч", "час", "h", "hour", "hours", "hr"}):              3600,
+        frozenset({"д", "дн", "день", "дней", "d", "day", "days"}):     86400,
+        frozenset({"н", "нед", "неделя", "w", "week", "weeks"}):       604800,
+        frozenset({"мес", "месяц", "месяца", "mo", "month", "months"}): 2592000,
+    }
+    if not args:
+        return timedelta(days=7), ""
+
+    first = args[0].lower()
+    if first in FOREVER:
+        return None, " ".join(args[1:])
+
+    import re as _re
+    m = _re.match(r"^(\d+)([а-яёa-z.]+)$", first)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        for unit_set, secs in SECS.items():
+            if unit in unit_set:
+                return timedelta(seconds=n * secs), " ".join(args[1:])
+
+    # First arg is not a duration → all args = reason, default 7d
+    return timedelta(days=7), " ".join(args)
+
+
+def _fmt_until(until: Optional[datetime]) -> str:
+    if until is None:
+        return "навсегда"
+    rem = (until - datetime.now()).total_seconds()
+    return fmt_cd(int(rem)) if rem > 0 else "истёк"
+
+
+async def _is_protected(chat, uid: int) -> bool:
+    """True if user is a group admin/creator (can't be moderated)."""
+    try:
+        m = await chat.get_member(uid)
+        return m.status in ("administrator", "creator")
+    except TelegramError:
+        return False
+
+
+# ── Moderation DB helpers ─────────────────────────────
+
+async def db_log_mute(uid: int, cid: int, by: int,
+                      until: Optional[datetime], reason: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO mutes (user_id,chat_id,muted_by,muted_at,until,reason)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(user_id,chat_id) DO UPDATE SET
+                   muted_by=excluded.muted_by, muted_at=excluded.muted_at,
+                   until=excluded.until, reason=excluded.reason""",
+            (uid, cid, by, _now(),
+             until.isoformat() if until else None, reason),
+        )
+        await db.commit()
+
+
+async def db_clear_mute(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM mutes WHERE user_id=? AND chat_id=?", (uid, cid))
+        await db.commit()
+
+
+async def db_get_mutes(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM mutes WHERE chat_id=? ORDER BY muted_at DESC", (cid,)
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_add_warn(uid: int, cid: int, by: int, reason: str) -> int:
+    """Add a warning and return total active warn count."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warns (user_id,chat_id,warned_by,warned_at,reason) VALUES (?,?,?,?,?)",
+            (uid, cid, by, _now(), reason),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=? AND active=1",
+            (uid, cid),
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+
+async def db_remove_last_warn(uid: int, cid: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC LIMIT 1",
+            (uid, cid),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        await db.execute("UPDATE warns SET active=0 WHERE id=?", (row[0],))
+        await db.commit()
+        return True
+
+
+async def db_clear_warns(uid: int, cid: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=? AND active=1",
+            (uid, cid),
+        ) as cur:
+            count = (await cur.fetchone())[0]
+        await db.execute(
+            "UPDATE warns SET active=0 WHERE user_id=? AND chat_id=?", (uid, cid)
+        )
+        await db.commit()
+        return count
+
+
+async def db_get_user_warns(uid: int, cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM warns WHERE user_id=? AND chat_id=? AND active=1 ORDER BY warned_at DESC",
+            (uid, cid),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_chat_warns(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT user_id, COUNT(*) AS cnt FROM warns
+               WHERE chat_id=? AND active=1 GROUP BY user_id ORDER BY cnt DESC LIMIT 20""",
+            (cid,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+# ── Shared permissions ────────────────────────────────
+
+_MUTED_PERMS = ChatPermissions(
+    can_send_messages=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+_FULL_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_invite_users=True,
+)
+
+
+# ── /мут /mute ────────────────────────────────────────
+
 @only_groups
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg  = update.message
+    caller = update.effective_user
+    cid  = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/mute [10m / 2h / 1d / навсегда] [причина]</code>\n"
+            "По умолчанию: 7 дней",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target = msg.reply_to_message.from_user
+    if target.id == caller.id:
+        await msg.reply_text("❌ Нельзя замутить себя")
+        return
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя замутить администратора")
+        return
+
+    dur, reason = _mod_dur(context.args)
+    until_dt   = datetime.now() + dur if dur else None
+
+    try:
+        await context.bot.restrict_chat_member(
+            cid, target.id, _MUTED_PERMS, until_date=until_dt,
+        )
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+    await db_log_mute(target.id, cid, caller.id, until_dt, reason)
+
+    await msg.reply_text(
+        f"🔇 {mention(target.id, target.first_name)} — <b>мут</b>\n"
+        f"⏱ Срок: <b>{_fmt_until(until_dt)}</b>"
+        + (f"\n📝 Причина: {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /unmute /анмут /unmute ────────────────────────────
+
+@only_groups
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение пользователя: <code>/unmute</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    cid    = update.effective_chat.id
+
+    try:
+        await context.bot.restrict_chat_member(cid, target.id, _FULL_PERMS)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await db_clear_mute(target.id, cid)
+    await msg.reply_text(
+        f"🔊 {mention(target.id, target.first_name)} — <b>мут снят</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /кик /kick ───────────────────────────────────────
+
+@only_groups
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg  = update.message
+    cid  = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/kick [причина]</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя кикнуть администратора")
+        return
+
+    reason = " ".join(context.args) if context.args else ""
+    try:
+        await context.bot.ban_chat_member(cid, target.id)
+        await asyncio.sleep(0.3)
+        await context.bot.unban_chat_member(cid, target.id)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"👢 {mention(target.id, target.first_name)} — <b>исключён</b>"
+        + (f"\n📝 {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /бан /ban ────────────────────────────────────────
+
+@only_groups
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg    = update.message
+    caller = update.effective_user
+    cid    = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text(
+            "📌 Ответь на сообщение:\n"
+            "<code>/ban [срок] [причина]</code>  (без срока = навсегда)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя забанить администратора")
+        return
+
+    dur, reason = _mod_dur(context.args if context.args else [])
+    # For ban default = permanent (not 7d like mute)
+    if context.args and dur and dur == timedelta(days=7) and not any(
+        context.args[0].lower().startswith(u)
+        for u in ["7д","7d","7н","7нед","7w","7 ","1н","1w"]
+    ):
+        # No recognisable duration → permanent
+        dur, reason = None, " ".join(context.args)
+    until_dt = datetime.now() + dur if dur else None
+
+    try:
+        await context.bot.ban_chat_member(
+            cid, target.id, until_date=until_dt, revoke_messages=False,
+        )
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"🚫 {mention(target.id, target.first_name)} — <b>заблокирован</b>\n"
+        f"⏱ Срок: <b>{_fmt_until(until_dt)}</b>"
+        + (f"\n📝 Причина: {reason}" if reason else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /unban /unban ────────────────────────────────────
+
+@only_groups
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+
+    if not msg.reply_to_message:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/unban</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    cid    = update.effective_chat.id
+
+    try:
+        await context.bot.unban_chat_member(cid, target.id, only_if_banned=True)
+    except TelegramError as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    await msg.reply_text(
+        f"✅ {mention(target.id, target.first_name)} — <b>разблокирован</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /варн /warn ──────────────────────────────────────
+
+@only_groups
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg    = update.message
+    caller = update.effective_user
+    cid    = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/pred [причина]</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    if await _is_protected(update.effective_chat, target.id):
+        await msg.reply_text("❌ Нельзя варнить администратора")
+        return
+
+    reason = " ".join(context.args) if context.args else ""
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+    count = await db_add_warn(target.id, cid, caller.id, reason)
+
+    filled  = "⚠️" * count
+    empty   = "□" * max(0, _WARN_LIMIT - count)
+    bar     = filled + empty
+
+    text = (
+        f"⚠️ {mention(target.id, target.first_name)} — <b>предупреждение</b>\n"
+        f"Варнов: <b>{count}/{_WARN_LIMIT}</b>  {bar}"
+        + (f"\n📝 Причина: {reason}" if reason else "")
+    )
+
+    if count >= _WARN_LIMIT:
+        try:
+            until_dt = datetime.now() + _WARN_AUTO_MUT
+            await context.bot.restrict_chat_member(
+                cid, target.id, _MUTED_PERMS, until_date=until_dt,
+            )
+            await db_log_mute(target.id, cid, caller.id, until_dt,
+                              f"Автомут — {count} варнов")
+            await db_clear_warns(target.id, cid)
+            text += f"\n\n🔇 <b>Лимит!</b> Автомут на {fmt_cd(int(_WARN_AUTO_MUT.total_seconds()))}"
+        except TelegramError:
+            pass
+
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ── /unpred /unwarn ────────────────────────────────
+
+@only_groups
+async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/unpred</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    ok = await db_remove_last_warn(target.id, cid)
+    if ok:
+        remaining = len(await db_get_user_warns(target.id, cid))
+        await msg.reply_text(
+            f"✅ Последний варн {mention(target.id, target.first_name)} снят. "
+            f"Осталось: <b>{remaining}/{_WARN_LIMIT}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await msg.reply_text(
+            f"❌ У {mention(target.id, target.first_name)} нет активных варнов",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── /снятьваны / снять все варны ─────────────────────
+
+@only_groups
+async def cmd_clearwarns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    if not msg.reply_to_message or msg.reply_to_message.from_user.is_bot:
+        await msg.reply_text("📌 Ответь на сообщение: <code>/clearpred</code>",
+                             parse_mode=ParseMode.HTML)
+        return
+
+    target = msg.reply_to_message.from_user
+    count  = await db_clear_warns(target.id, cid)
+    await msg.reply_text(
+        f"✅ Сняты все варны (<b>{count}</b>) у {mention(target.id, target.first_name)}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /predlist — список варнов пользователя / чата ───────
+
+@only_groups
+async def cmd_warnlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    msg = update.message
+    cid = update.effective_chat.id
+
+    # Reply → show specific user's warns
+    if msg.reply_to_message and not msg.reply_to_message.from_user.is_bot:
+        target = msg.reply_to_message.from_user
+        warns  = await db_get_user_warns(target.id, cid)
+        if not warns:
+            await msg.reply_text(
+                f"✅ У {mention(target.id, target.first_name)} нет варнов",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        lines = [
+            f"{i+1}. <code>{w['warned_at'][:10]}</code>"
+            + (f" — {w['reason']}" if w.get("reason") else "")
+            for i, w in enumerate(warns)
+        ]
+        await msg.reply_text(
+            f"⚠️ Варны {mention(target.id, target.first_name)}: "
+            f"<b>{len(warns)}/{_WARN_LIMIT}</b>\n\n" + "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # No reply → chat-wide warn overview
+    rows = await db_get_chat_warns(cid)
+    if not rows:
+        await msg.reply_text("✅ Нет активных варнов в чате")
+        return
+    lines = [
+        f"• {mention(r['user_id'], 'id'+str(r['user_id']))} — "
+        f"<b>{r['cnt']}/{_WARN_LIMIT}</b> варн."
+        for r in rows
+    ]
+    await msg.reply_text(
+        f"⚠️ <b>Варны в чате</b>:\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /mutelist — список замутенных ─────────────────────────
+
+@only_groups
+async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid   = update.effective_chat.id
+    mutes = await db_get_mutes(cid)
+    if not mutes:
+        await update.message.reply_text("✅ Нет замутенных")
+        return
+    lines = []
+    for m in mutes[:20]:
+        until = datetime.fromisoformat(m["until"]) if m.get("until") else None
+        r     = m.get("reason", "")
+        lines.append(
+            f"• {mention(m['user_id'], 'id'+str(m['user_id']))} — "
+            f"⏱{_fmt_until(until)}"
+            + (f" [{r}]" if r else "")
+        )
+    await update.message.reply_text(
+        f"🔇 <b>Замутенные ({len(mutes)})</b>:\n\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ══════════════════════════════════════════════════════
+#              ADMIN PANEL
+# ══════════════════════════════════════════════════════
+
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_group_or_bot_admin(update):
         await update.message.reply_text("❌ Нет доступа — только для администраторов")
@@ -2537,12 +3669,13 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статистика",    callback_data="ap:stats"),
-         InlineKeyboardButton("🏆 Топ VRF",      callback_data="ap:top")],
+         InlineKeyboardButton("🏆 Топ VRF",       callback_data="ap:top")],
         [InlineKeyboardButton("💑 Все браки",     callback_data="ap:marriages"),
-         InlineKeyboardButton("👮 Бот-админы",   callback_data="ap:admins")],
+         InlineKeyboardButton("👮 Бот-админы",    callback_data="ap:admins")],
         [InlineKeyboardButton("📋 Все команды",   callback_data="ap:cmds"),
          InlineKeyboardButton("ℹ️ Управление",   callback_data="ap:manage")],
-        [InlineKeyboardButton("🔴 Закрыть",       callback_data="ap:close")],
+        [InlineKeyboardButton("🛡️ Модерация",    callback_data="ap:mod")],
+        [SBtn("Закрыть", style="danger",          callback_data="ap:close")],
     ])
     await update.message.reply_text(
         f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -2605,23 +3738,85 @@ async def cmd_takevrf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @only_groups
 async def cmd_givebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /givebear [N] — reply to give N bears (default 1)."""
     if not await is_group_or_bot_admin(update):
         await update.message.reply_text("❌ Только для администраторов")
         return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Ответь на сообщение пользователя")
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/givebear [кол-во]</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
+
+    # Parse optional count
+    count = 1
+    if context.args:
+        try:
+            count = int(context.args[0])
+        except ValueError:
+            pass
+    count = max(1, min(count, 1000))
+
     target = update.message.reply_to_message.from_user
     cid    = update.effective_chat.id
     await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET bears=bears+1 WHERE user_id=? AND chat_id=?",
-                         (target.id, cid))
+        await db.execute(
+            "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+            (count, target.id, cid),
+        )
         await db.commit()
+
     u = await db_get_user(target.id, cid)
     await update.message.reply_text(
-        f"{E_BEAR} {mention(target.id, target.first_name)} получает медведя!\n"
-        f"Всего {E_BEAR}: {u['bears']}",
+        f"🐻 {mention(target.id, target.first_name)} получает "
+        f"<b>{count}🐻</b>!\n"
+        f"Итого медведей: <b>{u['bears']}🐻</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@only_groups
+async def cmd_takebear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /takebear [N] — reply to remove N bears (default 1)."""
+    if not await is_group_or_bot_admin(update):
+        await update.message.reply_text("❌ Только для администраторов")
+        return
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text(
+            "📌 Ответь на сообщение пользователя:\n"
+            "<code>/takebear [кол-во]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    count = 1
+    if context.args:
+        try:
+            count = int(context.args[0])
+        except ValueError:
+            pass
+    count = max(1, min(count, 1000))
+
+    target = update.message.reply_to_message.from_user
+    cid    = update.effective_chat.id
+    await db_ensure_user(target.id, cid, target.username or "", target.first_name)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET bears=MAX(0, bears-?) WHERE user_id=? AND chat_id=?",
+            (count, target.id, cid),
+        )
+        await db.commit()
+
+    u = await db_get_user(target.id, cid)
+    await update.message.reply_text(
+        f"🐻 У {mention(target.id, target.first_name)} изъято "
+        f"<b>{count}🐻</b>.\n"
+        f"Осталось медведей: <b>{u['bears']}🐻</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -2775,7 +3970,7 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 InlineKeyboardButton("8×8  (5 в ряд)",
                     callback_data=f"ttsz:{host.id}:{opponent.id}:{cid}:8"),
             ],
-            [InlineKeyboardButton("🔴 Отмена", callback_data="ttsz:cancel")],
+            [SBtn("Отмена", style="danger", callback_data="ttsz:cancel")],
         ]),
     )
 
@@ -2951,8 +4146,8 @@ async def cmd_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"{mention(opp.id, opp.first_name)}, принимаешь вызов?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🟢 Принять ⚔️", callback_data=f"bsj:{game_id}"),
-            InlineKeyboardButton("🔴 Отказать",  callback_data=f"bsd:{game_id}"),
+            SBtn("Принять ⚔️", style="success", callback_data=f"bsj:{game_id}"),
+            SBtn("Отказать", style="danger",  callback_data=f"bsd:{game_id}"),
         ]]),
     )
 
@@ -3310,7 +4505,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🕹 {mention(game['opp_id'], game['opp_name'])}: ожидает...",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
+                SBtn("Крутить! 🎰", style="primary", callback_data=f"slsp:{game_id}"),
             ]]),
         )
         return
@@ -3414,7 +4609,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"🕹 {mention(game['opp_id'], game['opp_name'])}: {o_status}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔵 Крутить! 🎰", callback_data=f"slsp:{game_id}"),
+                        SBtn("Крутить! 🎰", style="primary", callback_data=f"slsp:{game_id}"),
                     ]]),
                 )
             except TelegramError:
@@ -3487,8 +4682,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{o_m}, принимаешь вызов?",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"🟢 Принять ⭕  {bet} VRF", callback_data=f"ttj:{game_id}"),
-                InlineKeyboardButton("🔴 Отказать",              callback_data=f"ttd:{game_id}"),
+                SBtn(f"Принять ⭕  {bet} VRF", style="success", callback_data=f"ttj:{game_id}"),
+                SBtn("Отказать", style="danger",              callback_data=f"ttd:{game_id}"),
             ]]),
         )
 
@@ -3724,7 +4919,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  for mc in [3, 5]],
                 [InlineKeyboardButton(f"💣 {mc} мин", callback_data=f"mg:mc:{uid2}:{cid2}:{mc}:{bet}")
                  for mc in [10, 15]],
-                [InlineKeyboardButton("🔵 Назад", callback_data="mg:new")],
+                [SBtn("Назад", style="primary", callback_data="mg:new")],
             ])
             await query.edit_message_text(
                 f"💣 <b>Мины</b>  ·  Ставка: <b>{bet} VRF</b>\n\n"
@@ -4100,6 +5295,167 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Giveaway wizard (gws:) ────────────────────────────
+    if data.startswith("gws:"):
+        parts = data.split(":")
+        # parts[0]=gws, parts[1]=sid, parts[2]=step, parts[3+]=args
+        sid   = parts[1]
+        step  = parts[2]
+        setup = giveaway_setups.get(sid)
+
+        # Setup expired
+        if not setup:
+            await query.answer("❌ Сессия настройки истекла", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            return
+
+        # Only the organizer can interact
+        if who.id != setup["org_id"]:
+            await query.answer("❌ Это не твой розыгрыш!", show_alert=True)
+            return
+
+        # ── Cancel ───────────────────────────────────────
+        if step == "cancel":
+            giveaway_setups.pop(sid, None)
+            await query.answer("Отменено")
+            await query.edit_message_text("❌ Розыгрыш отменён.")
+            return
+
+        # ── Step 1: Reaction selected ─────────────────────
+        if step == "r":
+            emoji = parts[3]
+            setup["reaction"] = None if emoji == "any" else emoji
+            label = "✨ Любую реакцию" if emoji == "any" else f"«{emoji}»"
+            await query.answer(f"Реакция: {label}")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш медведей</b>\n\n"
+                f"✅ Реакция: <b>{label}</b>\n\n"
+                f"<b>Шаг 2 / 3</b> — Выбери медведей и победителей:\n"
+                f"<i>Формат: 🐻 на победителя × кол-во победителей</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_bw(sid, setup["bears_avail"]),
+            )
+            return
+
+        # ── Step 2: Bears × Winners selected ─────────────
+        if step == "bw":
+            bears   = int(parts[3])
+            winners = int(parts[4])
+            if bears * winners > setup["bears_avail"]:
+                await query.answer(
+                    f"❌ Нужно {bears*winners}🐻, у тебя только {setup['bears_avail']}🐻",
+                    show_alert=True,
+                )
+                return
+            setup["bears"]   = bears
+            setup["winners"] = winners
+            rl = "✨ Любую" if setup["reaction"] is None else f"«{setup['reaction']}»"
+            await query.answer(f"Выбрано: {bears}🐻 × {winners}")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш медведей</b>\n\n"
+                f"✅ Реакция: <b>{rl}</b>\n"
+                f"✅ Приз: <b>{bears}🐻 × {winners} победителей</b>\n"
+                f"   (итого: <b>{bears*winners}🐻</b> от тебя)\n\n"
+                f"<b>Шаг 3 / 3</b> — На какое время?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_time(sid),
+            )
+            return
+
+        # ── Step 3: Time selected ─────────────────────────
+        if step == "t":
+            minutes = int(parts[3])
+            setup["minutes"] = minutes
+            rl      = "✨ Любую" if setup["reaction"] is None else f"«{setup['reaction']}»"
+            b, w, m = setup["bears"], setup["winners"], minutes
+            await query.answer(f"Время: {minutes} мин")
+            await query.edit_message_text(
+                f"🐻 <b>Розыгрыш — Подтверждение</b>\n\n"
+                f"🎯 Реакция: <b>{rl}</b>\n"
+                f"🎁 Приз: <b>{b}🐻</b> каждому из <b>{w}</b> победителей\n"
+                f"💸 Стоимость: <b>{b*w}🐻</b> (списывается сразу)\n"
+                f"⏱ Время: <b>{m} мин</b>\n\n"
+                f"Всё верно? Запускаем?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_gw_kb_confirm(sid),
+            )
+            return
+
+        # ── Step 4: Launch! ───────────────────────────────
+        if step == "go":
+            setup = giveaway_setups.pop(sid, None)
+            if not setup:
+                await query.answer("❌ Сессия истекла", show_alert=True)
+                return
+
+            # Re-check bears
+            uu = await db_get_user(setup["org_id"], cid)
+            cost = setup["bears"] * setup["winners"]
+            if not uu or uu.get("bears", 0) < cost:
+                await query.answer(
+                    f"❌ Недостаточно 🐻 (нужно {cost}, есть {uu.get('bears',0) if uu else 0})",
+                    show_alert=True,
+                )
+                return
+
+            # Deduct bears immediately
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET bears=bears-? WHERE user_id=? AND chat_id=?",
+                    (cost, setup["org_id"], cid),
+                )
+                await db.commit()
+
+            await query.answer("🚀 Розыгрыш запускается!")
+            await query.edit_message_text(
+                f"✅ Розыгрыш запущен на <b>{setup['minutes']} мин</b>!\n"
+                f"Следи за сообщением ниже 👇",
+                parse_mode=ParseMode.HTML,
+            )
+
+            # Build giveaway message text
+            rl       = f"«{setup['reaction']}»" if setup["reaction"] else "любую реакцию"
+            gw_text  = (
+                f"🐻 <b>РОЗЫГРЫШ МЕДВЕДЕЙ!</b>\n\n"
+                f"🎁 Приз: <b>{setup['bears']}🐻</b> каждому из "
+                f"<b>{setup['winners']}</b> победителей\n"
+                f"👇 Поставь {rl} на это сообщение!\n\n"
+                f"⏱ Осталось: <b>{fmt_cd(setup['minutes']*60)}</b>\n"
+                f"👥 Участников: <b>0</b>\n\n"
+                f"🔮 Победители выбираются случайно!"
+            )
+            gw_msg = await context.bot.send_message(
+                cid, gw_text, parse_mode=ParseMode.HTML,
+            )
+
+            key = f"{cid}:{gw_msg.message_id}"
+            giveaway_active[key] = {
+                "sid":        sid,
+                "cid":        cid,
+                "msg_id":     gw_msg.message_id,
+                "org_id":     setup["org_id"],
+                "org_name":   setup["org_name"],
+                "reaction":   setup["reaction"],
+                "bears":      setup["bears"],
+                "winners":    setup["winners"],
+                "minutes":    setup["minutes"],
+                "start_time": datetime.now(),
+                "participants": set(),
+                "state":      "active",
+            }
+
+            # Launch timer in background
+            context.application.create_task(
+                _giveaway_timer(context.bot, key, sid)
+            )
+            return
+
+        await query.answer()
+        return
+
     # ── Admin panel ──────────────────────────────────────
     if data.startswith("ap:"):
         uid   = who.id
@@ -4115,7 +5471,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         action  = data[3:]
-        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔵 Назад", callback_data="ap:back")]])
+        back_kb = InlineKeyboardMarkup([[SBtn("Назад", style="primary", callback_data="ap:back")]])
 
         if action == "back":
             await query.answer()
@@ -4126,7 +5482,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                  InlineKeyboardButton("👮 Бот-админы",  callback_data="ap:admins")],
                 [InlineKeyboardButton("📋 Все команды",  callback_data="ap:cmds"),
                  InlineKeyboardButton("ℹ️ Управление",  callback_data="ap:manage")],
-                [InlineKeyboardButton("🔴 Закрыть",      callback_data="ap:close")],
+                [InlineKeyboardButton("🛡️ Модерация",   callback_data="ap:mod")],
+                [SBtn("Закрыть", style="danger",         callback_data="ap:close")],
             ])
             await query.edit_message_text(
                 f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
@@ -4136,6 +5493,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         elif action == "close":
             await query.answer("Закрыто")
             await query.message.delete()
+
+        elif action == "mod":
+            await query.answer()
+            mutes = await db_get_mutes(cid)
+            warns = await db_get_chat_warns(cid)
+            m_cnt = len(mutes)
+            w_cnt = sum(r["cnt"] for r in warns)
+            mut_lines = ""
+            if mutes:
+                mut_lines = "\n<b>🔇 Замутены:</b>\n" + "\n".join(
+                    "  • " + mention(m["user_id"], "id" + str(m["user_id"])) + " — " +
+                    _fmt_until(datetime.fromisoformat(m["until"]) if m.get("until") else None) +
+                    (f" [{m['reason']}]" if m.get("reason") else "")
+                    for m in mutes[:10]
+                )
+            warn_lines = ""
+            if warns:
+                warn_lines = "\n<b>⚠️ Варны:</b>\n" + "\n".join(
+                    "  • " + mention(r["user_id"], "id" + str(r["user_id"])) +
+                    f" — {r['cnt']}/{_WARN_LIMIT}"
+                    for r in warns[:10]
+                )
+            mod_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔇 Замутить",    callback_data="ap:mod_help_mute"),
+                 InlineKeyboardButton("🔊 Размутить",   callback_data="ap:mod_help_unmute")],
+                [InlineKeyboardButton("⚠️ Варн",        callback_data="ap:mod_help_warn"),
+                 InlineKeyboardButton("✅ Снять варн",  callback_data="ap:mod_help_unwarn")],
+                [InlineKeyboardButton("👢 Кик",         callback_data="ap:mod_help_kick"),
+                 InlineKeyboardButton("🚫 Бан",         callback_data="ap:mod_help_ban")],
+                [SBtn("◀ Назад", style="primary",       callback_data="ap:back")],
+            ])
+            await query.edit_message_text(
+                f"🛡️ <b>Модерация</b>\n\n"
+                f"🔇 Замутено: <b>{m_cnt}</b>  ·  ⚠️ Всего варнов: <b>{w_cnt}</b>\n"
+                f"{mut_lines}{warn_lines}\n\n"
+                f"<b>Команды (ответом на сообщение):</b>\n"
+                f"<code>/mute [10m/2h/1d/навсегда] [причина]</code>\n"
+                f"<code>/unmute</code>\n"
+                f"<code>/pred [причина]</code>  →  лимит {_WARN_LIMIT} → автомут 24ч\n"
+                f"<code>/unpred</code>  ·  <code>/clearpred</code>\n"
+                f"<code>/predlist</code>  ·  <code>/mutelist</code>\n"
+                f"<code>/kick [причина]</code>\n"
+                f"<code>/ban [срок] [причина]</code>  ·  <code>/unban</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=mod_kb,
+            )
+
+        elif action.startswith("mod_help_"):
+            await query.answer()  # no-op, info is already in the panel
 
         elif action == "stats":
             await query.answer()
@@ -4401,6 +5807,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # ── XP from regular messages ──────────────────────────
+    # Log every message to the daily activity chart
+    await db_log_activity(cid, msgs=1)
+
     if not await db_can_earn_xp(u.id, cid):
         return
 
@@ -4442,7 +5851,8 @@ async def on_startup(app: Application) -> None:
     cmds = [
         BotCommand("start",    "🏠 Старт / Главное меню"),
         BotCommand("profile",  "👤 Мой профиль"),
-        BotCommand("statsimg", "📊 Статистика картинкой"),
+        BotCommand("statsimg", "📈 График активности чата [дней]"),
+        BotCommand("activity", "📈 График активности чата [дней]"),
         BotCommand("top",      "🏆 Топ игроков"),
         BotCommand("stats",    "📊 Статистика чата"),
         BotCommand("daily",    "⚡ Ежедневный бонус"),
@@ -4460,6 +5870,7 @@ async def on_startup(app: Application) -> None:
         BotCommand("mines",    "💣 Мины — соло"),
         BotCommand("tictac",   "❌⭕ Крестики-нолики (ответом)"),
         BotCommand("seabattle","🚢 Морской Бой (ответом, PvP в ЛС)"),
+        BotCommand("giveaway", "🎁 Розыгрыш медведей среди реакций"),
         BotCommand("cancel",   "🚫 Отменить ожидающую игру"),
         BotCommand("marry",    "💒 Предложение"),
         BotCommand("marriage", "💑 Карточка брака"),
@@ -4488,7 +5899,8 @@ def main() -> None:
 
     # Profile
     app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("statsimg", cmd_statsimg))
+    app.add_handler(CommandHandler("statsimg",  cmd_statsimg))
+    app.add_handler(CommandHandler("activity",  cmd_activity))
     app.add_handler(CommandHandler("top",     cmd_top))
     app.add_handler(CommandHandler(["leaderboard", "lb"], cmd_top))
     app.add_handler(CommandHandler("stats",   cmd_stats))
@@ -4522,6 +5934,7 @@ def main() -> None:
     app.add_handler(CommandHandler("mines",   cmd_mines))
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
+    app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     # Admin
@@ -4529,17 +5942,42 @@ def main() -> None:
     app.add_handler(CommandHandler("givevrf",      cmd_givevrf))
     app.add_handler(CommandHandler("takevrf",      cmd_takevrf))
     app.add_handler(CommandHandler("givebear",     cmd_givebear))
+    app.add_handler(CommandHandler("takebear",     cmd_takebear))
     app.add_handler(CommandHandler("addadmin",     cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
     app.add_handler(CommandHandler("listadmins",   cmd_listadmins))
 
-    # Callbacks & messages
+    # Moderation (hidden — not in BotCommand list or /help)
+    # Note: Telegram only accepts [a-z0-9_] in command names
+    app.add_handler(CommandHandler(["mute",      "mut"],       cmd_mute))
+    app.add_handler(CommandHandler(["unmute",    "unmut"],     cmd_unmute))
+    app.add_handler(CommandHandler(["kick"],                   cmd_kick))
+    app.add_handler(CommandHandler(["ban"],                    cmd_ban))
+    app.add_handler(CommandHandler(["unban"],                  cmd_unban))
+    app.add_handler(CommandHandler(["pred",      "warn"],      cmd_warn))
+    app.add_handler(CommandHandler(["unpred",    "unwarn"],    cmd_unwarn))
+    app.add_handler(CommandHandler(["clearpred", "clearwarns"],cmd_clearwarns))
+    app.add_handler(CommandHandler(["predlist",  "warnlist"],  cmd_warnlist))
+    app.add_handler(CommandHandler(["mutelist"],               cmd_mutelist))
+
+    # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(MessageHandler(filters.Dice, on_casino_777))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     log.info("Starting polling...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "inline_query",
+            "message_reaction",
+            "chat_member",
+            "my_chat_member",
+        ],
+    )
 
 
 if __name__ == "__main__":

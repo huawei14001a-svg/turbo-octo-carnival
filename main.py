@@ -172,9 +172,14 @@ def xp_for_level(n: int) -> int:
     return 0 if n <= 1 else 50 * n * (n - 1)
 
 def get_level(xp: int) -> int:
+    # Solve 50*n*(n-1) = xp  →  n = (1 + sqrt(1 + 4*xp/50)) / 2
+    # The old code used 8*xp/50 which caused xp_for_level(n) to return n+1.
     if xp <= 0:
         return 1
-    n = int((1 + math.sqrt(1 + 8 * xp / 50)) / 2)
+    n = int((1 + math.sqrt(1 + 4 * xp / 50)) / 2)
+    # Guard against floating-point overshoot at exact level thresholds
+    while n < 100 and xp_for_level(n + 1) <= xp:
+        n += 1
     return max(1, min(n, 100))
 
 def get_progress(xp: int) -> Tuple[int, int, int, float]:
@@ -626,6 +631,13 @@ async def db_init() -> None:
                 active    INTEGER DEFAULT 1
             );
 
+            CREATE TABLE IF NOT EXISTS referrals (
+                user_id       INTEGER PRIMARY KEY,
+                inviter_id    INTEGER NOT NULL,
+                claimed_at    TEXT    NOT NULL,
+                new_user_paid INTEGER DEFAULT 0
+            );
+
 
         """)
         await db.commit()
@@ -690,6 +702,42 @@ async def db_ensure_user(uid: int, cid: int, username: str, first_name: str) -> 
             (uid, cid, username or "", first_name or "", STARTING_VRF),
         )
         await db.commit()
+
+        # Pay out a pending "new user" referral bonus the first time this
+        # user gets a row in ANY chat (covers the case where they clicked
+        # the referral link before ever talking to the bot in a group).
+        async with db.execute(
+            "SELECT 1 FROM referrals WHERE user_id=? AND new_user_paid=0", (uid,)
+        ) as cur:
+            pending = await cur.fetchone()
+        if pending:
+            await db.execute(
+                "UPDATE users SET vrf=vrf+? WHERE user_id=? AND chat_id=?",
+                (REFERRAL_BONUS_NEW, uid, cid),
+            )
+            await db.execute(
+                "UPDATE referrals SET new_user_paid=1 WHERE user_id=?", (uid,)
+            )
+            await db.commit()
+
+
+async def db_claim_referral(new_uid: int, inviter_id: int) -> bool:
+    """
+    Atomically record a referral claim. Returns True the first time this
+    user_id is ever claimed (caller should pay out bonuses), False if
+    already claimed before (no-op — prevents repeat/duplicate farming).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO referrals (user_id, inviter_id, claimed_at) VALUES (?,?,?)",
+                (new_uid, inviter_id, _now()),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            # PRIMARY KEY conflict (already claimed) — fail closed, no bonus.
+            return False
 
 
 async def db_get_user(uid: int, cid: int) -> Optional[dict]:
@@ -1039,48 +1087,57 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except ValueError:
                 pass
             if inviter_id and inviter_id != u.id:
-                # Find inviter in any chat and reward both
-                async with aiosqlite.connect(DB_PATH) as db:
-                    # Check if user already has a referral_by set
-                    async with db.execute(
-                        "SELECT referral_by FROM users WHERE user_id=? LIMIT 1", (u.id,)
-                    ) as cur:
-                        row = await cur.fetchone()
-                    already = row and row[0] is not None if row else False
-
-                    if not already:
-                        # Credit inviter in all their chats
+                claimed = await db_claim_referral(u.id, inviter_id)
+                if claimed:
+                    # Credit the inviter across every chat they're already in
+                    async with aiosqlite.connect(DB_PATH) as db:
                         await db.execute(
-                            "UPDATE users SET vrf=vrf+?, referral_count=referral_count+1 WHERE user_id=?",
+                            "UPDATE users SET vrf=vrf+?, referral_count=referral_count+1 "
+                            "WHERE user_id=?",
                             (REFERRAL_BONUS_INVITER, inviter_id),
                         )
-                        # Mark new user's referral_by
-                        await db.execute(
-                            "UPDATE users SET referral_by=? WHERE user_id=?",
-                            (inviter_id, u.id),
-                        )
-                        # Credit new user if they exist
-                        await db.execute(
-                            "UPDATE users SET vrf=vrf+? WHERE user_id=?",
-                            (REFERRAL_BONUS_NEW, u.id),
-                        )
                         await db.commit()
-                        try:
-                            await context.bot.send_message(
-                                inviter_id,
-                                f"🎉 <b>Реферальный бонус!</b>\n\n"
-                                f"👤 {u.first_name} зарегистрировался по твоей ссылке!\n"
-                                f"💎 +{fmt(REFERRAL_BONUS_INVITER)} VRF",
-                                parse_mode=ParseMode.HTML,
+                        async with db.execute(
+                            "SELECT COUNT(*) FROM users WHERE user_id=?", (u.id,)
+                        ) as cur:
+                            has_rows = (await cur.fetchone())[0] > 0
+
+                    new_user_msg = (
+                        f"🎉 <b>Реферальный бонус!</b>\n\n"
+                        f"Ты зарегистрировался по ссылке от друга!\n"
+                    )
+                    if has_rows:
+                        # Already has a group row somewhere — pay out now.
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute(
+                                "UPDATE users SET vrf=vrf+? WHERE user_id=?",
+                                (REFERRAL_BONUS_NEW, u.id),
                             )
-                        except TelegramError:
-                            pass
-                        await update.message.reply_text(
+                            await db.execute(
+                                "UPDATE referrals SET new_user_paid=1 WHERE user_id=?",
+                                (u.id,),
+                            )
+                            await db.commit()
+                        new_user_msg += f"💎 +{fmt(REFERRAL_BONUS_NEW)} VRF тебе на счёт!"
+                    else:
+                        # No group row yet — db_ensure_user will pay this out
+                        # automatically the first time you write in a group.
+                        new_user_msg += (
+                            f"💎 +{fmt(REFERRAL_BONUS_NEW)} VRF зачислятся, как только "
+                            f"напишешь что-нибудь в группе с ботом!"
+                        )
+
+                    try:
+                        await context.bot.send_message(
+                            inviter_id,
                             f"🎉 <b>Реферальный бонус!</b>\n\n"
-                            f"Ты зарегистрировался по ссылке от друга!\n"
-                            f"💎 +{fmt(REFERRAL_BONUS_NEW)} VRF тебе на счёт!",
+                            f"👤 {u.first_name} зарегистрировался по твоей ссылке!\n"
+                            f"💎 +{fmt(REFERRAL_BONUS_INVITER)} VRF",
                             parse_mode=ParseMode.HTML,
                         )
+                    except TelegramError:
+                        pass
+                    await update.message.reply_text(new_user_msg, parse_mode=ParseMode.HTML)
 
     if update.effective_chat.type == "private":
         rich_h = (
@@ -1272,7 +1329,7 @@ async def cmd_statsimg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    loop      = asyncio.get_event_loop()
+    loop      = asyncio.get_running_loop()
     img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
 
     if img_bytes is None:
@@ -1422,7 +1479,7 @@ async def cmd_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    loop      = asyncio.get_event_loop()
+    loop      = asyncio.get_running_loop()
     img_bytes = await loop.run_in_executor(None, _activity_chart_sync, list(rows))
 
     if img_bytes is None:
@@ -1542,9 +1599,8 @@ def _gw_active_text(gw: dict) -> str:
 async def _end_giveaway(bot, key: str) -> None:
     """Pick winners, award bears, edit the giveaway message."""
     gw = giveaway_active.pop(key, None)
-    if not gw or gw["state"] != "active":
-        return
-    gw["state"] = "ended"
+    if not gw:
+        return   # already ended or never existed (double-fire guard)
 
     cid       = gw["cid"]
     msg_id    = gw["msg_id"]
@@ -1775,127 +1831,190 @@ def _crash_flavor(mult: float) -> str:
 
 
 # ══════════════════════════════════════════════════════
-#   CRASH — Rocket image generator 🎨  (Pillow, 640×360)
+#   CRASH — Rocket image generator 🎨  (Pillow, 640×860)
 # ══════════════════════════════════════════════════════
-# Draws the live rocket-ascent scene as a landscape PNG. The rocket
-# travels along a fixed diagonal from the pad (bottom-left) to deep
-# space (top-right) — this uses a 640×360 canvas far better than a
-# purely vertical ascent would. mode:
-#   "pad"    — idle on the launch pad (sent once at round start)
-#   "flight" — ascending, multiplier baked into the picture (every tick)
+# Vertical portrait scene. Rocket ascends from launch pad
+# at the bottom to deep space at the top. mode:
+#   "pad"    — idle on the launch pad (sent at round start)
+#   "flight" — ascending, multiplier baked into the image (every tick)
 #   "crash"  — explosion burst at the final multiplier (round end)
 
-_CR_W, _CR_H = 640, 360
-_CR_PAD_BG   = (22, 33, 62)
-_CR_MID_BG   = (13, 27, 62)
-_CR_SPACE_BG = (5, 8, 26)
-_CR_WHITE    = (232, 238, 245)
-_CR_WINDOW   = (91, 143, 217)
-_CR_FIN      = (205, 216, 232)
-_CR_GROUND   = (42, 53, 80)
-_CR_CLOUD    = (207, 216, 227)
-_CR_FLAME_LO = (255, 233, 168)
-_CR_FLAME_MD = (240, 160, 48)
-_CR_FLAME_HI = (255, 91, 53)
+_CR_W, _CR_H = 640, 860
 
-# Diagonal flight path: pad (bottom-left) → deep space (top-right)
-_CR_PAD_X, _CR_PAD_Y = 96, 250
-_CR_TOP_X, _CR_TOP_Y = 540, 46
-_CR_DX = _CR_TOP_X - _CR_PAD_X
-_CR_DY = _CR_TOP_Y - _CR_PAD_Y
-_CR_DIST = math.hypot(_CR_DX, _CR_DY)
-_CR_UX, _CR_UY = _CR_DX / _CR_DIST, _CR_DY / _CR_DIST   # unit: direction of travel
-_CR_PX, _CR_PY = -_CR_UY, _CR_UX                          # perpendicular (trail width)
+_CR_SKY_LO   = (15, 40, 90)
+_CR_SKY_MID  = (8, 18, 55)
+_CR_SPACE    = (4, 7, 20)
+_CR_GROUND   = (38, 48, 72)
+_CR_CLOUD    = (210, 218, 230)
+_CR_ROCK_W   = (230, 236, 244)
+_CR_ROCK_G   = (170, 182, 200)
+_CR_ENGINE   = (120, 130, 148)
+_CR_STRIPE   = (255, 140, 40)
+_CR_WIN_C    = (80, 138, 220)
+_CR_FL_LO    = (255, 240, 180)
+_CR_FL_MD    = (255, 165, 40)
+_CR_FL_HI    = (255, 80, 45)
+_CR_NEBULA_A = (20, 10, 60)
+_CR_NEBULA_B = (40, 5, 30)
 
 _crash_star_pool_cache: Optional[list] = None
 
 
 def _cr_lerp(a: tuple, b: tuple, t: float) -> tuple:
     t = max(0.0, min(1.0, t))
-    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    return tuple(round(a[i] + (b[i]-a[i])*t) for i in range(3))
 
 
-def _cr_bg_color(frac: float) -> tuple:
-    if frac < 0.5:
-        return _cr_lerp(_CR_PAD_BG, _CR_MID_BG, frac / 0.5)
-    return _cr_lerp(_CR_MID_BG, _CR_SPACE_BG, (frac - 0.5) / 0.5)
+def _cr_bg(frac: float) -> tuple:
+    if frac < 0.45:
+        return _cr_lerp(_CR_SKY_LO, _CR_SKY_MID, frac / 0.45)
+    return _cr_lerp(_CR_SKY_MID, _CR_SPACE, (frac-0.45)/0.55)
 
 
 def _cr_flame_color(frac: float) -> tuple:
-    if frac < 0.45:
-        return _cr_lerp(_CR_FLAME_LO, _CR_FLAME_MD, frac / 0.45)
-    return _cr_lerp(_CR_FLAME_MD, _CR_FLAME_HI, min(1.0, (frac - 0.45) / 0.55))
+    if frac < 0.4: return _cr_lerp(_CR_FL_LO, _CR_FL_MD, frac/0.4)
+    return _cr_lerp(_CR_FL_MD, _CR_FL_HI, (frac-0.4)/0.6)
 
 
 def _cr_star_pool() -> list:
-    """Fixed star field biased toward the upper-right sky (deterministic, local RNG)."""
     global _crash_star_pool_cache
     if _crash_star_pool_cache is not None:
         return _crash_star_pool_cache
-    rng  = random.Random(11)
+    rng = random.Random(42)
     pool = []
-    for _ in range(34):
-        x = rng.uniform(140, _CR_W - 15)
-        y = rng.uniform(8, _CR_H * 0.62)
-        r = rng.uniform(0.7, 1.9)
-        op = rng.uniform(0.35, 0.95)
-        reveal = rng.uniform(0.0, 0.85)
-        pool.append((x, y, r, op, reveal))
+    for _ in range(110):
+        x  = rng.uniform(0, _CR_W)
+        y  = rng.uniform(0, _CR_H * 0.88)
+        r  = rng.uniform(0.5, 2.2)
+        op = rng.uniform(0.25, 1.0)
+        rv = rng.uniform(0.0, 0.9)
+        pool.append((x, y, r, op, rv))
     _crash_star_pool_cache = pool
     return pool
 
 
 def _cr_draw_stars(draw, frac: float) -> None:
-    for x, y, r, op, reveal in _cr_star_pool():
-        if reveal > frac:
-            continue
-        shade = round(255 * op)
-        draw.ellipse([x - r, y - r, x + r, y + r],
-                     fill=(shade, shade, min(255, shade + 12)))
+    for x, y, r, op, rv in _cr_star_pool():
+        if rv > frac: continue
+        alpha = min(1.0, (frac - rv) / 0.08) * op
+        s = round(255 * alpha)
+        draw.ellipse([x-r, y-r, x+r, y+r], fill=(s, s, min(255, s+14)))
 
 
-def _cr_draw_trail(draw, tip_x, tip_y, length, near_w, far_w,
-                    near_color, bg_color, segs: int = 5) -> None:
-    """Tapered exhaust trail extending backward along the flight diagonal."""
-    for i in range(segs):
-        t0, t1 = i / segs, (i + 1) / segs
-        x0, y0 = tip_x - _CR_UX*length*t0, tip_y - _CR_UY*length*t0
-        x1, y1 = tip_x - _CR_UX*length*t1, tip_y - _CR_UY*length*t1
-        w0 = near_w + (far_w - near_w) * t0
-        w1 = near_w + (far_w - near_w) * t1
-        col = _cr_lerp(near_color, bg_color, t0 * 0.9)
-        draw.polygon([
-            (x0 - _CR_PX*w0/2, y0 - _CR_PY*w0/2), (x0 + _CR_PX*w0/2, y0 + _CR_PY*w0/2),
-            (x1 + _CR_PX*w1/2, y1 + _CR_PY*w1/2), (x1 - _CR_PX*w1/2, y1 - _CR_PY*w1/2),
-        ], fill=col)
+def _cr_draw_background(img, draw, frac: float) -> None:
+    bg = _cr_bg(frac)
+    img.paste(bg, [0, 0, _CR_W, _CR_H])
+    if frac < 0.55:
+        for band in range(0, _CR_H, 4):
+            t = band / _CR_H
+            lo = _cr_lerp(bg, _cr_lerp(bg, (20, 60, 130), 0.4), 1 - t)
+            draw.rectangle([0, band, _CR_W, band+4], fill=lo)
+    if frac > 0.35:
+        sf = min(1.0, (frac-0.35)/0.5)
+        for band in range(0, _CR_H, 3):
+            t = band / _CR_H
+            base = _cr_lerp(bg, _CR_SPACE, t*0.4)
+            neb  = _cr_lerp(base,
+                             _CR_NEBULA_A if t < 0.5 else _CR_NEBULA_B,
+                             sf * 0.15 * (1-abs(t-0.5)*2))
+            draw.rectangle([0, band, _CR_W, band+3], fill=neb)
 
 
-def _cr_draw_rocket(draw, cx, nose_y, flame_color, flame_len, bg_color,
-                     trail_len: float = 0) -> None:
-    bw, bh, nh = 19, 37, 19
-    draw.polygon([(cx, nose_y), (cx-bw/2, nose_y+nh), (cx+bw/2, nose_y+nh)],
-                 fill=_CR_WHITE)
-    body_top, body_bot = nose_y + nh, nose_y + nh + bh
-    draw.rounded_rectangle([cx-bw/2, body_top, cx+bw/2, body_bot],
-                           radius=5, fill=_CR_WHITE)
-    wr, wcy = 4.5, body_top + bh * 0.34
-    draw.ellipse([cx-wr, wcy-wr, cx+wr, wcy+wr], fill=_CR_WINDOW)
-    fin_top = body_top + bh * 0.62
-    draw.polygon([(cx-bw/2, fin_top), (cx-bw/2-10, body_bot), (cx-bw/2, body_bot)],
-                 fill=_CR_FIN)
-    draw.polygon([(cx+bw/2, fin_top), (cx+bw/2+10, body_bot), (cx+bw/2, body_bot)],
-                 fill=_CR_FIN)
-    # Flame + trail emanate backward along the diagonal from body bottom-center
-    fw = bw * 0.6
-    flame_tip = (cx - _CR_UX*flame_len, body_bot - _CR_UY*flame_len)
-    draw.polygon([
-        (cx - _CR_PX*fw/2, body_bot - _CR_PY*fw/2),
-        (cx + _CR_PX*fw/2, body_bot + _CR_PY*fw/2),
-        flame_tip,
-    ], fill=flame_color)
-    if trail_len > 0:
-        _cr_draw_trail(draw, flame_tip[0], flame_tip[1], trail_len,
-                       fw*0.7, fw*2.4, flame_color, bg_color)
+def _cr_draw_ground(draw, frac: float) -> None:
+    if frac > 0.18: return
+    alpha = 1.0 - frac / 0.18
+    gy = _CR_H - 80
+    for dy in range(80):
+        col = _cr_lerp(_CR_GROUND, (25, 35, 55), dy/80)
+        draw.rectangle([0, gy+dy, _CR_W, gy+dy+1], fill=col)
+    pc = tuple(round(c*alpha + b*(1-alpha)) for c, b in zip((55,65,90), _cr_bg(frac)))
+    draw.rectangle([160, gy+8, 480, gy+18], fill=pc)
+    for x in [220, 295, 345, 420]:
+        draw.rectangle([x-3, gy+18, x+3, gy+62], fill=pc)
+    draw.rectangle([460, gy-55, 478, gy+70], fill=pc)
+    for h in range(-55, 70, 14):
+        draw.line([(460, gy+h), (506, gy+h-17)], fill=pc, width=2)
+
+
+def _cr_draw_clouds(draw, frac: float) -> None:
+    if frac < 0.08 or frac > 0.55: return
+    peak = 0.28
+    alph = max(0.0, 1.0 - abs(frac-peak)/0.20) * 0.7
+    if alph <= 0: return
+    cy = _CR_H * (0.72 - frac*0.5)
+    bg = _cr_bg(frac)
+    for (cx, ry, rx, ry2) in [(95, cy, 42, 0.30), (62, cy+20, 28, 0.28),
+                               (545, cy+12, 38, 0.30), (572, cy-8, 26, 0.26)]:
+        col = tuple(round(_CR_CLOUD[i]*alph + bg[i]*(1-alph)) for i in range(3))
+        draw.ellipse([cx-rx, ry-ry*ry2, cx+rx, ry+ry*ry2], fill=col)
+
+
+def _cr_draw_rocket(draw, cx: float, nose_y: float, frac: float) -> None:
+    fc   = _cr_flame_color(frac)
+    bg   = _cr_bg(frac)
+    BW, BH, NH, EBH, EBW, FW = 46, 120, 55, 32, 52, 28
+
+    body_top = nose_y + NH
+    body_bot = body_top + BH
+    eng_top  = body_bot
+    eng_bot  = eng_top + EBH
+
+    trail_len = 36 + frac * (_CR_H * 0.67)
+    flame_len = 28 + frac * 20
+    flame_tip_y = eng_bot + flame_len
+    for i in range(7):
+        t0 = i / 7
+        y0 = flame_tip_y + trail_len * t0
+        y1 = flame_tip_y + trail_len * (i+1)/7
+        w0, w1 = 8 + EBW*0.55*t0, 8 + EBW*0.55*(i+1)/7
+        col = _cr_lerp(fc, bg, 0.18 + t0*0.82)
+        draw.polygon([(cx-w0/2,y0),(cx+w0/2,y0),(cx+w1/2,y1),(cx-w1/2,y1)], fill=col)
+
+    for mult, col in [(1.0, fc), (0.62, _cr_lerp(_CR_FL_LO, fc, 0.4)), (0.28, (255,255,255))]:
+        fw2 = EBW*0.55*mult
+        draw.polygon([(cx-fw2/2,eng_bot),(cx+fw2/2,eng_bot),(cx,flame_tip_y)], fill=col)
+
+    draw.polygon([(cx-BW//2,eng_top),(cx+BW//2,eng_top),
+                  (cx+EBW//2,eng_bot),(cx-EBW//2,eng_bot)], fill=_CR_ENGINE)
+    draw.polygon([(cx-BW//2+6,eng_top+2),(cx+BW//2-6,eng_top+2),
+                  (cx+EBW//2-10,eng_bot-4),(cx-EBW//2+10,eng_bot-4)],
+                 fill=_cr_lerp(_CR_ENGINE,(200,210,225),0.25))
+    draw.rectangle([cx-EBW//2-2,eng_bot-3,cx+EBW//2+2,eng_bot+2],
+                   fill=_cr_lerp(_CR_ENGINE,_CR_ROCK_G,0.5))
+
+    for side in (-1, 1):
+        bx2 = cx + side * BW//2
+        draw.polygon([(bx2, body_bot-30),(bx2, eng_bot),
+                      (bx2+side*FW, eng_bot+12),(bx2+side*FW*0.6, body_bot-40)],
+                     fill=_CR_ROCK_G)
+        draw.line([(bx2+side*FW*0.6, body_bot-40),(bx2+side*FW, eng_bot+12)],
+                  fill=_CR_ROCK_W, width=1)
+
+    draw.rounded_rectangle([cx-BW//2,body_top,cx+BW//2,body_bot], radius=8, fill=_CR_ROCK_W)
+    for py in range(int(body_top)+20, int(body_bot)-10, 22):
+        draw.line([(cx-BW//2+4,py),(cx+BW//2-4,py)],
+                  fill=_cr_lerp(_CR_ROCK_W,_CR_ROCK_G,0.25), width=1)
+    sy = body_top + BH*0.68
+    draw.rectangle([cx-BW//2,sy,cx+BW//2,sy+8], fill=_CR_STRIPE)
+    draw.rectangle([cx-BW//2,sy,cx+BW//2,sy+3], fill=_cr_lerp(_CR_STRIPE,(255,255,255),0.35))
+
+    wcy, wr = body_top + BH*0.35, 11
+    draw.ellipse([cx-wr,wcy-wr,cx+wr,wcy+wr], fill=_cr_lerp(_CR_WIN_C,(0,0,0),0.35))
+    draw.ellipse([cx-wr+2,wcy-wr+2,cx+wr-2,wcy-wr+2+wr],
+                 fill=_cr_lerp(_CR_WIN_C,(255,255,255),0.35))
+
+    fh = 28
+    draw.polygon([(cx-BW//2,body_top),(cx+BW//2,body_top),
+                  (cx+BW//2-10,body_top-fh),(cx-BW//2+10,body_top-fh)], fill=_CR_ROCK_W)
+    draw.line([(cx-BW//2,body_top),(cx-BW//2+10,body_top-fh)], fill=_CR_ROCK_G, width=1)
+    draw.line([(cx+BW//2,body_top),(cx+BW//2-10,body_top-fh)], fill=_CR_ROCK_G, width=1)
+
+    nc_base_w = BW - 20
+    nc_base_y = body_top - fh
+    draw.polygon([(cx-nc_base_w//2,nc_base_y),(cx+nc_base_w//2,nc_base_y),
+                  (cx,nose_y)], fill=_CR_ROCK_W)
+    draw.polygon([(cx,nose_y),(cx,nc_base_y),(cx+nc_base_w//2,nc_base_y)],
+                 fill=_cr_lerp(_CR_ROCK_W,_CR_ROCK_G,0.22))
 
 
 def _cr_font(paths: list, size: int):
@@ -1911,59 +2030,87 @@ def _cr_font(paths: list, size: int):
         return ImageFont.load_default()
 
 
+def _cr_draw_hud(draw, mode: str, frac: float, label_main: str, label_sub: str) -> None:
+    _BOLD = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    _REG  = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    zones = [
+        (0.00,0.18,"СТАРТОВАЯ ПЛОЩАДКА",(130,150,180)),
+        (0.18,0.45,"АТМОСФЕРА",         (120,180,210)),
+        (0.45,0.70,"СТРАТОСФЕРА",       (100,130,200)),
+        (0.70,0.88,"ОТКРЫТЫЙ КОСМОС",   (160,140,230)),
+        (0.88,1.01,"ГЛУБОКИЙ КОСМОС",   (210,160,255)),
+    ]
+    for lo, hi, lbl, col in zones:
+        if lo <= frac < hi:
+            try:
+                draw.text((14, _CR_H-118), lbl, font=_cr_font(_REG, 11), fill=col)
+            except Exception:
+                pass
+            break
+    if label_main:
+        fc = (_cr_flame_color(frac) if mode == "flight"
+              else ((232,238,245) if mode == "pad" else (255,80,45)))
+        try:
+            f_big = _cr_font(_BOLD, 72)
+            draw.text((22, 22), label_main, font=f_big, fill=tuple(c//6 for c in fc))
+            draw.text((20, 20), label_main, font=f_big, fill=fc)
+        except Exception:
+            pass
+    if label_sub:
+        try:
+            draw.text((22, 100), label_sub, font=_cr_font(_REG, 17), fill=(140,155,185))
+        except Exception:
+            pass
+    bx, by, bh, bw = _CR_W-16, 60, _CR_H-140, 6
+    draw.rectangle([bx, by, bx+bw, by+bh], fill=(30,35,55))
+    fill_h = round(bh * frac)
+    if fill_h > 0:
+        draw.rectangle([bx, by+bh-fill_h, bx+bw, by+bh], fill=_cr_flame_color(frac))
+    for tf in [0.25, 0.5, 0.75]:
+        ty = by + bh - round(bh*tf)
+        draw.line([(bx-3,ty),(bx+bw+2,ty)], fill=(60,70,100), width=1)
+
+
 def _crash_image_sync(mode: str, value: float = 1.0,
                       label_main: str = "", label_sub: str = "") -> Optional[bytes]:
-    """Render the rocket scene as 640×360 PNG bytes. None if Pillow is missing."""
+    """Render 640x860 vertical rocket scene. Returns None if Pillow unavailable."""
     try:
         from PIL import Image, ImageDraw
     except ImportError:
         return None
-
     frac = 0.0 if mode == "pad" else min(1.0, math.log(max(1.01, value)) / math.log(40))
-    bg   = _cr_bg_color(frac)
-    img  = Image.new("RGB", (_CR_W, _CR_H), bg)
+    img  = Image.new("RGB", (_CR_W, _CR_H), _cr_bg(frac))
     d    = ImageDraw.Draw(img)
-
+    _cr_draw_background(img, d, frac)
     _cr_draw_stars(d, frac)
-
-    if frac < 0.12:
-        d.rounded_rectangle([30, _CR_PAD_Y+34, 200, _CR_PAD_Y+50], radius=5, fill=_CR_GROUND)
-    elif 0.15 < frac < 0.55:
-        cw = 0.35 + frac
-        d.ellipse([260, 200, 260+90*cw, 200+36*cw], fill=_CR_CLOUD)
-        d.ellipse([380, 150, 380+80*cw, 150+32*cw], fill=_CR_CLOUD)
-
-    cx  = _CR_PAD_X + frac * _CR_DX
-    ny  = _CR_PAD_Y + frac * _CR_DY
-    fcol = _cr_flame_color(frac)
-
+    _cr_draw_ground(d, frac)
+    _cr_draw_clouds(d, frac)
+    cx     = _CR_W // 2
+    nose_y = round(655 - frac * 570)
     if mode == "crash":
-        bx, by = cx, ny + 34
-        rng2 = random.Random(99)
-        for i in range(16):
-            ang = (i / 16) * 2 * math.pi + rng2.uniform(-0.05, 0.05)
-            ln  = rng2.uniform(22, 48)
-            sx, sy = bx + math.cos(ang)*46, by + math.sin(ang)*46
-            ex, ey = bx + math.cos(ang)*(46+ln), by + math.sin(ang)*(46+ln)
-            d.line([(sx, sy), (ex, ey)], fill=_CR_FLAME_HI, width=4)
-        d.ellipse([bx-55, by-55, bx+55, by+55], outline=_CR_FLAME_MD, width=3)
-        for rad, col in [(42, _CR_FLAME_HI), (27, _CR_FLAME_MD), (13, (255, 255, 255))]:
-            d.ellipse([bx-rad, by-rad, bx+rad, by+rad], fill=col)
+        bx, by = cx, nose_y + 90
+        rng2 = random.Random(77)
+        for rad in range(110, 20, -10):
+            col = _cr_lerp(_cr_bg(frac), _CR_FL_HI, 0.06+(110-rad)/110*0.25)
+            d.ellipse([bx-rad,by-rad,bx+rad,by+rad], fill=col)
+        for i in range(20):
+            ang = (i/20)*2*math.pi + rng2.uniform(-0.08, 0.08)
+            ln  = rng2.uniform(55, 115)
+            sx, sy = bx+math.cos(ang)*100, by+math.sin(ang)*100
+            ex, ey = bx+math.cos(ang)*(100+ln), by+math.sin(ang)*(100+ln)
+            d.line([(sx,sy),(ex,ey)], fill=_CR_FL_HI, width=rng2.randint(2,5))
+        for _ in range(14):
+            ang = rng2.uniform(0, 2*math.pi)
+            dist = rng2.uniform(70, 160)
+            px2, py2 = bx+math.cos(ang)*dist, by+math.sin(ang)*dist
+            sz = rng2.uniform(3, 9)
+            d.ellipse([px2-sz,py2-sz,px2+sz,py2+sz],
+                      fill=_cr_lerp(_CR_FL_HI, _CR_FL_MD, rng2.random()))
+        for rad, col in [(90,_CR_FL_HI),(58,_CR_FL_MD),(30,_CR_FL_LO),(14,(255,255,255))]:
+            d.ellipse([bx-rad,by-rad,bx+rad,by+rad], fill=col)
     else:
-        flame_len = 16 + frac * 16
-        trail_len = 26 + frac * (_CR_DIST - 40)
-        _cr_draw_rocket(d, cx, ny, fcol, flame_len, bg, trail_len=trail_len)
-
-    _BOLD = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
-    _REG  = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-    if label_main:
-        f_num = _cr_font(_BOLD, 40)
-        col   = _CR_WHITE if mode == "pad" else (fcol if mode == "flight" else _CR_FLAME_HI)
-        d.text((22, 14), label_main, font=f_num, fill=col)
-    if label_sub:
-        f_sub = _cr_font(_REG, 15)
-        d.text((24, 60), label_sub, font=f_sub, fill=(178, 188, 208))
-
+        _cr_draw_rocket(d, cx, nose_y, frac)
+    _cr_draw_hud(d, mode, frac, label_main, label_sub)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
@@ -2028,59 +2175,71 @@ def _crash_flight_kb(cid: int) -> InlineKeyboardMarkup:
 # ── Text builders ──────────────────────────────────────
 
 def _crash_join_text(rnd: dict) -> str:
-    """Caption for the pad photo during the join window."""
+    """Caption shown on the pad photo during the join window."""
     players = rnd["players"]
     total   = sum(p["bet"] for p in players.values())
     items   = list(players.items())
-    plist   = "\n".join(
-        f"• {mention(uid, p['name'])} — <code>{fmt(p['bet'])}</code> VRF"
-        for uid, p in items[:8]
-    ) or "<i>Пока никто не зашёл...</i>"
-    if len(items) > 8:
-        plist += f"\n<i>+{len(items)-8} ещё...</i>"
 
     if rnd["join_mode"] == "players":
         target = rnd["target_players"]
         have   = len(players)
-        status = f"👥 <b>{have}/{target}</b> игроков" + (" ✅" if have >= target else "")
+        bar    = "🟢" * have + "⬜" * max(0, target - have)
+        status = f"👥 {bar}  <b>{have}/{target}</b> игроков"
     else:
         remain = max(0, int((rnd["join_deadline"] - datetime.now()).total_seconds()))
-        status = f"⏱ <b>{remain} сек</b> до старта"
+        status = f"⏱ До старта: <b>{remain} сек</b>"
+
+    # Player rows
+    prows = "\n".join(
+        f"  • {mention(uid, p['name'])} — <code>{fmt(p['bet'])}</code> VRF"
+        for uid, p in items[:10]
+    ) or "  <i>Пока никто не зашёл...</i>"
+    if len(items) > 10:
+        prows += f"\n  <i>+{len(items)-10} ещё</i>"
 
     return (
         f"🚀 <b>КРАШ — ставки открыты!</b>\n"
-        f"<i>Лови момент, забирай выигрыш до взрыва</i>\n\n"
+        f"<i>Лови момент и забирай выигрыш до взрыва</i>\n\n"
         f"{status}\n"
-        f"<blockquote>💰 Банк: <b>{fmt(total)} VRF</b></blockquote>\n"
-        f"{plist}\n\n"
-        f"⬇️ Жми сумму, чтобы войти"
+        f"<blockquote expandable>💰 Банк: <b>{fmt(total)} VRF</b>\n\n"
+        f"{prows}</blockquote>\n"
+        f"⬇️ <b>Жми сумму чтобы войти</b>"
     )
 
 
 def _crash_flight_text(rnd: dict, mult: float) -> str:
-    """Caption for the flight photo — the multiplier itself lives in the image."""
+    """Rich caption for the live flight photo.
+    The multiplier number itself is baked into the image — here we show
+    who's still flying and who already cashed out."""
     players = rnd["players"]
     in_p    = [p for p in players.values() if not p["cashed"]]
-    out_p   = [p for p in players.values() if p["cashed"]]
+    out_p   = sorted([p for p in players.values() if p["cashed"]],
+                     key=lambda p: p["mult"], reverse=True)
 
-    in_list = "\n".join(
-        f"🟢 {p['name']} — <code>{fmt(p['bet'])}</code> VRF" for p in in_p[:6]
-    ) or "—"
-    if len(in_p) > 6:
-        in_list += f"\n<i>+{len(in_p)-6} ещё</i>"
+    def in_row(p: dict) -> str:
+        pot = round(p["bet"] * mult)
+        return f"🟢 <b>{p['name']}</b>  <code>{fmt(p['bet'])}</code> → <b>{fmt(pot)}</b> VRF"
 
-    out_list = "\n".join(
-        f"💰 {p['name']} — ×{p['mult']:.2f} → <b>+{fmt(round(p['bet']*p['mult']))}</b>"
-        for p in out_p[:6]
-    ) or "—"
-    if len(out_p) > 6:
-        out_list += f"\n<i>+{len(out_p)-6} ещё</i>"
+    def out_row(p: dict) -> str:
+        payout = round(p["bet"] * p["mult"])
+        return (f"💰 <b>{p['name']}</b>  ×{p['mult']:.2f} "
+                f"→ <b>+{fmt(payout)}</b> VRF")
 
-    return (
-        f"<blockquote>🟢 В игре:\n{in_list}</blockquote>"
-        f"<blockquote>💰 Уже забрали:\n{out_list}</blockquote>"
-        f"👇 Жми, пока не поздно!"
-    )
+    in_lines  = "\n".join(in_row(p) for p in in_p[:6])
+    out_lines = "\n".join(out_row(p) for p in out_p[:6])
+
+    parts = []
+    if in_lines:
+        if len(in_p) > 6:
+            in_lines += f"\n<i>+{len(in_p)-6} ещё в игре</i>"
+        parts.append(f"<blockquote>🚀 Ещё в игре:\n{in_lines}</blockquote>")
+    if out_lines:
+        if len(out_p) > 6:
+            out_lines += f"\n<i>+{len(out_p)-6} ещё</i>"
+        parts.append(f"<blockquote>💰 Уже забрали:\n{out_lines}</blockquote>")
+
+    body = "\n".join(parts) or "<i>—</i>"
+    return f"{body}\n👇 <b>Жми ЗАБРАТЬ, пока не поздно!</b>"
 
 
 def _crash_result_cards(crash_point: float, winners: list, losers: list) -> tuple:
@@ -2148,7 +2307,7 @@ async def _crash_end(bot, cid: int, final_mult: float) -> None:
 
     crash_rounds.pop(cid, None)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     img  = await loop.run_in_executor(
         None, _crash_image_sync, "crash", crash_point,
         f"×{crash_point:.2f}", "ВЗРЫВ!",
@@ -2223,7 +2382,7 @@ async def _crash_join_loop(bot, cid: int) -> None:
 
 async def _crash_flight_loop(bot, cid: int) -> None:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(CRASH_TICK_SECONDS)
             rnd = crash_rounds.get(cid)
@@ -2328,6 +2487,11 @@ async def _crash_launch(context: ContextTypes.DEFAULT_TYPE, query,
             pass
         return
 
+    # Claim the slot SYNCHRONOUSLY (no await between check and write) so a
+    # second concurrent /crash launch in the same chat can't race past the
+    # check above while this one is still awaiting image generation / send.
+    crash_rounds[cid] = {"cid": cid, "state": "launching"}
+
     now      = datetime.now()
     deadline = now + timedelta(seconds=join_seconds if mode == "time" else JOIN_TIMEOUT)
 
@@ -2342,7 +2506,7 @@ async def _crash_launch(context: ContextTypes.DEFAULT_TYPE, query,
         "join_mode": mode, "join_deadline": deadline,
         "target_players": target_players, "players": {},
     }
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     img  = await loop.run_in_executor(
         None, _crash_image_sync, "pad", 1.0, "", "Заправка топливом...",
     )
@@ -2361,6 +2525,7 @@ async def _crash_launch(context: ContextTypes.DEFAULT_TYPE, query,
                 reply_markup=_crash_join_kb(cid),
             )
     except TelegramError:
+        crash_rounds.pop(cid, None)   # release the claimed slot on failure
         return
 
     crash_rounds[cid] = {
@@ -3818,27 +3983,33 @@ _WARN_AUTO_MUT = timedelta(hours=24)   # auto-mute duration
 
 # ── Duration parser ───────────────────────────────────
 
-def _mod_dur(args: list) -> tuple:
+def _mod_dur(args: list, default: Optional[timedelta] = timedelta(days=7)) -> tuple:
     """
     Parse duration from command args.
     Returns (Optional[timedelta], reason: str).
-    Default (no args) → 7 days.
+    `default` is returned verbatim whenever no valid duration is found
+    (no args, or first arg isn't a recognised unit) — pass default=None
+    for commands where "no duration given" should mean permanent.
     """
     FOREVER = {"навсегда", "perma", "forever", "перм", "perm", "inf", "∞"}
     SECS: dict = {
-        frozenset({"с", "сек", "sec", "s"}):                                 1,
-        frozenset({"мин", "мин.", "м", "min", "m", "minute", "minutes"}):   60,
-        frozenset({"ч", "час", "h", "hour", "hours", "hr"}):              3600,
-        frozenset({"д", "дн", "день", "дней", "d", "day", "days"}):     86400,
-        frozenset({"н", "нед", "неделя", "w", "week", "weeks"}):       604800,
-        frozenset({"мес", "месяц", "месяца", "mo", "month", "months"}): 2592000,
+        frozenset({"с", "сек", "секунд", "секунды", "sec", "s"}):                          1,
+        frozenset({"мин", "мин.", "минут", "минуты", "м", "min", "m", "minute", "minutes"}): 60,
+        frozenset({"ч", "час", "часа", "часов", "h", "hour", "hours", "hr"}):             3600,
+        frozenset({"д", "дн", "день", "дня", "дней", "d", "day", "days"}):              86400,
+        frozenset({"н", "нед", "неделя", "недели", "недель", "w", "week", "weeks"}):    604800,
+        frozenset({"мес", "месяц", "месяца", "месяцев", "mo", "month", "months"}):     2592000,
     }
     if not args:
-        return timedelta(days=7), ""
+        return default, ""
 
     first = args[0].lower()
     if first in FOREVER:
         return None, " ".join(args[1:])
+
+    # Bare number with no unit (e.g. "/mute 10 спам") → assume minutes
+    if first.isdigit():
+        return timedelta(minutes=int(first)), " ".join(args[1:])
 
     import re as _re
     m = _re.match(r"^(\d+)([а-яёa-z.]+)$", first)
@@ -3848,8 +4019,8 @@ def _mod_dur(args: list) -> tuple:
             if unit in unit_set:
                 return timedelta(seconds=n * secs), " ".join(args[1:])
 
-    # First arg is not a duration → all args = reason, default 7d
-    return timedelta(days=7), " ".join(args)
+    # First arg is not a recognised duration → all args = reason, use default
+    return default, " ".join(args)
 
 
 def _fmt_until(until: Optional[datetime]) -> str:
@@ -4117,14 +4288,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("❌ Нельзя забанить администратора")
         return
 
-    dur, reason = _mod_dur(context.args if context.args else [])
-    # For ban default = permanent (not 7d like mute)
-    if context.args and dur and dur == timedelta(days=7) and not any(
-        context.args[0].lower().startswith(u)
-        for u in ["7д","7d","7н","7нед","7w","7 ","1н","1w"]
-    ):
-        # No recognisable duration → permanent
-        dur, reason = None, " ".join(context.args)
+    dur, reason = _mod_dur(context.args, default=None)
     until_dt = datetime.now() + dur if dur else None
 
     try:
@@ -6304,9 +6468,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await _crash_end(context.bot, rcid, rnd["crash_point"])
                 return
 
+            # Claim the cashout SYNCHRONOUSLY before any await — prevents
+            # a double-tap delivering two payouts if Telegram retries the callback.
             p["cashed"] = True
             p["mult"]   = cur_mult
             payout      = round(p["bet"] * cur_mult)
+
             await db_add_vrf(who.id, rcid, payout)
             await db_add_xp(who.id, rcid, XP_PER_WIN)
             await db_record_game(who.id, rcid, won=True)
@@ -6689,7 +6856,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 parse_mode=ParseMode.HTML,
             )
         else:
-            new_bal = await db_deduct_vrf(u.id, cid, bet)
+            await db_deduct_vrf(u.id, cid, bet)
+            after_u = await db_get_user(u.id, cid)
+            new_bal = after_u["vrf"] if after_u else (uu["vrf"] - bet)
             await update.message.reply_text(
                 f"🎲 Выпало <b>{rolled}</b> — промах! ❌\n\n"
                 f"💸 -{fmt(bet)} VRF\n"

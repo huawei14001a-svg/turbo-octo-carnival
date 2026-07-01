@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import threading
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
@@ -27,8 +28,12 @@ from telegram import (
     InlineQueryResultArticle,
     InputMediaPhoto,
     InputTextMessageContent,
+    KeyboardButton,
     ReactionTypeEmoji,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -78,6 +83,7 @@ class SBtn(InlineKeyboardButton):
 
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 DB_PATH:   str = os.getenv("DB_PATH", "verifure.db")
+WEBAPP_URL: str = os.getenv("WEBAPP_URL", "")  # Railway URL e.g. https://your-app.up.railway.app
 
 # ── VRF Economy ───────────────────────────────────────
 STARTING_VRF        = 500
@@ -3043,31 +3049,47 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @only_groups
 async def cmd_clicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /clicker [amount]
-    Claim accumulated VRF earned in the web clicker.
-    The clicker app calls sendPrompt which delivers the command here.
-    Limit: 500 VRF per 24 h per user (abuse prevention).
+    /clicker — открывает Telegram Mini App кликер (если WEBAPP_URL задан),
+    или засчитывает VRF из текстовой команды /clicker [amount].
     """
     u   = update.effective_user
     cid = update.effective_chat.id
 
+    # ── Mode A: Mini App is configured — send the keyboard button ─────────
+    if WEBAPP_URL and not context.args:
+        clicker_url = WEBAPP_URL.rstrip("/") + "/clicker"
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("🖱 Открыть кликер VRF", web_app=WebAppInfo(url=clicker_url))]],
+            resize_keyboard=True,
+            one_time_keyboard=False,
+        )
+        await update.message.reply_text(
+            "👆 Нажми кнопку ниже чтобы открыть кликер.\n"
+            "Накопи VRF и нажми <b>Отправить в бот</b> — монеты придут сюда!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return
+
+    # ── Mode B: text-based fallback /clicker [amount] ─────────────────────
     CLICKER_DAILY_MAX = 500
     CLICKER_COOLDOWN  = timedelta(hours=24)
 
     if not context.args or not context.args[0].replace(".", "").isdigit():
-        await update.message.reply_text(
+        base_msg = (
             "🖱 <b>Кликер</b>\n\n"
-            "Отправь заработанные клики командой:\n"
+            "Накапливай VRF в кликере и засылай в бот командой:\n"
             "<code>/clicker [сумма]</code>\n\n"
-            "Например: <code>/clicker 150</code>\n"
-            "Ограничение: <b>500 VRF в сутки</b>",
-            parse_mode=ParseMode.HTML,
+            "Ограничение: <b>500 VRF в сутки</b>"
         )
+        if WEBAPP_URL:
+            base_msg += f"\n\nМини-приложение: {WEBAPP_URL.rstrip('/')}/clicker"
+        await update.message.reply_text(base_msg, parse_mode=ParseMode.HTML)
         return
 
     amount = int(float(context.args[0]))
     if amount <= 0:
-        await update.message.reply_text("❌ Сумма должна быть больше 0!", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("❌ Сумма должна быть больше 0!")
         return
     if amount > CLICKER_DAILY_MAX:
         await update.message.reply_text(
@@ -3078,48 +3100,41 @@ async def cmd_clicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
 
-    # Check daily limit via DB column (reuse last_gift logic pattern)
     async with aiosqlite.connect(DB_PATH) as db:
+        for col in ["last_clicker_claim TEXT DEFAULT NULL",
+                    "clicker_claimed_today INTEGER DEFAULT 0"]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            except Exception:
+                pass
+        await db.commit()
         async with db.execute(
             "SELECT last_clicker_claim, clicker_claimed_today FROM users "
             "WHERE user_id=? AND chat_id=?", (u.id, cid)
         ) as cur:
             row = await cur.fetchone()
 
-    # Column may not exist yet (migration) — add it
-    if row is None or (isinstance(row, tuple) and len(row) < 2):
-        async with aiosqlite.connect(DB_PATH) as db:
-            for col in ["last_clicker_claim TEXT DEFAULT NULL",
-                        "clicker_claimed_today INTEGER DEFAULT 0"]:
-                try:
-                    await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
-                except Exception:
-                    pass
-            await db.commit()
-        last_claim, claimed_today = None, 0
-    else:
-        last_claim, claimed_today = row[0], (row[1] or 0)
-
+    last_claim, claimed_today = (row or (None, 0))
+    claimed_today = claimed_today or 0
     now = datetime.now()
+
     if last_claim:
         try:
             last_dt = datetime.fromisoformat(last_claim)
             if now - last_dt < CLICKER_COOLDOWN:
-                remaining_today = CLICKER_DAILY_MAX - claimed_today
-                if remaining_today <= 0:
-                    next_reset = last_dt + CLICKER_COOLDOWN
-                    wait = int((next_reset - now).total_seconds())
+                remaining = max(0, CLICKER_DAILY_MAX - claimed_today)
+                if remaining <= 0:
+                    wait = int((last_dt + CLICKER_COOLDOWN - now).total_seconds())
                     await update.message.reply_text(
                         f"⏰ Суточный лимит кликера исчерпан!\n"
                         f"Следующее пополнение через <b>{fmt_cd(wait)}</b>.",
                         parse_mode=ParseMode.HTML,
                     )
                     return
-                amount = min(amount, remaining_today)
+                amount = min(amount, remaining)
         except ValueError:
             claimed_today = 0
 
-    # Credit VRF
     new_bal = await db_add_vrf(u.id, cid, amount)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -3133,8 +3148,7 @@ async def cmd_clicker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🖱 <b>Кликер — зачислено!</b>\n\n"
         f"💎 +{fmt(amount)} VRF\n"
         f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>\n\n"
-        f"<i>Ещё можно получить сегодня: "
-        f"{fmt(max(0, CLICKER_DAILY_MAX - claimed_today - amount))} VRF</i>",
+        f"<i>Осталось сегодня: {fmt(max(0, CLICKER_DAILY_MAX - claimed_today - amount))} VRF</i>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -6723,6 +6737,104 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         return
 
+    # ── Tower 🏢 ───────────────────────────────────────────
+    if data.startswith("tw:"):
+        parts  = data.split(":")
+        action = parts[1]
+        tcid   = int(parts[2])
+        game   = tower_games.get(tcid)
+
+        if action == "join":
+            amount = int(parts[3])
+            if not game or game["state"] != "joining":
+                await query.answer("❌ Набор уже закрыт!", show_alert=True)
+                return
+            if who.id in game["players"]:
+                await query.answer("Ты уже в игре!", show_alert=True)
+                return
+            await db_ensure_user(who.id, tcid, who.username or "", who.first_name)
+            u2 = await db_get_user(who.id, tcid)
+            if not u2 or u2["vrf"] < amount:
+                await query.answer(f"❌ Недостаточно VRF! Нужно {amount}.", show_alert=True)
+                return
+            ok = await db_deduct_vrf(who.id, tcid, amount)
+            if not ok:
+                await query.answer("❌ Недостаточно VRF!", show_alert=True)
+                return
+            game["players"][who.id] = {
+                "name": who.first_name, "bet": amount,
+                "cashed": False, "cash_floor": 0,
+                "cash_mult": 1.0, "payout": 0,
+            }
+            await query.answer(f"✅ Ставка {amount} VRF принята!")
+            return
+
+        if action == "custom":
+            if not game or game["state"] != "joining":
+                await query.answer("❌ Набор закрыт!", show_alert=True)
+                return
+            if who.id in game["players"]:
+                await query.answer("Ты уже участвуешь!", show_alert=True)
+                return
+            tower_custom_pending[(tcid, who.id)] = {"expires": datetime.now() + timedelta(seconds=60)}
+            try:
+                await context.bot.send_message(
+                    tcid,
+                    f"✏️ {mention(who.id, who.first_name)}, напиши свою ставку "
+                    f"(минимум <b>{TOWER_MIN_BET} VRF</b>) ответом на это сообщение:",
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=game["msg_id"],
+                    reply_markup=ForceReply(selective=True),
+                )
+            except TelegramError:
+                pass
+            await query.answer("✍️ Напиши сумму в чат")
+            return
+
+        if action == "L" or action == "R":
+            if not game or game["state"] != "voting":
+                await query.answer("❌ Голосование неактивно!", show_alert=True)
+                return
+            if who.id not in game["players"] or game["players"][who.id]["cashed"]:
+                await query.answer("❌ Ты не в игре!", show_alert=True)
+                return
+            prev = game["voted"].get(who.id)
+            game["voted"][who.id] = action
+            msg = ("✅ Голос учтён!" if not prev
+                   else f"Голос изменён: {prev} → {action}")
+            await query.answer(msg)
+            return
+
+        if action == "cash":
+            if not game or game["state"] not in ("voting", "cashout"):
+                await query.answer("❌ Нельзя забрать сейчас!", show_alert=True)
+                return
+            p = game["players"].get(who.id)
+            if not p:
+                await query.answer("❌ Ты не в игре!", show_alert=True)
+                return
+            if p["cashed"]:
+                await query.answer(f"Уже забрал x{p['cash_mult']:.2f}!", show_alert=True)
+                return
+            # Cashout at PREVIOUS floor's multiplier
+            mults   = game.get("mults", TOWER_MULTS)
+            cur_f   = game["floor"]
+            cash_f  = max(1, cur_f - (1 if game["state"] == "cashout" else 0))
+            mult    = mults[min(cash_f-1, len(mults)-1)]
+            payout  = round(p["bet"] * mult)
+            p["cashed"]    = True
+            p["cash_floor"] = cash_f
+            p["cash_mult"]  = mult
+            p["payout"]     = payout
+            await db_add_vrf(who.id, tcid, payout)
+            await db_add_xp(who.id, tcid, XP_PER_WIN)
+            await db_record_game(who.id, tcid, won=True)
+            await query.answer(f"💰 Забрал x{mult:.2f}! +{fmt(payout)} VRF")
+            return
+
+        await query.answer()
+        return
+
     await query.answer()
 
 
@@ -6746,6 +6858,46 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     word = pts[0] if pts else ""
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+
+    # ── Tower: custom bet reply ─────────────────────────────
+    pend_tw = tower_custom_pending.get(pend_key)
+    if pend_tw:
+        if datetime.now() > pend_tw["expires"]:
+            tower_custom_pending.pop(pend_key, None)
+        else:
+            digits = text.replace(" ", "")
+            if digits.isdigit():
+                tower_custom_pending.pop(pend_key, None)
+                tw_amount = int(digits)
+                if tw_amount < TOWER_MIN_BET:
+                    await update.message.reply_text(
+                        f"❌ Минимальная ставка {TOWER_MIN_BET} VRF")
+                    return
+                game = tower_games.get(cid)
+                if not game or game["state"] != "joining":
+                    await update.message.reply_text("❌ Набор уже закрыт!")
+                    return
+                if u.id in game["players"]:
+                    await update.message.reply_text("Ты уже в игре!")
+                    return
+                uu2 = await db_get_user(u.id, cid)
+                if not uu2 or uu2["vrf"] < tw_amount:
+                    await update.message.reply_text(
+                        f"❌ Недостаточно VRF! Есть: {fmt(uu2['vrf'] if uu2 else 0)}")
+                    return
+                ok = await db_deduct_vrf(u.id, cid, tw_amount)
+                if not ok:
+                    await update.message.reply_text("❌ Недостаточно VRF!")
+                    return
+                game["players"][u.id] = {
+                    "name": u.first_name, "bet": tw_amount,
+                    "cashed": False, "cash_floor": 0, "cash_mult": 1.0, "payout": 0,
+                }
+                await update.message.reply_text(f"✅ Ставка {tw_amount} VRF принята!")
+                return
+            else:
+                await update.message.reply_text("❌ Введи число. Попробуй ещё раз:")
+                return
 
     # ── Crash: custom bet amount reply ─────────────────────
     pend_key = (cid, u.id)
@@ -7007,6 +7159,1081 @@ async def on_startup(app: Application) -> None:
     log.info("Verifure Game 10.1 is online!")
 
 
+
+# ══════════════════════════════════════════════════════
+#   TELEGRAM MINI APP — VRF Кликер (встроенный HTML)
+# ══════════════════════════════════════════════════════
+# Файл раздаётся прямо из бота по адресу /clicker.
+# Установи переменную окружения WEBAPP_URL = https://your-app.up.railway.app
+# и в Railway Settings → Networking включи порт 8080 (Public Networking).
+
+_CLICKER_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>VRF Кликер</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{min-height:100vh;background:#0b0e14;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+  display:flex;flex-direction:column;align-items:center;justify-content:space-between;
+  padding:16px 16px 24px;color:#fff;background-image:radial-gradient(circle at 25% 20%,#111b2e 0%,#0b0e14 70%)}
+.stars{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0}
+.star{position:absolute;border-radius:50%;background:#fff;animation:twinkle var(--d,3s) ease-in-out infinite var(--delay,0s)}
+@keyframes twinkle{0%,100%{opacity:var(--lo,.1)}50%{opacity:var(--hi,.9)}}
+.content{position:relative;z-index:1;width:100%;max-width:400px;display:flex;flex-direction:column;align-items:center;gap:18px}
+.user-bar{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,0.05);
+  border:1px solid rgba(255,255,255,0.08);border-radius:99px;padding:4px 14px 4px 4px;align-self:center}
+.avatar{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);
+  display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:#fff;flex-shrink:0}
+.user-name{font-size:13px;font-weight:500;color:rgba(255,255,255,0.8)}
+.balance-card{background:rgba(0,0,0,0.35);border:1px solid rgba(255,215,0,0.15);
+  border-radius:16px;padding:18px 24px;text-align:center;width:100%}
+.bal-label{font-size:11px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:2px;margin-bottom:4px}
+.bal-num{font-size:58px;font-weight:700;color:#ffd966;line-height:1;text-shadow:0 0 30px rgba(255,215,0,.15)}
+.bal-sub{font-size:12px;color:rgba(255,255,255,0.3);margin-top:4px}
+.coin-area{display:flex;flex-direction:column;align-items:center;gap:10px}
+.coin{width:148px;height:148px;border-radius:50%;cursor:pointer;user-select:none;position:relative;
+  background:conic-gradient(from 180deg,#ffd966,#f4b400,#e6a000,#ffd966);
+  border:3px solid rgba(255,220,80,.3);transition:transform .08s;display:flex;align-items:center;justify-content:center}
+.coin:active{transform:scale(.91)}
+.coin-ring{position:absolute;inset:-5px;border-radius:50%;border:2px solid rgba(255,200,30,.2);animation:pulse 2.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.6;transform:scale(1)}50%{opacity:.2;transform:scale(1.06)}}
+.coin-text{font-size:38px;font-weight:800;color:rgba(100,55,0,.8);text-shadow:0 2px 4px rgba(255,255,255,.3)}
+.tap-hint{font-size:12px;color:rgba(255,255,255,.3);letter-spacing:.5px}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;width:100%}
+.stat{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
+  border-radius:10px;padding:8px 4px;text-align:center}
+.stat-v{font-size:17px;font-weight:600;color:#fff}
+.stat-l{font-size:10px;color:rgba(255,255,255,.35);text-transform:uppercase;letter-spacing:.8px;margin-top:1px}
+.prog-wrap{width:100%}
+.prog-row{display:flex;justify-content:space-between;font-size:11px;color:rgba(255,255,255,.3);margin-bottom:5px}
+.prog-bar{height:5px;background:rgba(255,255,255,.07);border-radius:99px;overflow:hidden}
+.prog-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);border-radius:99px;transition:width .4s ease}
+.limit-row{font-size:11px;color:rgba(255,255,255,.3);text-align:center;width:100%}
+.fly{position:fixed;pointer-events:none;z-index:9999;font-size:20px;font-weight:700;
+  color:#ffd966;text-shadow:0 0 10px rgba(255,215,0,.4);animation:fup .9s ease-out forwards}
+@keyframes fup{0%{opacity:1;transform:translateY(0)}100%{opacity:0;transform:translateY(-70px) scale(.5)}}
+</style>
+</head>
+<body>
+<div class="stars" id="stars"></div>
+<div class="content">
+  <div class="user-bar">
+    <div class="avatar" id="av">?</div>
+    <div class="user-name" id="uname">Загрузка...</div>
+  </div>
+  <div class="balance-card">
+    <div class="bal-label">Накоплено</div>
+    <div class="bal-num" id="bal">0</div>
+    <div class="bal-sub">VRF монет</div>
+  </div>
+  <div class="coin-area">
+    <div class="coin" id="coin" role="button" aria-label="Нажми для накопления VRF">
+      <div class="coin-ring"></div>
+      <div class="coin-text">VRF</div>
+    </div>
+    <div class="tap-hint">Нажимай для накопления</div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat"><div class="stat-v" id="s-clicks">0</div><div class="stat-l">Кликов</div></div>
+    <div class="stat"><div class="stat-v" id="s-rate">0.5</div><div class="stat-l">За клик</div></div>
+    <div class="stat"><div class="stat-v" id="s-sent">0</div><div class="stat-l">Отправлено</div></div>
+  </div>
+  <div class="prog-wrap">
+    <div class="prog-row"><span>Бонус за 50 кликов</span><span id="prog-t">0/50</span></div>
+    <div class="prog-bar"><div class="prog-fill" id="prog-f" style="width:0"></div></div>
+  </div>
+  <div class="limit-row" id="limit-row"></div>
+</div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+// ── Stars ──
+const sc = document.getElementById('stars');
+for (let i=0;i<55;i++){
+  const s=document.createElement('div');
+  s.className='star';
+  const sz=Math.random()*1.8+.4;
+  s.style.cssText=`width:${sz}px;height:${sz}px;left:${Math.random()*100}%;top:${Math.random()*100}%;
+    --d:${2+Math.random()*4}s;--delay:${Math.random()*5}s;--lo:${.05+Math.random()*.1};--hi:${.5+Math.random()*.5}`;
+  sc.appendChild(s);
+}
+
+// ── User ──
+const u = tg.initDataUnsafe?.user;
+if(u){
+  document.getElementById('uname').textContent = u.first_name || u.username || 'Игрок';
+  document.getElementById('av').textContent = (u.first_name||'?')[0].toUpperCase();
+}
+
+// ── State (localStorage persists between Telegram WebView sessions) ──
+const SK = 'vrf_clicker_v4';
+const DAILY_MAX = 500;
+let S = {balance:0, clicks:0, perClick:0.5, totalSent:0, sentToday:0, lastSentDate:''};
+try{
+  const raw = localStorage.getItem(SK);
+  if(raw) S = {...S, ...JSON.parse(raw)};
+  const today = new Date().toDateString();
+  if(S.lastSentDate !== today) S.sentToday = 0;
+}catch(e){}
+
+function save(){ try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){} }
+
+function render(){
+  document.getElementById('bal').textContent = Math.floor(S.balance);
+  document.getElementById('s-clicks').textContent = S.clicks;
+  document.getElementById('s-rate').textContent = S.perClick.toFixed(1);
+  document.getElementById('s-sent').textContent = S.totalSent;
+  const prog = (S.clicks % 50)/50;
+  document.getElementById('prog-f').style.width = (prog*100)+'%';
+  document.getElementById('prog-t').textContent = (S.clicks%50)+'/50';
+  const remain = Math.max(0, DAILY_MAX - S.sentToday);
+  document.getElementById('limit-row').textContent = remain > 0
+    ? `Доступно к отправке сегодня: ${remain} VRF`
+    : 'Суточный лимит исчерпан. Возвращайся завтра!';
+  updateMainBtn();
+}
+
+function updateMainBtn(){
+  const can = Math.min(Math.floor(S.balance), Math.max(0, DAILY_MAX - S.sentToday));
+  if(can >= 1){
+    tg.MainButton.setText('Отправить '+can+' VRF в бот');
+    tg.MainButton.color = '#22c55e';
+    tg.MainButton.show();
+  } else if(Math.floor(S.balance) < 1) {
+    tg.MainButton.setText('Кликай чтобы накопить');
+    tg.MainButton.color = '#374151';
+    tg.MainButton.show();
+  } else {
+    tg.MainButton.setText('Лимит 500 VRF/сутки исчерпан');
+    tg.MainButton.color = '#374151';
+    tg.MainButton.show();
+  }
+}
+
+// ── Click ──
+document.getElementById('coin').addEventListener('click', function(e){
+  if(navigator.vibrate) navigator.vibrate(12);
+  S.balance = Math.round((S.balance + S.perClick)*100)/100;
+  S.clicks++;
+  if(S.clicks % 50 === 0) S.perClick = Math.round((S.perClick+.1)*10)/10;
+  render(); save();
+  const fly = document.createElement('div');
+  fly.className = 'fly';
+  fly.textContent = S.clicks%50===0 ? 'БОНУС x'+S.perClick.toFixed(1)+'!' : '+'+S.perClick.toFixed(1);
+  fly.style.left=(e.clientX-25)+'px'; fly.style.top=(e.clientY-25)+'px';
+  document.body.appendChild(fly);
+  setTimeout(()=>fly.remove(),950);
+});
+
+// ── Send to bot ──
+tg.MainButton.onClick(function(){
+  const can = Math.min(Math.floor(S.balance), Math.max(0, DAILY_MAX - S.sentToday));
+  if(can < 1){ tg.showAlert('Накопи хотя бы 1 VRF или подожди до завтра'); return; }
+  tg.showConfirm('Отправить '+can+' VRF в бот?', function(ok){
+    if(!ok) return;
+    S.balance = Math.round((S.balance - can)*100)/100;
+    S.sentToday += can;
+    S.totalSent += can;
+    S.lastSentDate = new Date().toDateString();
+    save();
+    tg.sendData(JSON.stringify({action:'clicker',amount:can}));
+  });
+});
+
+render();
+</script>
+</body>
+</html>"""
+
+
+def _run_clicker_webserver() -> None:
+    """
+    Запускает лёгкий aiohttp-сервер в фоновом потоке.
+    Railway автоматически привязывает домен если включить Public Networking → Port 8080.
+    Переменные окружения: PORT (Railway задаёт автоматически), WEBAPP_URL.
+    """
+    import asyncio as _asyncio
+
+    async def _serve() -> None:
+        try:
+            from aiohttp import web as _web
+        except ImportError:
+            log.warning("aiohttp not installed — Mini App web server disabled. pip install aiohttp")
+            return
+
+        async def clicker_page(request: _web.Request) -> _web.Response:
+            return _web.Response(text=_CLICKER_HTML, content_type="text/html",
+                                 charset="utf-8")
+
+        async def health(request: _web.Request) -> _web.Response:
+            return _web.Response(text="ok")
+
+        web_app = _web.Application()
+        web_app.router.add_get("/clicker", clicker_page)
+        web_app.router.add_get("/", health)
+
+        runner = _web.AppRunner(web_app)
+        await runner.setup()
+        port = int(os.getenv("PORT", "8080"))
+        site = _web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        log.info("Mini App web server started on port %s  →  %s/clicker", port, WEBAPP_URL or f"http://localhost:{port}")
+        await _asyncio.Event().wait()   # run forever
+
+    _asyncio.run(_serve())
+
+
+async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle VRF clicker data sent from the Telegram Mini App via sendData()."""
+    msg = update.message
+    if not msg or not msg.web_app_data:
+        return
+
+    user = update.effective_user
+    cid  = update.effective_chat.id
+    raw  = msg.web_app_data.data
+
+    try:
+        import json as _json
+        data = _json.loads(raw)
+    except Exception:
+        return
+
+    if data.get("action") != "clicker":
+        return
+
+    amount = int(data.get("amount", 0))
+    if amount <= 0:
+        return
+
+    CLICKER_DAILY_MAX = 500
+    if amount > CLICKER_DAILY_MAX:
+        amount = CLICKER_DAILY_MAX
+
+    await db_ensure_user(user.id, cid, user.username or "", user.first_name)
+
+    # Check daily limit
+    async with aiosqlite.connect(DB_PATH) as db:
+        for col in ["last_clicker_claim TEXT DEFAULT NULL",
+                    "clicker_claimed_today INTEGER DEFAULT 0"]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            except Exception:
+                pass
+        await db.commit()
+
+        async with db.execute(
+            "SELECT last_clicker_claim, clicker_claimed_today FROM users "
+            "WHERE user_id=? AND chat_id=?", (user.id, cid)
+        ) as cur:
+            row = await cur.fetchone()
+
+    last_claim, claimed_today = (row or (None, 0))
+    claimed_today = claimed_today or 0
+
+    if last_claim:
+        try:
+            last_dt = datetime.fromisoformat(last_claim)
+            if datetime.now() - last_dt < timedelta(hours=24):
+                available = max(0, CLICKER_DAILY_MAX - claimed_today)
+                if available <= 0:
+                    await msg.reply_text(
+                        "⏰ <b>Суточный лимит кликера исчерпан!</b>\n"
+                        "Возвращайся через 24 часа.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return
+                amount = min(amount, available)
+            else:
+                claimed_today = 0
+        except ValueError:
+            claimed_today = 0
+
+    new_bal = await db_add_vrf(user.id, cid, amount)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_clicker_claim=?, clicker_claimed_today=? "
+            "WHERE user_id=? AND chat_id=?",
+            (datetime.now().isoformat(), claimed_today + amount, user.id, cid),
+        )
+        await db.commit()
+
+    remain = max(0, CLICKER_DAILY_MAX - claimed_today - amount)
+    await msg.reply_text(
+        f"🖱 <b>Кликер — зачислено!</b>\n\n"
+        f"💎 +{fmt(amount)} VRF\n"
+        f"💰 Баланс: <b>{fmt(new_bal)} VRF</b>\n\n"
+        f"<i>Осталось сегодня: {fmt(remain)} VRF</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+
+# ══════════════════════════════════════════════════════
+#   БАШНЯ 🏢 — этажная рулетка с голосованием
+# ══════════════════════════════════════════════════════
+# Логика: игроки делают ставку, каждый этаж голосуют Л/П.
+# Большинство открывает дверь — за одной мина, за другой проход.
+# Чем выше этаж — тем больше множитель выигрыша.
+# Можно забрать ставку после любого этажа до следующего голосования.
+
+TOWER_MIN_BET    = 10
+TOWER_BET_PRESETS = [25, 50, 100, 250, 500]
+TOWER_JOIN_SECS  = 28
+TOWER_VOTE_SECS  = 22
+TOWER_CASH_SECS  = 8     # window to cashout between floors
+TOWER_TICK       = 5     # image update interval
+# Multipliers per floor (up to 10 floors)
+TOWER_MULTS = [1.30, 1.70, 2.20, 2.80, 3.60, 4.50, 5.80, 7.50, 9.50, 12.50]
+
+tower_games: dict = {}   # key: cid (int)
+
+# ── Image constants ───────────────────────────────────
+_T_S_TOP  = (3, 6, 18);  _T_S_BOT = (8, 14, 32)
+_T_BLDG   = (18, 26, 44); _T_BLDG2 = (14, 20, 36)
+_T_F_LINE = (30, 42, 65); _T_WIN_DK = (12, 18, 36)
+_T_WIN_LIT = (255, 220, 100); _T_WIN_SAF = (70, 200, 120)
+_T_D_WOOD = (150, 100, 55); _T_D_FRM = (90, 58, 28)
+_T_D_KNOB = (220, 180, 80); _T_GOLD = (255, 205, 50)
+_T_RED = (240, 60, 40); _T_GREEN = (70, 210, 110)
+_T_GROUND = (28, 38, 58); _T_CEIL = (22, 32, 52)
+_T_WHITE = (230, 238, 252); _T_MUTED = (140, 155, 185)
+_T_MOON = (225, 230, 255); _T_BX = 128; _T_BW = 384
+
+
+def _tlerp(a, b, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(round(a[i]+(b[i]-a[i])*t) for i in range(3))
+
+
+def _tower_floor_rect(fi: int, max_f: int, y_bot: int, fh: int):
+    fy_bot = y_bot - (fi-1)*fh
+    return (_T_BX, fy_bot - fh, _T_BX + _T_BW, fy_bot)
+
+
+def _tower_draw_door(d, x1, y1, x2, y2, color, label, fh, open_pct=0.0):
+    d.rectangle([x1-2, y1-2, x2+2, y2+2], fill=_T_D_FRM)
+    if open_pct > 0:
+        vw = max(4, int((x2-x1)*(1-open_pct)))
+        d.rectangle([x1, y1, x1+vw, y2], fill=color)
+        d.rectangle([x1+vw, y1, x2, y2], fill=_T_WIN_DK)
+    else:
+        d.rectangle([x1, y1, x2, y2], fill=color)
+        pw, ph = max(2,(x2-x1)//5), max(4,(y2-y1)//5)
+        d.rectangle([x1+pw, y1+ph, x2-pw, y2-ph],
+                    outline=_tlerp(color,(0,0,0),0.2), width=1)
+    kx = x2-6 if label == "L" else x1+6
+    ky = (y1+y2)//2
+    d.ellipse([kx-3,ky-3,kx+3,ky+3], fill=_T_D_KNOB)
+    if label:
+        try:
+            from PIL import ImageFont
+            for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+                try:
+                    f = ImageFont.truetype(p, min(fh-20, 28))
+                    break
+                except Exception:
+                    f = None
+            if f:
+                bbox = d.textbbox((0,0), label, font=f)
+                tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                tx = (x1+x2)//2 - tw//2; ty = (y1+y2)//2 - th//2
+                d.text((tx+1,ty+1), label, font=f, fill=(0,0,0))
+                d.text((tx, ty), label, font=f, fill=_T_WHITE)
+        except Exception:
+            pass
+
+
+def _tower_image_sync(
+    game: dict,
+    mode: str = "voting",     # joining|voting|cashout|safe|bomb|complete
+    vote_L: int = 0, vote_R: int = 0,
+    time_left: int = 0,
+) -> Optional[bytes]:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    W, H = 640, 900
+    max_f   = game["max_floors"]
+    cur_f   = game["floor"]
+    history = game.get("history", [])
+    mults   = game.get("mults", TOWER_MULTS)
+
+    img = Image.new("RGB", (W, H), _T_S_TOP)
+    d   = ImageDraw.Draw(img)
+
+    # Sky gradient
+    for y in range(H):
+        c = _tlerp(_T_S_TOP, _T_S_BOT, y/H)
+        d.line([(0,y),(W,y)], fill=c)
+
+    # Stars (deterministic)
+    rng = random.Random(7)
+    for _ in range(90):
+        sx, sy = rng.randint(0,W), rng.randint(0,H*2//3)
+        sr = rng.uniform(0.5, 2.0); sa = rng.uniform(0.2, 0.95)
+        sc = round(255*sa)
+        d.ellipse([sx-sr,sy-sr,sx+sr,sy+sr], fill=(sc,sc,min(255,sc+18)))
+
+    # Moon
+    d.ellipse([565,32,610,77], fill=_T_MOON)
+    d.ellipse([575,27,618,72], fill=_T_S_TOP)
+
+    Y_GROUND = H - 60
+    Y_TOP_B  = 90 + max(0, (10-max_f)*5)
+    fh = (Y_GROUND - Y_TOP_B) // max_f
+    BR = _T_BX + _T_BW
+
+    # Side buildings
+    d.rectangle([0, Y_GROUND-280, 115, Y_GROUND], fill=_T_BLDG2)
+    d.rectangle([525, Y_GROUND-220, W, Y_GROUND], fill=_T_BLDG2)
+
+    # Ground
+    for y in range(Y_GROUND, H):
+        d.line([(0,y),(W,y)], fill=_tlerp(_T_GROUND,(18,24,38),(y-Y_GROUND)/(H-Y_GROUND)))
+
+    # Main building body
+    d.rectangle([_T_BX, Y_TOP_B, BR, Y_GROUND], fill=_T_BLDG)
+    d.rectangle([_T_BX, Y_TOP_B-8, BR, Y_TOP_B], fill=_tlerp(_T_BLDG,(0,0,0),0.3))
+
+    # Draw floors
+    for fi in range(1, max_f+1):
+        x1, y1, x2, y2 = _tower_floor_rect(fi, max_f, Y_GROUND, fh)
+        fh_real = y2 - y1
+        mid = (x1+x2)//2
+
+        # Classify floor
+        if fi < cur_f:
+            hist = history[fi-1] if fi-1 < len(history) else {}
+            st = "safe"; vd = hist.get("voted"); bd = hist.get("bomb")
+        elif fi == cur_f:
+            st = mode; vd = None
+            last = history[-1] if history and mode in ("safe","bomb") else {}
+            if mode in ("safe","bomb"):
+                vd = last.get("voted"); bd2 = last.get("bomb")
+            else:
+                bd2 = None
+            bd = bd2 if mode in ("safe","bomb") else None
+        else:
+            st = "future"; vd = None; bd = None
+
+        # Floor background
+        bg = _T_BLDG if st not in ("safe",) else _tlerp(_T_BLDG, _T_WIN_SAF, 0.18)
+        d.rectangle([x1,y1,x2,y2], fill=bg)
+        d.rectangle([x1,y1,x2,y1+5], fill=_tlerp(_T_CEIL,(0,0,0),0.3))
+        d.line([(x1,y2),(x2,y2)], fill=_T_F_LINE, width=2)
+
+        # Door zone
+        door_w = 76; door_x1 = mid - door_w//2; door_x2 = mid + door_w//2
+        dh = max(24, fh_real-14); dy1 = y1+(fh_real-dh)//2+2; dy2 = dy1+dh
+        win_h = max(16, fh_real-22); win_w = 28
+        win_y = y1+(fh_real-win_h)//2+3
+
+        # Windows
+        wc = (_T_WIN_LIT if st == "safe"
+              else _T_WIN_DK if st in ("future","joining")
+              else _tlerp(_T_WIN_DK, _T_WIN_LIT, 0.55))
+        for wx in [x1+10, x1+10+win_w+8, x1+10+2*(win_w+8)]:
+            if wx+win_w < door_x1-4:
+                d.rectangle([wx,win_y,wx+win_w,win_y+win_h], fill=wc)
+        for wx in [door_x2+10, door_x2+10+win_w+8, door_x2+10+2*(win_w+8)]:
+            if wx+win_w < x2-4:
+                d.rectangle([wx,win_y,wx+win_w,win_y+win_h], fill=wc)
+
+        # Doors
+        lx1,lx2 = door_x1, mid-2; rx1,rx2 = mid+2, door_x2
+        if st in ("voting","joining","cashout"):
+            show_lbl = (st == "voting" and fi == cur_f)
+            _tower_draw_door(d, lx1,dy1,lx2,dy2, _T_D_WOOD, "L" if show_lbl else None, fh_real)
+            _tower_draw_door(d, rx1,dy1,rx2,dy2, _tlerp(_T_D_WOOD,(30,0,0),0.15), "R" if show_lbl else None, fh_real)
+        elif st == "safe" and fi == cur_f:
+            lc = _T_GREEN if vd=="L" and bd!="L" else (_T_RED if bd=="L" else _T_D_WOOD)
+            rc = _T_GREEN if vd=="R" and bd!="R" else (_T_RED if bd=="R" else _T_D_WOOD)
+            _tower_draw_door(d, lx1,dy1,lx2,dy2, lc, None, fh_real, 0.55 if lc==_T_GREEN else 0)
+            _tower_draw_door(d, rx1,dy1,rx2,dy2, rc, None, fh_real, 0.55 if rc==_T_GREEN else 0)
+        elif st == "safe":  # already-cleared floor
+            _tower_draw_door(d, lx1,dy1,lx2,dy2, _tlerp(_T_WIN_SAF,_T_D_WOOD,0.5), None, fh_real)
+            _tower_draw_door(d, rx1,dy1,rx2,dy2, _T_RED, None, fh_real)
+        elif st == "bomb":
+            bx, by = mid, (dy1+dy2)//2
+            for rad in range(50,8,-10):
+                d.ellipse([bx-rad,by-rad,bx+rad,by+rad], fill=_tlerp(_T_RED,_T_GOLD,(50-rad)/50))
+            d.ellipse([bx-10,by-10,bx+10,by+10], fill=_T_WHITE)
+            rng2 = random.Random(cur_f*7+9)
+            for i in range(14):
+                ang=(i/14)*2*math.pi+rng2.uniform(-0.1,0.1); ln=rng2.uniform(20,45)
+                d.line([(bx+math.cos(ang)*18,by+math.sin(ang)*18),
+                        (bx+math.cos(ang)*(18+ln),by+math.sin(ang)*(18+ln))],
+                       fill=_T_GOLD, width=2)
+        else:  # future
+            d.rectangle([lx1,dy1,lx2,dy2], fill=_tlerp(_T_BLDG,_T_D_WOOD,0.18))
+            d.rectangle([rx1,dy1,rx2,dy2], fill=_tlerp(_T_BLDG,_T_D_WOOD,0.15))
+
+        # Multiplier badge (left of cleared floors)
+        if fi < cur_f:
+            mi = mults[fi-1]
+            lbl = f"x{mi:.1f}"
+            try:
+                from PIL import ImageFont
+                for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+                    try: fnt = ImageFont.truetype(p, 10); break
+                    except: fnt = None
+                if fnt: d.text((_T_BX-48,(y1+y2)//2-6), lbl, font=fnt, fill=_T_GREEN)
+            except Exception: pass
+
+        # Floor number label (right side)
+        try:
+            from PIL import ImageFont
+            for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+                try: fnt = ImageFont.truetype(p, 10); break
+                except: fnt = None
+            if fnt: d.text((BR+8,(y1+y2)//2-6), f"F{fi}", font=fnt, fill=_T_MUTED)
+        except Exception: pass
+
+    # Active floor glow
+    if mode in ("voting","cashout") and 1 <= cur_f <= max_f:
+        ax1,ay1,ax2,ay2 = _tower_floor_rect(cur_f, max_f, Y_GROUND, fh)
+        for i in range(5,0,-1):
+            c = _tlerp(_T_BLDG, _T_GOLD, i/6 * 0.9)
+            d.rectangle([ax1-i,ay1-i,ax2+i,ay2+i], outline=c, width=1)
+
+    # Progress bar (right edge)
+    pbx, pby, pbh = W-12, Y_TOP_B, Y_GROUND-Y_TOP_B
+    d.rectangle([pbx,pby,pbx+6,pby+pbh], fill=_tlerp(_T_BLDG,(0,0,0),0.2))
+    if cur_f > 1:
+        filled = round(pbh*(cur_f-1)/max(1,max_f-1))
+        d.rectangle([pbx,pby+pbh-filled,pbx+6,pby+pbh], fill=_T_GREEN)
+
+    # Timer bar (bottom of image)
+    if mode == "voting" and TOWER_VOTE_SECS > 0:
+        tbx, tby, tbw = 30, Y_GROUND+18, W-60
+        d.rounded_rectangle([tbx,tby,tbx+tbw,tby+6], radius=3, fill=_T_BLDG)
+        pct = max(0, time_left/TOWER_VOTE_SECS)
+        fw = round(tbw*pct)
+        if fw > 4:
+            d.rounded_rectangle([tbx,tby,tbx+fw,tby+6], radius=3,
+                                 fill=_tlerp(_T_RED,_T_GOLD,pct))
+    elif mode == "cashout":
+        tbx, tby, tbw = 30, Y_GROUND+18, W-60
+        d.rounded_rectangle([tbx,tby,tbx+tbw,tby+6], radius=3, fill=_T_BLDG)
+        pct = max(0, time_left/TOWER_CASH_SECS)
+        fw = round(tbw*pct)
+        if fw > 4:
+            d.rounded_rectangle([tbx,tby,tbx+fw,tby+6], radius=3,
+                                 fill=_tlerp(_T_GREEN,_T_BLDG,pct))
+
+    # Header: floor + multiplier (ASCII only, always renders)
+    try:
+        from PIL import ImageFont
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+            try: fb = ImageFont.truetype(p, 38); break
+            except: fb = None
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+            try: fm = ImageFont.truetype(p, 18); break
+            except: fm = None
+        for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+            try: fs = ImageFont.truetype(p, 13); break
+            except: fs = None
+
+        cur_mult = mults[min(cur_f-1, len(mults)-1)]
+
+        # Floor label
+        txt = f"FL {cur_f}/{max_f}"
+        if fb: d.text((22,18), txt, font=fb, fill=_T_GOLD)
+
+        # Multiplier badge
+        ms = f"x{cur_mult:.2f}"
+        col = (_T_RED if mode == "bomb" else
+               _T_GREEN if mode in ("safe","complete") else _T_GOLD)
+        if fm:
+            bbox = d.textbbox((0,0), ms, font=fm)
+            tw = bbox[2]-bbox[0]
+            bx2 = W-tw-30
+            d.rounded_rectangle([bx2-10,18,bx2+tw+10,44], radius=8,
+                                 fill=_tlerp(_T_BLDG,col,0.3))
+            d.text((bx2,22), ms, font=fm, fill=col)
+
+        # Vote counts
+        if mode == "voting" and fs:
+            vc = f"L:{vote_L}   R:{vote_R}   ({time_left}s)"
+            d.text((22,62), vc, font=fs, fill=_T_WHITE)
+        elif mode == "cashout" and fs:
+            d.text((22,62), f"CASHOUT! ({time_left}s)", font=fs, fill=_T_GREEN)
+        elif mode == "joining" and fs:
+            d.text((22,62), "JOIN! Place your bet", font=fs, fill=_T_GREEN)
+        elif mode == "bomb" and fs:
+            d.text((22,62), "BOOM! GAME OVER", font=fs, fill=_T_RED)
+        elif mode == "complete" and fs:
+            d.text((22,62), "COMPLETE! All floors cleared!", font=fs, fill=_T_GREEN)
+
+    except Exception:
+        pass
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ── Tower caption builders ────────────────────────────
+
+def _tower_join_caption(game: dict) -> str:
+    players = game["players"]
+    total   = sum(p["bet"] for p in players.values())
+    remain  = max(0, int((game["join_deadline"] - datetime.now()).total_seconds()))
+    mults   = game.get("mults", TOWER_MULTS)
+    max_f   = game["max_floors"]
+
+    floors_str = "  ".join(f"x{mults[i]:.1f}" for i in range(min(max_f, len(mults))))
+    plist = "\n".join(
+        f"  • {mention(uid, p['name'])} — <code>{fmt(p['bet'])}</code> VRF"
+        for uid, p in list(players.items())[:10]
+    ) or "  <i>Пока нет участников</i>"
+    if len(players) > 10:
+        plist += f"\n  <i>+{len(players)-10} ещё</i>"
+
+    return (
+        f"🏢 <b>БАШНЯ — набор игроков</b>\n"
+        f"<i>Выбери дверь и поднимайся по этажам!</i>\n\n"
+        f"<blockquote expandable>📊 Множители:\n{floors_str}\n\n"
+        f"💰 Банк: <b>{fmt(total)} VRF</b>\n\n{plist}</blockquote>\n"
+        f"⏱ До старта: <b>{remain} сек</b> — ставь и жди!"
+    )
+
+
+def _tower_vote_caption(game: dict, vote_L: int, vote_R: int, time_left: int) -> str:
+    cur_f   = game["floor"]
+    mults   = game.get("mults", TOWER_MULTS)
+    cur_m   = mults[min(cur_f-1, len(mults)-1)]
+    players = game["players"]
+
+    in_p    = [(uid, p) for uid, p in players.items() if not p["cashed"]]
+    cash_p  = [(uid, p) for uid, p in players.items() if p["cashed"]]
+
+    in_list = "\n".join(
+        f"  🟢 {p['name']} — <code>{fmt(p['bet'])}</code> → <b>{fmt(round(p['bet']*cur_m))}</b>"
+        for uid, p in in_p[:6]
+    ) or "  —"
+    cash_list = "\n".join(
+        f"  💰 {p['name']} — x{p['cash_mult']:.2f} → <b>+{fmt(p['payout'])}</b>"
+        for uid, p in cash_p[:4]
+    )
+
+    total_L = vote_L; total_R = vote_R
+    bar_w = 10
+    l_bars = round(bar_w * total_L / max(1, total_L+total_R))
+    votes_bar = "🔵"*l_bars + "🔴"*(bar_w-l_bars)
+
+    parts = [
+        f"🏢 <b>БАШНЯ — Этаж {cur_f}/{game['max_floors']}</b>  <code>x{cur_m:.2f}</code>\n",
+        f"{votes_bar}  <b>Л:{total_L}</b> vs <b>П:{total_R}</b>\n",
+        f"<blockquote>🟢 В игре:\n{in_list}</blockquote>",
+    ]
+    if cash_list:
+        parts.append(f"<blockquote expandable>💰 Забрали:\n{cash_list}</blockquote>")
+    return "".join(parts) + "\n👇 <b>Голосуй и забирай!</b>"
+
+
+def _tower_cashout_caption(game: dict, time_left: int) -> str:
+    cur_f = game["floor"]
+    mults = game.get("mults", TOWER_MULTS)
+    prev_m = mults[min(cur_f-2, len(mults)-1)] if cur_f > 1 else mults[0]
+    next_m = mults[min(cur_f-1, len(mults)-1)]
+    in_p   = [p for p in game["players"].values() if not p["cashed"]]
+    return (
+        f"✅ <b>Этаж {cur_f-1} — БЕЗОПАСНО!</b>\n\n"
+        f"Текущий множитель: <b>x{prev_m:.2f}</b>\n"
+        f"Следующий этаж: <b>x{next_m:.2f}</b>\n\n"
+        f"🚪 Успей забрать до голосования — <b>{time_left}с</b>\n"
+        f"👥 Ещё в игре: <b>{len(in_p)}</b> игроков"
+    )
+
+
+def _tower_result_cards(game: dict, crash_floor: int = None) -> tuple:
+    mults = game.get("mults", TOWER_MULTS)
+    winners = []
+    losers  = []
+    for uid, p in game["players"].items():
+        if p["cashed"]:
+            winners.append((p["name"], p["cash_mult"], p["payout"]))
+        else:
+            losers.append((p["name"], p["bet"]))
+
+    if crash_floor:
+        header = f"<h2>💥 Башня — взрыв на этаже {crash_floor}!</h2>"
+    else:
+        m = mults[min(game["floor"]-1, len(mults)-1)]
+        header = f"<h2>🏆 Башня — все {game['max_floors']} этажей пройдены! x{m:.2f}</h2>"
+
+    rows = "".join(
+        f"<tr><td>💰 {n}</td><td><b>x{m:.2f}</b> <mark>+{fmt(py)}</mark></td></tr>"
+        for n, m, py in winners
+    ) + "".join(
+        f"<tr><td>💥 {n}</td><td><b>-{fmt(b)} VRF</b></td></tr>"
+        for n, b in losers
+    ) or "<tr><td colspan='2'><i>Нет участников</i></td></tr>"
+
+    rich_h = (
+        header + "<table bordered striped>" + rows + "</table>"
+        f"<blockquote>👥 Участников: <b>{len(game['players'])}</b>"
+        f"  ·  Этажей: <b>{game['floor']}</b></blockquote>"
+    )
+    win_lines = "\n".join(f"💰 {n} — x{m:.2f} → +{fmt(py)} VRF" for n,m,py in winners) or "—"
+    lose_lines = "\n".join(f"💥 {n} — -{fmt(b)} VRF" for n,b in losers) or "—"
+    fb_h = (
+        (f"💥 <b>Башня — взрыв на этаже {crash_floor}!</b>" if crash_floor
+         else f"🏆 <b>Башня — победа! Все этажи пройдены!</b>") + "\n\n"
+        + win_lines + "\n" + lose_lines + "\n\n🏢 /tower"
+    )
+    return rich_h, fb_h
+
+
+# ── Tower keyboards ───────────────────────────────────
+
+def _tower_join_kb(cid: int) -> InlineKeyboardMarkup:
+    row1 = [SBtn(f"{a} VRF", style="primary", callback_data=f"tw:join:{cid}:{a}")
+            for a in TOWER_BET_PRESETS[:3]]
+    row2 = [SBtn(f"{a} VRF", style="primary", callback_data=f"tw:join:{cid}:{a}")
+            for a in TOWER_BET_PRESETS[3:]]
+    return InlineKeyboardMarkup([
+        row1, row2,
+        [SBtn("✏️ Своя сумма", style="primary", callback_data=f"tw:custom:{cid}")],
+    ])
+
+
+def _tower_vote_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        SBtn("🚪 Левая", style="primary",  callback_data=f"tw:L:{cid}"),
+        SBtn("🚪 Правая", style="primary", callback_data=f"tw:R:{cid}"),
+    ], [
+        SBtn("💰 Забрать", style="success", callback_data=f"tw:cash:{cid}"),
+    ]])
+
+
+def _tower_cashout_only_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        SBtn("💰 ЗАБРАТЬ СЕЙЧАС", style="success", callback_data=f"tw:cash:{cid}"),
+    ]])
+
+
+# ── Tower custom bet state ────────────────────────────
+tower_custom_pending: dict = {}   # key: (cid, uid)
+
+
+# ── Lifecycle functions ───────────────────────────────
+
+async def _tower_end(bot, cid: int, bomb_floor: int = None) -> None:
+    """End the game, pay cashouts, show rich result table."""
+    game = tower_games.pop(cid, None)
+    if not game:
+        return
+
+    mults = game.get("mults", TOWER_MULTS)
+
+    # Pay out players who are still in (not cashed) at bomb or complete
+    if bomb_floor:
+        # They lose — no payout needed (bet already deducted at join)
+        pass
+    else:
+        # Complete — pay at final multiplier
+        final_mult = mults[min(game["floor"]-1, len(mults)-1)]
+        for uid, p in game["players"].items():
+            if not p["cashed"]:
+                p["payout"]    = round(p["bet"] * final_mult)
+                p["cash_mult"] = final_mult
+                p["cashed"]    = True
+                await db_add_vrf(uid, cid, p["payout"])
+                await db_add_xp(uid, cid, XP_PER_WIN)
+                await db_record_game(uid, cid, won=True)
+
+    # Edit photo → bomb or complete image
+    mode = "bomb" if bomb_floor else "complete"
+    loop = asyncio.get_running_loop()
+    img  = await loop.run_in_executor(None, _tower_image_sync, game, mode)
+    light_cap = (f"💥 <b>Взрыв на этаже {bomb_floor}!</b>" if bomb_floor
+                 else "🏆 <b>Все этажи пройдены!</b>")
+    try:
+        if img:
+            await bot.edit_message_media(
+                chat_id=cid, message_id=game["msg_id"],
+                media=InputMediaPhoto(media=io.BytesIO(img),
+                                      caption=light_cap, parse_mode=ParseMode.HTML),
+            )
+        else:
+            await bot.edit_message_caption(chat_id=cid, message_id=game["msg_id"],
+                                           caption=light_cap, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
+
+    # Rich result table
+    rich_h, fb_h = _tower_result_cards(game, crash_floor=bomb_floor)
+    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h)
+
+
+async def _tower_floor_loop(bot, cid: int) -> None:
+    """
+    Run one floor: cashout window → vote window → reveal → recurse or end.
+    """
+    try:
+        game = tower_games.get(cid)
+        if not game or game["state"] == "ended":
+            return
+
+        cur_f = game["floor"]
+        mults = game.get("mults", TOWER_MULTS)
+        max_f = game["max_floors"]
+        cur_m = mults[min(cur_f-1, len(mults)-1)]
+
+        # ── Cashout window (only from floor 2+) ──────────────────────
+        if cur_f > 1:
+            game["state"] = "cashout"
+            deadline = datetime.now() + timedelta(seconds=TOWER_CASH_SECS)
+            game["cash_deadline"] = deadline
+
+            loop = asyncio.get_running_loop()
+            img  = await loop.run_in_executor(
+                None, _tower_image_sync, game, "cashout", 0, 0, TOWER_CASH_SECS)
+            try:
+                if img:
+                    await bot.edit_message_media(
+                        chat_id=cid, message_id=game["msg_id"],
+                        media=InputMediaPhoto(
+                            media=io.BytesIO(img),
+                            caption=_tower_cashout_caption(game, TOWER_CASH_SECS),
+                            parse_mode=ParseMode.HTML),
+                        reply_markup=_tower_cashout_only_kb(cid),
+                    )
+            except TelegramError:
+                pass
+
+            await asyncio.sleep(TOWER_CASH_SECS)
+            game = tower_games.get(cid)
+            if not game:
+                return
+
+        # ── Voting window ─────────────────────────────────────────────
+        game["state"]         = "voting"
+        game["voted"]         = {}
+        game["vote_deadline"] = datetime.now() + timedelta(seconds=TOWER_VOTE_SECS)
+
+        loop = asyncio.get_running_loop()
+        elapsed = 0
+        while elapsed < TOWER_VOTE_SECS:
+            game = tower_games.get(cid)
+            if not game or game["state"] != "voting":
+                return
+            remain = max(0, int((game["vote_deadline"] - datetime.now()).total_seconds()))
+            votes  = game.get("voted", {})
+            vL = sum(1 for v in votes.values() if v == "L")
+            vR = sum(1 for v in votes.values() if v == "R")
+            img = await loop.run_in_executor(
+                None, _tower_image_sync, game, "voting", vL, vR, remain)
+            try:
+                if img:
+                    await bot.edit_message_media(
+                        chat_id=cid, message_id=game["msg_id"],
+                        media=InputMediaPhoto(
+                            media=io.BytesIO(img),
+                            caption=_tower_vote_caption(game, vL, vR, remain),
+                            parse_mode=ParseMode.HTML),
+                        reply_markup=_tower_vote_kb(cid),
+                    )
+            except TelegramError:
+                pass
+            await asyncio.sleep(TOWER_TICK)
+            elapsed += TOWER_TICK
+
+        # ── Determine result ──────────────────────────────────────────
+        game = tower_games.get(cid)
+        if not game or game["state"] != "voting":
+            return
+
+        votes = game.get("voted", {})
+        vL = sum(1 for v in votes.values() if v == "L")
+        vR = sum(1 for v in votes.values() if v == "R")
+
+        # Majority decision (tie → random)
+        if vL > vR:
+            chosen = "L"
+        elif vR > vL:
+            chosen = "R"
+        else:
+            chosen = random.choice(["L", "R"])
+
+        bomb = game["bomb_doors"][cur_f - 1]
+        safe = (chosen != bomb)
+
+        game["history"].append({"voted": chosen, "bomb": bomb, "safe": safe})
+
+        if safe:
+            # Update to safe image
+            img = await loop.run_in_executor(None, _tower_image_sync, game, "safe")
+            try:
+                if img:
+                    await bot.edit_message_media(
+                        chat_id=cid, message_id=game["msg_id"],
+                        media=InputMediaPhoto(
+                            media=io.BytesIO(img),
+                            caption=f"✅ <b>Этаж {cur_f} — безопасно!</b> Поднимаемся...",
+                            parse_mode=ParseMode.HTML),
+                        reply_markup=None,
+                    )
+            except TelegramError:
+                pass
+
+            await asyncio.sleep(2)
+
+            # Award XP for surviving
+            for uid in game["players"]:
+                if not game["players"][uid]["cashed"]:
+                    await db_add_xp(uid, cid, XP_PER_GAME)
+
+            # Advance floor
+            game["floor"] += 1
+
+            if game["floor"] > max_f:
+                await _tower_end(bot, cid, bomb_floor=None)
+            else:
+                await _tower_floor_loop(bot, cid)
+        else:
+            # BOOM — record losers
+            for uid, p in game["players"].items():
+                if not p["cashed"]:
+                    await db_add_xp(uid, cid, XP_PER_GAME)
+                    await db_record_game(uid, cid, won=False)
+            await _tower_end(bot, cid, bomb_floor=cur_f)
+
+    except Exception:
+        log.exception("Tower floor loop error (cid=%s)", cid)
+        tower_games.pop(cid, None)
+
+
+async def _tower_join_loop(bot, cid: int) -> None:
+    """Join phase: update photo every TOWER_TICK seconds, then launch floor 1."""
+    try:
+        loop = asyncio.get_running_loop()
+        while True:
+            game = tower_games.get(cid)
+            if not game or game["state"] != "joining":
+                return
+            remain = max(0, int((game["join_deadline"] - datetime.now()).total_seconds()))
+            if remain <= 0:
+                break
+            await asyncio.sleep(min(TOWER_TICK, remain))
+            game = tower_games.get(cid)
+            if not game or game["state"] != "joining":
+                return
+            remain = max(0, int((game["join_deadline"] - datetime.now()).total_seconds()))
+            img = await loop.run_in_executor(None, _tower_image_sync, game, "joining")
+            try:
+                if img:
+                    await bot.edit_message_media(
+                        chat_id=cid, message_id=game["msg_id"],
+                        media=InputMediaPhoto(
+                            media=io.BytesIO(img),
+                            caption=_tower_join_caption(game),
+                            parse_mode=ParseMode.HTML),
+                        reply_markup=_tower_join_kb(cid),
+                    )
+            except TelegramError:
+                pass
+
+        game = tower_games.get(cid)
+        if not game or game["state"] != "joining":
+            return
+
+        if len(game["players"]) < 2:
+            tower_games.pop(cid, None)
+            # Refund lonely player
+            for uid, p in game["players"].items():
+                await db_add_vrf(uid, cid, p["bet"])
+            try:
+                await bot.edit_message_caption(
+                    chat_id=cid, message_id=game["msg_id"],
+                    caption="🏢 <b>Башня отменена</b> — не хватило игроков. Ставки возвращены.",
+                    parse_mode=ParseMode.HTML, reply_markup=None,
+                )
+            except TelegramError:
+                pass
+            return
+
+        game["state"] = "voting"
+        await _tower_floor_loop(bot, cid)
+
+    except Exception:
+        log.exception("Tower join loop error (cid=%s)", cid)
+        tower_games.pop(cid, None)
+
+
+# ── /tower command ────────────────────────────────────
+
+@only_groups
+async def cmd_tower(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u   = update.effective_user
+    cid = update.effective_chat.id
+
+    existing = tower_games.get(cid)
+    if existing and existing["state"] != "ended":
+        await update.message.reply_text(
+            "🏢 Башня уже идёт — <b>присоединяйся</b> к текущей игре!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+
+    # Pre-claim slot
+    tower_games[cid] = {"cid": cid, "state": "launching"}
+
+    max_f   = random.randint(6, 10)
+    mults_s = TOWER_MULTS[:max_f]
+    # Pre-generate bomb placement for each floor
+    bombs   = [random.choice(["L", "R"]) for _ in range(max_f)]
+
+    now  = datetime.now()
+    stub = {
+        "cid": cid, "state": "joining",
+        "starter_id": u.id, "starter_name": u.first_name,
+        "max_floors": max_f, "floor": 1,
+        "bomb_doors": bombs, "mults": mults_s,
+        "players": {}, "voted": {}, "history": [],
+        "join_deadline": now + timedelta(seconds=TOWER_JOIN_SECS),
+        "vote_deadline":  None,
+        "msg_id": None,
+    }
+
+    loop = asyncio.get_running_loop()
+    img  = await loop.run_in_executor(None, _tower_image_sync, stub, "joining")
+
+    try:
+        if img:
+            msg = await context.bot.send_photo(
+                chat_id=cid, photo=io.BytesIO(img),
+                caption=_tower_join_caption(stub),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_tower_join_kb(cid),
+            )
+        else:
+            msg = await context.bot.send_message(
+                cid, _tower_join_caption(stub),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_tower_join_kb(cid),
+            )
+    except TelegramError:
+        tower_games.pop(cid, None)
+        return
+
+    stub["msg_id"] = msg.message_id
+    tower_games[cid] = stub
+    context.application.create_task(_tower_join_loop(context.bot, cid))
+
 def main() -> None:
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN environment variable is not set!")
@@ -7057,6 +8284,7 @@ def main() -> None:
     app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
     app.add_handler(CommandHandler("crash",     cmd_crash))
+    app.add_handler(CommandHandler("tower",     cmd_tower))
     app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
@@ -7086,7 +8314,14 @@ def main() -> None:
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageReactionHandler(on_reaction))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    # ── Start Mini App web server in background thread ─────────────────────
+    if WEBAPP_URL or os.getenv("PORT"):
+        t = threading.Thread(target=_run_clicker_webserver, daemon=True, name="webapp-server")
+        t.start()
+        log.info("Mini App web server thread started")
 
     log.info("Starting polling...")
     app.run_polling(

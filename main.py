@@ -2325,7 +2325,8 @@ async def _crash_end(bot, cid: int, final_mult: float) -> None:
         pass
 
     rich_h, fb_h = _crash_result_cards(crash_point, winners, losers)
-    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h)
+    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h,
+                    reply_markup=_play_again_kb("crash", cid))
 
 
 # ── Background tasks ───────────────────────────────────
@@ -3448,6 +3449,16 @@ async def cmd_marriages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 #                  DUEL GAME ⚔️
 # ══════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════
+#   PLAY-AGAIN button — all bet games
+# ═══════════════════════════════════════════
+
+def _play_again_kb(game: str, cid: int, bet: int = 0) -> InlineKeyboardMarkup:
+    """Single 'Play again' row appended to any game result message."""
+    return InlineKeyboardMarkup([[SBtn("\U0001f504 \u0415\u0449\u0451 \u0440\u0430\u0437", style="success",
+                                       callback_data=f"ra:{game}:{cid}:{bet}")]])
+
+
 @only_groups
 async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     challenger = update.effective_user
@@ -3571,7 +3582,8 @@ async def _run_duel(context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
         f"🥇 {mention(w_id, w_name)} побеждает!\n"
         f"💎 +{bet} VRF → Баланс: {fmt(new_bal)} VRF"
     )
-    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h)
+    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
+                    reply_markup=_play_again_kb("duel", cid, bet))
 
     # Send message effect DM to winner for big wins
     if bet >= 200:
@@ -3733,7 +3745,8 @@ async def _run_cubes(context: ContextTypes.DEFAULT_TYPE, game: dict) -> None:
         f"🏆 <b>ПОБЕДИТЕЛЬ!</b>\n{mention(w_id, w_name)}\n"
         f"📊 {h_score}:{o_score} | 💎 +{fmt(bet)} VRF"
     )
-    await send_rich(context.bot, cid, html=cubes_rich, fallback_html=cubes_fb)
+    await send_rich(context.bot, cid, html=cubes_rich, fallback_html=cubes_fb,
+                    reply_markup=_play_again_kb("cubes", cid, bet))
 
 
 # ══════════════════════════════════════════════════════
@@ -3884,7 +3897,8 @@ async def _run_sports(context: ContextTypes.DEFAULT_TYPE, game: dict) -> None:
         f"🏆 <b>ПОБЕДИТЕЛЬ!</b>\n{mention(w_id, w_name)}\n"
         f"📊 {h_total}:{o_total} | 💎 +{fmt(bet)} VRF"
     )
-    await send_rich(context.bot, cid, html=sport_rich, fallback_html=sport_fb)
+    await send_rich(context.bot, cid, html=sport_rich, fallback_html=sport_fb,
+                    reply_markup=_play_again_kb("sport", cid, bet))
 
 
 @only_groups
@@ -5528,7 +5542,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🏆 <b>СЛОТ</b>\n{h_name}: {h_combo} ({h_mult}×)\n"
                 f"{o_name}: {o_combo} ({o_mult}×)\n\n🥇 {w_name} +{fmt(bet)} VRF"
             )
-            await send_rich(context.bot, cid, html=slot_rich, fallback_html=slot_fb)
+            await send_rich(context.bot, cid, html=slot_rich, fallback_html=slot_fb,
+                            reply_markup=_play_again_kb("slot", cid, bet))
         else:
             # One player has spun, update message
             h_status = f"✅ {parse_slot(game['h_val'])[0]}" if game["h_val"] else f"{E_WAIT} ожидает..."
@@ -6463,6 +6478,162 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Play Again 🔄 ─────────────────────────────────────────
+    if data.startswith("ra:"):
+        _, game_name, rcid_s, *rest = data.split(":")
+        rcid = int(rcid_s)
+        bet  = int(rest[0]) if rest else 0
+
+        await query.answer()
+
+        if game_name in ("crash",):
+            # Crash: start the wizard fresh
+            await query.message.reply_text(
+                "🚀 Запускай новый раунд:", parse_mode=ParseMode.HTML,
+                reply_markup=_crash_setup_mode_kb(str(uuid.uuid4())[:8]),
+            )
+            return
+
+        if game_name == "tower":
+            # Tower: send /tower hint (can't easily call cmd_tower from callback)
+            await query.message.reply_text(
+                "🏢 Новая башня:",
+                reply_markup=InlineKeyboardMarkup([[
+                    SBtn("🏢 Начать башню", style="success",
+                         callback_data=f"ra_tower:{rcid}"),
+                ]]),
+            )
+            return
+
+        if game_name == "slot":
+            # Slot PvP: show quick bet selection
+            presets = [25, 50, 100, 250, 500]
+            rows = [
+                [SBtn(f"{a} VRF", style="primary",
+                      callback_data=f"slsp:{rcid}:{who.id}:{a}")
+                 for a in presets[:3]],
+                [SBtn(f"{a} VRF", style="primary",
+                      callback_data=f"slsp:{rcid}:{who.id}:{a}")
+                 for a in presets[3:]],
+            ]
+            await query.message.reply_text(
+                "🎰 <b>Слот-машина</b> — выбери ставку:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+
+        # PvP games (duel, cubes, sport): show bet picker + offer challenge
+        presets   = [25, 50, 100, 250, 500]
+        emoji_map = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅"}
+        icon      = emoji_map.get(game_name, "🎮")
+        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт"}
+        gname     = name_map.get(game_name, "Игра")
+
+        # Default to last bet if known, else 50
+        default_bet = bet if bet > 0 else 50
+
+        rows = [
+            [SBtn(f"{a} VRF", style="primary",
+                  callback_data=f"ra_pvp:{game_name}:{rcid}:{who.id}:{a}")
+             for a in presets[:3]],
+            [SBtn(f"{a} VRF", style="primary",
+                  callback_data=f"ra_pvp:{game_name}:{rcid}:{who.id}:{a}")
+             for a in presets[3:]],
+        ]
+        await query.message.reply_text(
+            f"{icon} <b>{gname}</b> — выбери ставку:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("ra_tower:"):
+        # Directly start a tower game from the play-again button
+        rcid = int(data.split(":")[1])
+        existing = tower_games.get(rcid)
+        if existing and existing["state"] != "ended":
+            await query.answer("Башня уже идёт! Присоединяйся.", show_alert=True)
+            return
+        await query.answer("🏢 Запускаю башню...")
+        # Spoof an Update-like object via context bot to call the tower logic
+        await db_ensure_user(who.id, rcid, who.username or "", who.first_name)
+        tower_games[rcid] = {"cid": rcid, "state": "launching"}
+        max_f = random.randint(6, 10)
+        bombs = [random.choice(["L", "R"]) for _ in range(max_f)]
+        now   = datetime.now()
+        stub  = {
+            "cid": rcid, "state": "joining",
+            "starter_id": who.id, "starter_name": who.first_name,
+            "max_floors": max_f, "floor": 1,
+            "bomb_doors": bombs, "mults": TOWER_MULTS[:max_f],
+            "players": {}, "voted": {}, "history": [],
+            "join_deadline": now + timedelta(seconds=TOWER_JOIN_SECS),
+            "vote_deadline": None, "msg_id": None,
+        }
+        loop = asyncio.get_running_loop()
+        img  = await loop.run_in_executor(None, _tower_image_sync, stub, "joining")
+        try:
+            if img:
+                msg = await context.bot.send_photo(
+                    chat_id=rcid, photo=io.BytesIO(img),
+                    caption=_tower_join_caption(stub), parse_mode=ParseMode.HTML,
+                    reply_markup=_tower_join_kb(rcid),
+                )
+            else:
+                msg = await context.bot.send_message(
+                    rcid, _tower_join_caption(stub), parse_mode=ParseMode.HTML,
+                    reply_markup=_tower_join_kb(rcid),
+                )
+        except TelegramError:
+            tower_games.pop(rcid, None)
+            return
+        stub["msg_id"] = msg.message_id
+        tower_games[rcid] = stub
+        context.application.create_task(_tower_join_loop(context.bot, rcid))
+        return
+
+    if data.startswith("ra_pvp:"):
+        # PvP play-again: post a public challenge with Accept/Decline buttons
+        parts     = data.split(":")
+        game_name = parts[1]; rcid = int(parts[2])
+        challenger_id = int(parts[3]); bet = int(parts[4])
+
+        if who.id != challenger_id:
+            await query.answer("Это не твоя кнопка!", show_alert=True)
+            return
+
+        await query.answer(f"Вызов брошен на {bet} VRF!")
+
+        cmd_map   = {"duel": "/duel", "cubes": "/cubes", "sport": "/basket"}
+        icon_map  = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅"}
+        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт"}
+        icon      = icon_map.get(game_name, "🎮")
+        gname     = name_map.get(game_name, "Игра")
+        game_id   = str(uuid.uuid4())[:8]
+
+        # Store a pending challenge
+        chal_key = f"ra:{game_id}"
+
+        if game_name == "duel":
+            duel_challenges[f"{rcid}:{challenger_id}:0"] = {
+                "cid": rcid, "c_id": challenger_id,
+                "c_name": who.first_name, "o_id": 0,
+                "bet": bet, "created": datetime.now(),
+            }
+        # For cubes/sport the opponent needs to reply via a message; just show the invite
+        await context.bot.send_message(
+            rcid,
+            f"{icon} <b>{gname}</b>\n\n"
+            f"{mention(challenger_id, who.first_name)} ищет соперника!\n"
+            f"💎 Ставка: <b>{bet} VRF</b>\n\n"
+            f"<i>Ответь на это сообщение командой "
+            f"<code>/{game_name if game_name != 'sport' else 'basket'} {bet}</code> "
+            f"чтобы принять вызов.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     # ── Crash 🚀 ──────────────────────────────────────────
     if data.startswith("cr:"):
         parts   = data.split(":")
@@ -6763,8 +6934,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 return
             game["players"][who.id] = {
                 "name": who.first_name, "bet": amount,
-                "cashed": False, "cash_floor": 0,
-                "cash_mult": 1.0, "payout": 0,
+                "alive": True, "cashed": False,
+                "cash_floor": 0, "cash_mult": 1.0, "payout": 0,
             }
             await query.answer(f"✅ Ставка {amount} VRF принята!")
             return
@@ -6807,29 +6978,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if action == "cash":
             if not game or game["state"] not in ("voting", "cashout"):
-                await query.answer("❌ Нельзя забрать сейчас!", show_alert=True)
+                await query.answer("Нельзя забрать сейчас!", show_alert=True)
                 return
             p = game["players"].get(who.id)
             if not p:
-                await query.answer("❌ Ты не в игре!", show_alert=True)
+                await query.answer("Ты не в игре!", show_alert=True)
+                return
+            if not p.get("alive", True):
+                await query.answer("Ты уже выбыл!", show_alert=True)
                 return
             if p["cashed"]:
                 await query.answer(f"Уже забрал x{p['cash_mult']:.2f}!", show_alert=True)
                 return
-            # Cashout at PREVIOUS floor's multiplier
             mults   = game.get("mults", TOWER_MULTS)
             cur_f   = game["floor"]
-            cash_f  = max(1, cur_f - (1 if game["state"] == "cashout" else 0))
-            mult    = mults[min(cash_f-1, len(mults)-1)]
-            payout  = round(p["bet"] * mult)
-            p["cashed"]    = True
-            p["cash_floor"] = cash_f
-            p["cash_mult"]  = mult
-            p["payout"]     = payout
+            # During cashout window we pay the PREVIOUS floor's mult;
+            # during voting we pay the CURRENT floor's mult
+            if game["state"] == "cashout":
+                cash_f = max(1, cur_f - 1)
+            else:
+                cash_f = cur_f
+            mult   = mults[min(cash_f-1, len(mults)-1)]
+            payout = round(p["bet"] * mult)
+            # Claim synchronously before any await
+            p["cashed"] = True; p["alive"] = False
+            p["cash_floor"] = cash_f; p["cash_mult"] = mult; p["payout"] = payout
             await db_add_vrf(who.id, tcid, payout)
             await db_add_xp(who.id, tcid, XP_PER_WIN)
             await db_record_game(who.id, tcid, won=True)
-            await query.answer(f"💰 Забрал x{mult:.2f}! +{fmt(payout)} VRF")
+            await query.answer(f"Забрал x{mult:.2f}! +{fmt(payout)} VRF")
             return
 
         await query.answer()
@@ -6891,7 +7068,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     return
                 game["players"][u.id] = {
                     "name": u.first_name, "bet": tw_amount,
-                    "cashed": False, "cash_floor": 0, "cash_mult": 1.0, "payout": 0,
+                    "alive": True, "cashed": False,
+                    "cash_floor": 0, "cash_mult": 1.0, "payout": 0,
                 }
                 await update.message.reply_text(f"✅ Ставка {tw_amount} VRF принята!")
                 return
@@ -7790,90 +7968,110 @@ def _tower_join_caption(game: dict) -> str:
     remain  = max(0, int((game["join_deadline"] - datetime.now()).total_seconds()))
     mults   = game.get("mults", TOWER_MULTS)
     max_f   = game["max_floors"]
+    mult_row = " · ".join(f"x{mults[i]:.1f}" for i in range(min(max_f, len(mults))))
 
-    floors_str = "  ".join(f"x{mults[i]:.1f}" for i in range(min(max_f, len(mults))))
-    plist = "\n".join(
-        f"  • {mention(uid, p['name'])} — <code>{fmt(p['bet'])}</code> VRF"
-        for uid, p in list(players.items())[:10]
-    ) or "  <i>Пока нет участников</i>"
-    if len(players) > 10:
-        plist += f"\n  <i>+{len(players)-10} ещё</i>"
+    plines = "\n".join(
+        f"{mention(uid, p['name'])} — {fmt(p['bet'])} VRF"
+        for uid, p in list(players.items())[:12]
+    ) or "<i>Пока никого</i>"
+    if len(players) > 12:
+        plines += f"\n<i>+{len(players)-12} ещё</i>"
 
     return (
-        f"🏢 <b>БАШНЯ — набор игроков</b>\n"
-        f"<i>Выбери дверь и поднимайся по этажам!</i>\n\n"
-        f"<blockquote expandable>📊 Множители:\n{floors_str}\n\n"
-        f"💰 Банк: <b>{fmt(total)} VRF</b>\n\n{plist}</blockquote>\n"
-        f"⏱ До старта: <b>{remain} сек</b> — ставь и жди!"
+        f"🏢 <b>БАШНЯ</b>  ·  {max_f} этажей\n"
+        f"<blockquote>{mult_row}</blockquote>\n"
+        f"Банк: <b>{fmt(total)} VRF</b>\n\n"
+        f"{plines}\n\n"
+        f"⏱ <b>{remain} сек</b> — делай ставку!"
     )
 
 
-def _tower_vote_caption(game: dict, vote_L: int, vote_R: int, time_left: int) -> str:
-    cur_f   = game["floor"]
-    mults   = game.get("mults", TOWER_MULTS)
-    cur_m   = mults[min(cur_f-1, len(mults)-1)]
-    players = game["players"]
+def _tower_vote_caption(game: dict, time_left: int) -> str:
+    cur_f  = game["floor"]
+    mults  = game.get("mults", TOWER_MULTS)
+    cur_m  = mults[min(cur_f-1, len(mults)-1)]
+    votes  = game.get("voted", {})
+    alive  = {uid: p for uid, p in game["players"].items() if p.get("alive", True) and not p["cashed"]}
 
-    in_p    = [(uid, p) for uid, p in players.items() if not p["cashed"]]
-    cash_p  = [(uid, p) for uid, p in players.items() if p["cashed"]]
+    voted_L  = [p["name"] for uid, p in alive.items() if votes.get(uid) == "L"]
+    voted_R  = [p["name"] for uid, p in alive.items() if votes.get(uid) == "R"]
+    no_vote  = [p["name"] for uid, p in alive.items() if uid not in votes]
+    cashed   = [p for p in game["players"].values() if p["cashed"]]
 
-    in_list = "\n".join(
-        f"  🟢 {p['name']} — <code>{fmt(p['bet'])}</code> → <b>{fmt(round(p['bet']*cur_m))}</b>"
-        for uid, p in in_p[:6]
-    ) or "  —"
-    cash_list = "\n".join(
-        f"  💰 {p['name']} — x{p['cash_mult']:.2f} → <b>+{fmt(p['payout'])}</b>"
-        for uid, p in cash_p[:4]
+    def _nlist(names): return ", ".join(names[:5]) + (f" +{len(names)-5}" if len(names)>5 else "")
+
+    parts = [f"🏢 <b>Этаж {cur_f}/{game['max_floors']}</b>  <code>x{cur_m:.2f}</code>  ⏱ {time_left}с\n"]
+
+    if voted_L:  parts.append(f"🚪 Левая:  {_nlist(voted_L)}")
+    if voted_R:  parts.append(f"🚪 Правая: {_nlist(voted_R)}")
+    if no_vote:  parts.append(f"<i>Не выбрали: {_nlist(no_vote)}</i>")
+
+    if cashed:
+        c_lines = "  ".join(f"{p['name']} x{p['cash_mult']:.1f}" for p in cashed[:4])
+        parts.append(f"\n💰 Забрали: {c_lines}")
+
+    return "\n".join(parts)
+
+
+def _tower_reveal_caption(game: dict, cur_f: int, bomb: str,
+                           went_up: list, eliminated: list) -> str:
+    safe_door = "Правая" if bomb == "L" else "Левая"
+    bomb_door = "Левая" if bomb == "L" else "Правая"
+    mults = game.get("mults", TOWER_MULTS)
+    cur_m = mults[min(cur_f-1, len(mults)-1)]
+
+    up_str  = ", ".join(n for _, n in went_up[:6])   or "—"
+    out_str = ", ".join(n for _, n, _ in eliminated[:6]) or "—"
+    if len(went_up) > 6:    up_str  += f" +{len(went_up)-6}"
+    if len(eliminated) > 6: out_str += f" +{len(eliminated)-6}"
+
+    next_f   = cur_f + 1
+    next_m   = mults[min(next_f-1, len(mults)-1)] if next_f <= game["max_floors"] else None
+    next_str = f"  ·  следующий x{next_m:.2f}" if next_m else ""
+
+    return (
+        f"✅ <b>Этаж {cur_f} — безопасная дверь: {safe_door}</b>\n\n"
+        f"Продолжают:  {up_str}\n"
+        f"Выбыли:      {out_str} <i>(открыли {bomb_door} 💣)</i>\n\n"
+        f"<code>x{cur_m:.2f}{next_str}</code>"
     )
-
-    total_L = vote_L; total_R = vote_R
-    bar_w = 10
-    l_bars = round(bar_w * total_L / max(1, total_L+total_R))
-    votes_bar = "🔵"*l_bars + "🔴"*(bar_w-l_bars)
-
-    parts = [
-        f"🏢 <b>БАШНЯ — Этаж {cur_f}/{game['max_floors']}</b>  <code>x{cur_m:.2f}</code>\n",
-        f"{votes_bar}  <b>Л:{total_L}</b> vs <b>П:{total_R}</b>\n",
-        f"<blockquote>🟢 В игре:\n{in_list}</blockquote>",
-    ]
-    if cash_list:
-        parts.append(f"<blockquote expandable>💰 Забрали:\n{cash_list}</blockquote>")
-    return "".join(parts) + "\n👇 <b>Голосуй и забирай!</b>"
 
 
 def _tower_cashout_caption(game: dict, time_left: int) -> str:
-    cur_f = game["floor"]
-    mults = game.get("mults", TOWER_MULTS)
+    cur_f  = game["floor"]
+    mults  = game.get("mults", TOWER_MULTS)
     prev_m = mults[min(cur_f-2, len(mults)-1)] if cur_f > 1 else mults[0]
     next_m = mults[min(cur_f-1, len(mults)-1)]
-    in_p   = [p for p in game["players"].values() if not p["cashed"]]
+    alive  = sum(1 for p in game["players"].values() if p.get("alive",True) and not p["cashed"])
     return (
-        f"✅ <b>Этаж {cur_f-1} — БЕЗОПАСНО!</b>\n\n"
-        f"Текущий множитель: <b>x{prev_m:.2f}</b>\n"
-        f"Следующий этаж: <b>x{next_m:.2f}</b>\n\n"
-        f"🚪 Успей забрать до голосования — <b>{time_left}с</b>\n"
-        f"👥 Ещё в игре: <b>{len(in_p)}</b> игроков"
+        f"✅ <b>Этаж {cur_f-1} — пройден!</b>\n\n"
+        f"Текущий:    <b>x{prev_m:.2f}</b>\n"
+        f"Следующий:  <b>x{next_m:.2f}</b>\n\n"
+        f"<b>{time_left}с</b> на выход · В игре: {alive}"
     )
 
 
-def _tower_result_cards(game: dict, crash_floor: int = None) -> tuple:
-    mults = game.get("mults", TOWER_MULTS)
+def _tower_result_cards(game: dict, bomb_floor: int = None) -> tuple:
+    mults   = game.get("mults", TOWER_MULTS)
     winners = []
     losers  = []
     for uid, p in game["players"].items():
-        if p["cashed"]:
-            winners.append((p["name"], p["cash_mult"], p["payout"]))
+        if p["cashed"] or (not p.get("alive", True) is False and p.get("payout", 0) > 0):
+            if p.get("payout", 0) > 0:
+                winners.append((p["name"], p.get("cash_mult", 1.0), p["payout"]))
+            elif p["cashed"]:
+                winners.append((p["name"], p.get("cash_mult", 1.0), p.get("payout", 0)))
         else:
             losers.append((p["name"], p["bet"]))
 
-    if crash_floor:
-        header = f"<h2>💥 Башня — взрыв на этаже {crash_floor}!</h2>"
+    if bomb_floor:
+        h2 = f"<h2>💥 Башня — мина на этаже {bomb_floor}!</h2>"
     else:
         m = mults[min(game["floor"]-1, len(mults)-1)]
-        header = f"<h2>🏆 Башня — все {game['max_floors']} этажей пройдены! x{m:.2f}</h2>"
+        h2 = f"<h2>🏆 Башня — {game['max_floors']} этажей пройдено! x{m:.2f}</h2>"
 
     rows = "".join(
-        f"<tr><td>💰 {n}</td><td><b>x{m:.2f}</b> <mark>+{fmt(py)}</mark></td></tr>"
+        f"<tr><td>🏆 {n}</td><td><b>x{m:.2f}</b> <mark>+{fmt(py)}</mark></td></tr>"
         for n, m, py in winners
     ) + "".join(
         f"<tr><td>💥 {n}</td><td><b>-{fmt(b)} VRF</b></td></tr>"
@@ -7881,16 +8079,16 @@ def _tower_result_cards(game: dict, crash_floor: int = None) -> tuple:
     ) or "<tr><td colspan='2'><i>Нет участников</i></td></tr>"
 
     rich_h = (
-        header + "<table bordered striped>" + rows + "</table>"
-        f"<blockquote>👥 Участников: <b>{len(game['players'])}</b>"
-        f"  ·  Этажей: <b>{game['floor']}</b></blockquote>"
+        h2 + "<table bordered striped>" + rows + "</table>"
+        f"<blockquote>Участников: {len(game['players'])}  ·  "
+        f"Дошли до этажа: {game['floor']}</blockquote>"
     )
-    win_lines = "\n".join(f"💰 {n} — x{m:.2f} → +{fmt(py)} VRF" for n,m,py in winners) or "—"
-    lose_lines = "\n".join(f"💥 {n} — -{fmt(b)} VRF" for n,b in losers) or "—"
     fb_h = (
-        (f"💥 <b>Башня — взрыв на этаже {crash_floor}!</b>" if crash_floor
-         else f"🏆 <b>Башня — победа! Все этажи пройдены!</b>") + "\n\n"
-        + win_lines + "\n" + lose_lines + "\n\n🏢 /tower"
+        (f"💥 <b>Мина на этаже {bomb_floor}!</b>" if bomb_floor
+         else "🏆 <b>Башня пройдена!</b>") + "\n\n"
+        + "\n".join(f"🏆 {n} x{m:.2f} +{fmt(py)} VRF" for n,m,py in winners)
+        + "\n" + "\n".join(f"💥 {n} -{fmt(b)} VRF" for n,b in losers)
+        + "\n\n🏢 /tower"
     )
     return rich_h, fb_h
 
@@ -7898,9 +8096,9 @@ def _tower_result_cards(game: dict, crash_floor: int = None) -> tuple:
 # ── Tower keyboards ───────────────────────────────────
 
 def _tower_join_kb(cid: int) -> InlineKeyboardMarkup:
-    row1 = [SBtn(f"{a} VRF", style="primary", callback_data=f"tw:join:{cid}:{a}")
+    row1 = [SBtn(f"{a}", style="primary", callback_data=f"tw:join:{cid}:{a}")
             for a in TOWER_BET_PRESETS[:3]]
-    row2 = [SBtn(f"{a} VRF", style="primary", callback_data=f"tw:join:{cid}:{a}")
+    row2 = [SBtn(f"{a}", style="primary", callback_data=f"tw:join:{cid}:{a}")
             for a in TOWER_BET_PRESETS[3:]]
     return InlineKeyboardMarkup([
         row1, row2,
@@ -7910,8 +8108,8 @@ def _tower_join_kb(cid: int) -> InlineKeyboardMarkup:
 
 def _tower_vote_kb(cid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        SBtn("🚪 Левая", style="primary",  callback_data=f"tw:L:{cid}"),
-        SBtn("🚪 Правая", style="primary", callback_data=f"tw:R:{cid}"),
+        SBtn("🚪 Левая",  style="primary",  callback_data=f"tw:L:{cid}"),
+        SBtn("🚪 Правая", style="primary",  callback_data=f"tw:R:{cid}"),
     ], [
         SBtn("💰 Забрать", style="success", callback_data=f"tw:cash:{cid}"),
     ]])
@@ -7919,7 +8117,7 @@ def _tower_vote_kb(cid: int) -> InlineKeyboardMarkup:
 
 def _tower_cashout_only_kb(cid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        SBtn("💰 ЗАБРАТЬ СЕЙЧАС", style="success", callback_data=f"tw:cash:{cid}"),
+        SBtn("💰 Забрать сейчас", style="success", callback_data=f"tw:cash:{cid}"),
     ]])
 
 
@@ -7930,58 +8128,61 @@ tower_custom_pending: dict = {}   # key: (cid, uid)
 # ── Lifecycle functions ───────────────────────────────
 
 async def _tower_end(bot, cid: int, bomb_floor: int = None) -> None:
-    """End the game, pay cashouts, show rich result table."""
+    """End game, pay out survivors/cashouts, send rich result table."""
     game = tower_games.pop(cid, None)
     if not game:
         return
 
     mults = game.get("mults", TOWER_MULTS)
 
-    # Pay out players who are still in (not cashed) at bomb or complete
-    if bomb_floor:
-        # They lose — no payout needed (bet already deducted at join)
-        pass
-    else:
-        # Complete — pay at final multiplier
-        final_mult = mults[min(game["floor"]-1, len(mults)-1)]
+    # Complete: pay out everyone still alive
+    if not bomb_floor:
+        final_m = mults[min(game["floor"]-1, len(mults)-1)]
         for uid, p in game["players"].items():
-            if not p["cashed"]:
-                p["payout"]    = round(p["bet"] * final_mult)
-                p["cash_mult"] = final_mult
-                p["cashed"]    = True
-                await db_add_vrf(uid, cid, p["payout"])
+            if p.get("alive", True) and not p["cashed"]:
+                payout = round(p["bet"] * final_m)
+                p["payout"] = payout; p["cash_mult"] = final_m
+                p["cashed"] = True;   p["alive"] = False
+                await db_add_vrf(uid, cid, payout)
                 await db_add_xp(uid, cid, XP_PER_WIN)
                 await db_record_game(uid, cid, won=True)
 
-    # Edit photo → bomb or complete image
     mode = "bomb" if bomb_floor else "complete"
     loop = asyncio.get_running_loop()
     img  = await loop.run_in_executor(None, _tower_image_sync, game, mode)
-    light_cap = (f"💥 <b>Взрыв на этаже {bomb_floor}!</b>" if bomb_floor
-                 else "🏆 <b>Все этажи пройдены!</b>")
+    cap  = (f"💥 <b>Мина на этаже {bomb_floor}!</b>" if bomb_floor
+            else "🏆 <b>Башня пройдена!</b>")
     try:
         if img:
             await bot.edit_message_media(
                 chat_id=cid, message_id=game["msg_id"],
                 media=InputMediaPhoto(media=io.BytesIO(img),
-                                      caption=light_cap, parse_mode=ParseMode.HTML),
+                                      caption=cap, parse_mode=ParseMode.HTML),
             )
         else:
-            await bot.edit_message_caption(chat_id=cid, message_id=game["msg_id"],
-                                           caption=light_cap, parse_mode=ParseMode.HTML)
+            await bot.edit_message_caption(
+                chat_id=cid, message_id=game["msg_id"],
+                caption=cap, parse_mode=ParseMode.HTML, reply_markup=None,
+            )
     except TelegramError:
         pass
 
-    # Rich result table
-    rich_h, fb_h = _tower_result_cards(game, crash_floor=bomb_floor)
-    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h)
+    rich_h, fb_h = _tower_result_cards(game, bomb_floor=bomb_floor)
+    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h,
+                    reply_markup=_play_again_kb("tower", cid))
 
 
 async def _tower_floor_loop(bot, cid: int) -> None:
     """
-    Run one floor: cashout window → vote window → reveal → recurse or end.
+    Run one floor:
+      1. Cashout window (floor 2+)
+      2. Voting window — each player votes L or R independently
+      3. Reveal: players who picked the bomb door are ELIMINATED;
+         players who picked the safe door advance.
+      4. If survivors remain → next floor; otherwise → game over.
     """
     try:
+        loop = asyncio.get_running_loop()
         game = tower_games.get(cid)
         if not game or game["state"] == "ended":
             return
@@ -7989,16 +8190,11 @@ async def _tower_floor_loop(bot, cid: int) -> None:
         cur_f = game["floor"]
         mults = game.get("mults", TOWER_MULTS)
         max_f = game["max_floors"]
-        cur_m = mults[min(cur_f-1, len(mults)-1)]
 
-        # ── Cashout window (only from floor 2+) ──────────────────────
+        # ── Cashout window (floor 2+) ─────────────────────────────────
         if cur_f > 1:
             game["state"] = "cashout"
-            deadline = datetime.now() + timedelta(seconds=TOWER_CASH_SECS)
-            game["cash_deadline"] = deadline
-
-            loop = asyncio.get_running_loop()
-            img  = await loop.run_in_executor(
+            img = await loop.run_in_executor(
                 None, _tower_image_sync, game, "cashout", 0, 0, TOWER_CASH_SECS)
             try:
                 if img:
@@ -8012,7 +8208,6 @@ async def _tower_floor_loop(bot, cid: int) -> None:
                     )
             except TelegramError:
                 pass
-
             await asyncio.sleep(TOWER_CASH_SECS)
             game = tower_games.get(cid)
             if not game:
@@ -8023,16 +8218,14 @@ async def _tower_floor_loop(bot, cid: int) -> None:
         game["voted"]         = {}
         game["vote_deadline"] = datetime.now() + timedelta(seconds=TOWER_VOTE_SECS)
 
-        loop = asyncio.get_running_loop()
         elapsed = 0
         while elapsed < TOWER_VOTE_SECS:
             game = tower_games.get(cid)
             if not game or game["state"] != "voting":
                 return
             remain = max(0, int((game["vote_deadline"] - datetime.now()).total_seconds()))
-            votes  = game.get("voted", {})
-            vL = sum(1 for v in votes.values() if v == "L")
-            vR = sum(1 for v in votes.values() if v == "R")
+            vL = sum(1 for v in game["voted"].values() if v == "L")
+            vR = sum(1 for v in game["voted"].values() if v == "R")
             img = await loop.run_in_executor(
                 None, _tower_image_sync, game, "voting", vL, vR, remain)
             try:
@@ -8041,7 +8234,7 @@ async def _tower_floor_loop(bot, cid: int) -> None:
                         chat_id=cid, message_id=game["msg_id"],
                         media=InputMediaPhoto(
                             media=io.BytesIO(img),
-                            caption=_tower_vote_caption(game, vL, vR, remain),
+                            caption=_tower_vote_caption(game, remain),
                             parse_mode=ParseMode.HTML),
                         reply_markup=_tower_vote_kb(cid),
                     )
@@ -8050,65 +8243,66 @@ async def _tower_floor_loop(bot, cid: int) -> None:
             await asyncio.sleep(TOWER_TICK)
             elapsed += TOWER_TICK
 
-        # ── Determine result ──────────────────────────────────────────
+        # ── Determine individual outcomes ─────────────────────────────
         game = tower_games.get(cid)
         if not game or game["state"] != "voting":
             return
 
-        votes = game.get("voted", {})
-        vL = sum(1 for v in votes.values() if v == "L")
-        vR = sum(1 for v in votes.values() if v == "R")
-
-        # Majority decision (tie → random)
-        if vL > vR:
-            chosen = "L"
-        elif vR > vL:
-            chosen = "R"
-        else:
-            chosen = random.choice(["L", "R"])
-
         bomb = game["bomb_doors"][cur_f - 1]
-        safe = (chosen != bomb)
+        votes = game.get("voted", {})
+        alive_before = {uid: p for uid, p in game["players"].items()
+                        if p.get("alive", True) and not p["cashed"]}
 
-        game["history"].append({"voted": chosen, "bomb": bomb, "safe": safe})
+        went_up   = []   # (uid, name)
+        eliminated = []  # (uid, name, bet)
 
-        if safe:
-            # Update to safe image
-            img = await loop.run_in_executor(None, _tower_image_sync, game, "safe")
-            try:
-                if img:
-                    await bot.edit_message_media(
-                        chat_id=cid, message_id=game["msg_id"],
-                        media=InputMediaPhoto(
-                            media=io.BytesIO(img),
-                            caption=f"✅ <b>Этаж {cur_f} — безопасно!</b> Поднимаемся...",
-                            parse_mode=ParseMode.HTML),
-                        reply_markup=None,
-                    )
-            except TelegramError:
-                pass
-
-            await asyncio.sleep(2)
-
-            # Award XP for surviving
-            for uid in game["players"]:
-                if not game["players"][uid]["cashed"]:
-                    await db_add_xp(uid, cid, XP_PER_GAME)
-
-            # Advance floor
-            game["floor"] += 1
-
-            if game["floor"] > max_f:
-                await _tower_end(bot, cid, bomb_floor=None)
+        for uid, p in alive_before.items():
+            chosen = votes.get(uid)
+            if chosen is None or chosen == bomb:
+                # No vote or chose bomb door → eliminated
+                p["alive"] = False
+                eliminated.append((uid, p["name"], p["bet"]))
+                await db_add_xp(uid, cid, XP_PER_GAME)
+                await db_record_game(uid, cid, won=False)
             else:
-                await _tower_floor_loop(bot, cid)
-        else:
-            # BOOM — record losers
-            for uid, p in game["players"].items():
-                if not p["cashed"]:
-                    await db_add_xp(uid, cid, XP_PER_GAME)
-                    await db_record_game(uid, cid, won=False)
+                # Picked safe door → advance
+                went_up.append((uid, p["name"]))
+                await db_add_xp(uid, cid, XP_PER_GAME)
+
+        game["history"].append({
+            "voted": votes, "bomb": bomb,
+            "went_up": len(went_up), "eliminated": len(eliminated),
+        })
+
+        # Show reveal image
+        game_snap = dict(game); game_snap["floor"] = cur_f
+        img = await loop.run_in_executor(None, _tower_image_sync, game_snap, "safe")
+        reveal_cap = _tower_reveal_caption(game, cur_f, bomb, went_up, eliminated)
+        try:
+            if img:
+                await bot.edit_message_media(
+                    chat_id=cid, message_id=game["msg_id"],
+                    media=InputMediaPhoto(media=io.BytesIO(img),
+                                         caption=reveal_cap, parse_mode=ParseMode.HTML),
+                    reply_markup=None,
+                )
+        except TelegramError:
+            pass
+
+        await asyncio.sleep(3)
+
+        # Check survivors
+        if not went_up:
+            # All eliminated — game over
             await _tower_end(bot, cid, bomb_floor=cur_f)
+            return
+
+        # Advance
+        game["floor"] += 1
+        if game["floor"] > max_f:
+            await _tower_end(bot, cid, bomb_floor=None)
+        else:
+            await _tower_floor_loop(bot, cid)
 
     except Exception:
         log.exception("Tower floor loop error (cid=%s)", cid)
@@ -8116,7 +8310,6 @@ async def _tower_floor_loop(bot, cid: int) -> None:
 
 
 async def _tower_join_loop(bot, cid: int) -> None:
-    """Join phase: update photo every TOWER_TICK seconds, then launch floor 1."""
     try:
         loop = asyncio.get_running_loop()
         while True:
@@ -8151,13 +8344,12 @@ async def _tower_join_loop(bot, cid: int) -> None:
 
         if len(game["players"]) < 2:
             tower_games.pop(cid, None)
-            # Refund lonely player
             for uid, p in game["players"].items():
                 await db_add_vrf(uid, cid, p["bet"])
             try:
                 await bot.edit_message_caption(
                     chat_id=cid, message_id=game["msg_id"],
-                    caption="🏢 <b>Башня отменена</b> — не хватило игроков. Ставки возвращены.",
+                    caption="🏢 Башня отменена — мало игроков. Ставки возвращены.",
                     parse_mode=ParseMode.HTML, reply_markup=None,
                 )
             except TelegramError:
@@ -8182,48 +8374,37 @@ async def cmd_tower(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     existing = tower_games.get(cid)
     if existing and existing["state"] != "ended":
         await update.message.reply_text(
-            "🏢 Башня уже идёт — <b>присоединяйся</b> к текущей игре!",
-            parse_mode=ParseMode.HTML,
-        )
+            "🏢 Башня уже идёт — присоединяйся!", parse_mode=ParseMode.HTML)
         return
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
-
-    # Pre-claim slot
     tower_games[cid] = {"cid": cid, "state": "launching"}
 
     max_f   = random.randint(6, 10)
-    mults_s = TOWER_MULTS[:max_f]
-    # Pre-generate bomb placement for each floor
     bombs   = [random.choice(["L", "R"]) for _ in range(max_f)]
-
-    now  = datetime.now()
-    stub = {
+    now     = datetime.now()
+    stub    = {
         "cid": cid, "state": "joining",
         "starter_id": u.id, "starter_name": u.first_name,
         "max_floors": max_f, "floor": 1,
-        "bomb_doors": bombs, "mults": mults_s,
+        "bomb_doors": bombs, "mults": TOWER_MULTS[:max_f],
         "players": {}, "voted": {}, "history": [],
         "join_deadline": now + timedelta(seconds=TOWER_JOIN_SECS),
-        "vote_deadline":  None,
-        "msg_id": None,
+        "vote_deadline": None, "msg_id": None,
     }
 
     loop = asyncio.get_running_loop()
     img  = await loop.run_in_executor(None, _tower_image_sync, stub, "joining")
-
     try:
         if img:
             msg = await context.bot.send_photo(
                 chat_id=cid, photo=io.BytesIO(img),
-                caption=_tower_join_caption(stub),
-                parse_mode=ParseMode.HTML,
+                caption=_tower_join_caption(stub), parse_mode=ParseMode.HTML,
                 reply_markup=_tower_join_kb(cid),
             )
         else:
             msg = await context.bot.send_message(
-                cid, _tower_join_caption(stub),
-                parse_mode=ParseMode.HTML,
+                cid, _tower_join_caption(stub), parse_mode=ParseMode.HTML,
                 reply_markup=_tower_join_kb(cid),
             )
     except TelegramError:

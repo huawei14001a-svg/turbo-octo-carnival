@@ -6478,6 +6478,81 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Maze 🏰 ────────────────────────────────────────────
+    if data.startswith("mz:"):
+        parts  = data.split(":")
+        action = parts[1]
+
+        if action == "bet":
+            uid2, cid2, bet = int(parts[2]), int(parts[3]), int(parts[4])
+            if who.id != uid2:
+                await query.answer("Это не твоя кнопка!", show_alert=True)
+                return
+            await db_ensure_user(uid2, cid2, who.username or '', who.first_name)
+            uu2 = await db_get_user(uid2, cid2)
+            if not uu2 or uu2['vrf'] < bet:
+                await query.answer(f"❌ Нужно {bet} VRF!", show_alert=True)
+                return
+            ok = await db_deduct_vrf(uid2, cid2, bet)
+            if not ok:
+                await query.answer("❌ Недостаточно VRF!", show_alert=True)
+                return
+
+            # Start game
+            seed = random.randint(1, 9999999)
+            grid, exit_pos, optimal = _mz_generate(seed)
+            key2 = (uid2, cid2)
+            game = {
+                'uid': uid2, 'cid': cid2, 'bet': bet,
+                'grid': grid, 'px': 1, 'py': 1, 'direction': 1,
+                'hp': MAZE_HP_MAX, 'steps': 0, 'chests': 0,
+                'visited': {(1,1)}, 'optimal': optimal,
+                'exit_pos': exit_pos, 'state': 'playing', 'msg_id': None,
+            }
+            maze_games[key2] = game
+            await query.answer("🏰 Удачи в лабиринте!")
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
+            await _mz_send(context.bot, game, '')
+            return
+
+        # Navigation actions
+        uid2, cid2 = int(parts[2]), int(parts[3])
+        if who.id != uid2:
+            await query.answer("Это не твой лабиринт!", show_alert=True)
+            return
+
+        key2 = (uid2, cid2)
+        game = maze_games.get(key2)
+
+        if action == "Q":
+            if not game or game['state'] != 'playing':
+                await query.answer()
+                return
+            await query.answer("🏳 Сдался")
+            maze_games.pop(key2, None)
+            await db_add_xp(uid2, cid2, XP_PER_GAME)
+            await db_record_game(uid2, cid2, won=False)
+            try:
+                await query.edit_message_caption(
+                    caption="🏳 Покинул лабиринт. Ставка потеряна.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_mz_result_kb(cid2),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if not game or game['state'] != 'playing':
+            await query.answer("Игра уже завершена!", show_alert=True)
+            return
+
+        await query.answer()
+        await _mz_move(context.bot, game, action)
+        return
+
     # ── Play Again 🔄 ─────────────────────────────────────────
     if data.startswith("ra:"):
         _, game_name, rcid_s, *rest = data.split(":")
@@ -6485,6 +6560,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bet  = int(rest[0]) if rest else 0
 
         await query.answer()
+
+        if game_name == "maze":
+            # Start new maze — show bet selection
+            presets2 = MAZE_BET_PRESETS
+            rows_m = [
+                [SBtn(f"{a} VRF", style="primary",
+                      callback_data=f"mz:bet:{who.id}:{rcid}:{a}")
+                 for a in presets2[:3]],
+                [SBtn(f"{a} VRF", style="primary",
+                      callback_data=f"mz:bet:{who.id}:{rcid}:{a}")
+                 for a in presets2[3:]],
+            ]
+            await query.message.reply_text(
+                "🏰 <b>Новый лабиринт</b> — выбери ставку:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows_m),
+            )
+            return
 
         if game_name in ("crash",):
             # Crash: start the wizard fresh
@@ -8415,6 +8508,596 @@ async def cmd_tower(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tower_games[cid] = stub
     context.application.create_task(_tower_join_loop(context.bot, cid))
 
+
+
+# ══════════════════════════════════════════════════════
+#   ЛАБИРИНТ 🏰 — first-person dungeon crawler
+# ══════════════════════════════════════════════════════
+# Карта 13×13, первое лицо. Навигация: ↑вперёд ↓назад ←поворот ←поворот.
+# Что впереди — неизвестно до хода. Ловушки (-1♥), сундуки (+VRF), выход (победа).
+
+MAZE_MIN_BET    = 10
+MAZE_BET_PRESETS = [25, 50, 100, 250, 500]
+MAZE_HP_MAX     = 3
+MAZE_GRID_N     = 6       # rooms per side → grid = 2*6+1 = 13
+MAZE_TRAP_PCT   = 0.12    # fraction of open cells that are traps
+MAZE_CHEST_PCT  = 0.08
+
+# Payout multipliers based on efficiency (optimal_steps / actual_steps)
+MAZE_MULT = [(0.85, 2.8), (0.65, 2.2), (0.45, 1.7), (0.0, 1.2)]
+
+maze_games: dict = {}   # key: (uid, cid)
+
+# ── Direction system ──────────────────────────────────
+_MZ_FWD  = [(0,-1),(1,0),(0,1),(-1,0)]   # N E S W — (dx, dy)
+_MZ_LEFT = [(-1,0),(0,-1),(1,0),(0,1)]   # perpendicular left
+_MZ_DIR_NAMES = ['СЕВЕР ↑','ВОСТОК →','ЮГ ↓','ЗАПАД ←']
+
+def _mz_turn_left(d):  return (d + 3) % 4
+def _mz_turn_right(d): return (d + 1) % 4
+
+
+# ── Maze generation (recursive backtracking, 13×13 grid) ──
+
+def _mz_generate(seed: int) -> tuple:
+    """Returns (grid, exit_pos, optimal_steps). grid[y][x] = 'W'|'.'|'T'|'P'|'S'|'E'"""
+    G = 2 * MAZE_GRID_N + 1
+    grid = [['W'] * G for _ in range(G)]
+    rng  = random.Random(seed)
+    vis  = [[False]*MAZE_GRID_N for _ in range(MAZE_GRID_N)]
+
+    def carve(cx, cy):
+        gx, gy = 2*cx+1, 2*cy+1
+        vis[cy][cx] = True
+        grid[gy][gx] = '.'
+        dirs = [(0,-1),(1,0),(0,1),(-1,0)]; rng.shuffle(dirs)
+        for dx, dy in dirs:
+            nx, ny = cx+dx, cy+dy
+            if 0<=nx<MAZE_GRID_N and 0<=ny<MAZE_GRID_N and not vis[ny][nx]:
+                grid[gy+dy][gx+dx] = '.'   # carve passage
+                carve(nx, ny)
+
+    carve(0, 0)
+
+    # Find all open cells except start
+    open_cells = [(x,y) for y in range(G) for x in range(G)
+                  if grid[y][x] == '.' and (x,y) != (1,1)]
+    rng.shuffle(open_cells)
+
+    # Exit: far from start
+    far = sorted(open_cells, key=lambda p: abs(p[0]-1)+abs(p[1]-1), reverse=True)
+    exit_pos = far[0]
+    ex, ey = exit_pos
+    grid[ey][ex] = 'E'
+
+    # BFS for optimal steps
+    from collections import deque
+    dist = {(1,1): 0}
+    q = deque([(1,1)])
+    while q:
+        cx, cy = q.popleft()
+        for ddx, ddy in [(0,-1),(1,0),(0,1),(-1,0)]:
+            nx, ny = cx+ddx, cy+ddy
+            if 0<=nx<G and 0<=ny<G and grid[ny][nx]!='W' and (nx,ny) not in dist:
+                dist[(nx,ny)] = dist[(cx,cy)] + 1
+                q.append((nx,ny))
+    optimal = dist.get(exit_pos, 30)
+
+    # Traps and chests (avoid start, exit, and passage-only cells)
+    playable = [c for c in open_cells if c != exit_pos]
+    n_trap  = max(2, int(len(playable) * MAZE_TRAP_PCT))
+    n_chest = max(1, int(len(playable) * MAZE_CHEST_PCT))
+    idx = 0
+    for _ in range(n_trap):
+        if idx < len(playable):
+            x, y = playable[idx]; idx += 1
+            if grid[y][x] == '.':
+                grid[y][x] = rng.choice(['P','S'])
+    for _ in range(n_chest):
+        if idx < len(playable):
+            x, y = playable[idx]; idx += 1
+            if grid[y][x] == '.':
+                grid[y][x] = 'T'
+
+    return grid, exit_pos, optimal
+
+
+# ── Scene computation ─────────────────────────────────
+
+def _mz_scene(grid, px, py, direction):
+    G = len(grid)
+    fx, fy = _MZ_FWD[direction]
+    lx, ly = _MZ_LEFT[direction]
+    rx, ry = -lx, -ly
+
+    def cell(x, y):
+        if 0<=x<G and 0<=y<G: return grid[y][x]
+        return 'W'
+
+    # ahead[0..2] = cell types 1,2,3 steps forward
+    ahead = [cell(px+fx*d, py+fy*d) for d in range(1,4)]
+    # left[0..2] = wall to left at depth 0 (player pos), 1, 2
+    left  = [cell(px+lx+fx*d, py+ly+fy*d) == 'W' for d in range(0,3)]
+    right = [cell(px+rx+fx*d, py+ry+fy*d) == 'W' for d in range(0,3)]
+
+    return {'ahead': ahead, 'left': left, 'right': right}
+
+
+# ── Image renderer (first-person dungeon view) ────────
+
+_MZ_W, _MZ_H   = 640, 560
+_MZ_VT, _MZ_VB = 55, 515
+_MZ_HORIZON     = (_MZ_VT + _MZ_VB) // 2   # 285
+
+# Perspective zones: (abs_top, abs_bot, left_x, right_x)
+_MZ_Z = [
+    (_MZ_VT,      _MZ_VB,      0,   _MZ_W),
+    (_MZ_VT+42,   _MZ_VB-42,   80,  560),
+    (_MZ_VT+84,   _MZ_VB-84,  160,  480),
+    (_MZ_VT+126,  _MZ_VB-126, 240,  400),
+    (_MZ_VT+168,  _MZ_VB-168, 290,  350),
+]
+_MZ_WALL  = [(22,21,30),(44,42,56),(64,62,78),(80,77,95),(96,93,112)]
+_MZ_CEIL  = [(4,4,12),(10,9,22),(14,13,28),(18,17,34),(22,21,40)]
+_MZ_FLOR  = [(10,8,5),(24,19,12),(38,29,18),(50,39,26),(62,50,34)]
+
+
+def _mz_poly_l(d): # left trapezoid
+    t1,b1,l1,r1=_MZ_Z[d-1]; t2,b2,l2,r2=_MZ_Z[d]
+    return [(l1,t1),(l2,t2),(l2,b2),(l1,b1)]
+def _mz_poly_r(d): # right trapezoid
+    t1,b1,l1,r1=_MZ_Z[d-1]; t2,b2,l2,r2=_MZ_Z[d]
+    return [(r1,t1),(r2,t2),(r2,b2),(r1,b1)]
+def _mz_poly_c(d): # ceiling
+    t1,b1,l1,r1=_MZ_Z[d-1]; t2,b2,l2,r2=_MZ_Z[d]
+    return [(l1,t1),(r1,t1),(r2,t2),(l2,t2)]
+def _mz_poly_f(d): # floor
+    t1,b1,l1,r1=_MZ_Z[d-1]; t2,b2,l2,r2=_MZ_Z[d]
+    return [(l1,b1),(r1,b1),(r2,b2),(l2,b2)]
+
+
+def _mz_stone_wall(d, x1, y1, x2, y2, col):
+    try:
+        from PIL import ImageDraw as _D
+    except Exception:
+        return
+    _rng2 = random.Random(x1*7+y1*13+col[0])
+    h = y2 - y1
+    lines = []
+    for _ in range(max(1, h//14)):
+        lly = y1 + _rng2.randint(8, max(9,h-8))
+        llx1 = x1 + _rng2.randint(0, max(1,(x2-x1)//4))
+        llx2 = llx1 + _rng2.randint(max(1,(x2-x1)//5), max(2,(x2-x1)*3//4))
+        lines.append((lly, llx1, llx2))
+    return lines, col
+
+
+def _mz_image_sync(scene: dict, player_info: dict,
+                    event: str = "") -> Optional[bytes]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    W2, H2 = _MZ_W, _MZ_H
+    img = Image.new("RGB", (W2, H2), (0,0,0))
+    d   = ImageDraw.Draw(img)
+
+    ahead = scene['ahead']
+    left  = scene['left']
+    right = scene['right']
+
+    def is_wall(c): return c == 'W'
+    def is_open(c): return c != 'W'
+
+    # Visibility: can we see at depth d?
+    vis = [True]
+    for i in range(3):
+        vis.append(vis[i] and is_open(ahead[i]))
+
+    # ── Background ────────────────────────────────────
+    d.rectangle([0, _MZ_VT, W2, _MZ_HORIZON], fill=_MZ_CEIL[0])
+    d.rectangle([0, _MZ_HORIZON, W2, _MZ_VB],  fill=_MZ_FLOR[0])
+
+    # ── Draw back → front ────────────────────────────
+    for depth in range(3, 0, -1):
+        if not vis[depth-1]:
+            continue
+        d.polygon(_mz_poly_c(depth), fill=_MZ_CEIL[depth])
+        d.polygon(_mz_poly_f(depth), fill=_MZ_FLOR[depth])
+        if left[depth-1]:
+            d.polygon(_mz_poly_l(depth), fill=_MZ_WALL[depth])
+        if right[depth-1]:
+            d.polygon(_mz_poly_r(depth), fill=_MZ_WALL[depth])
+
+    # ── Front walls and objects ───────────────────────
+    for depth in range(1, 4):
+        if not vis[depth-1]:
+            break
+        cell = ahead[depth-1]
+        t2,b2,l2,r2 = _MZ_Z[depth]
+        wc = _MZ_WALL[depth]
+        cx = (l2+r2)//2
+
+        if is_wall(cell):
+            d.rectangle([l2,t2,r2,b2], fill=wc)
+            # Stone texture lines
+            rng2 = random.Random(l2*7+t2*13)
+            h2 = b2-t2
+            for _ in range(max(1, h2//14)):
+                lly = t2+rng2.randint(8, max(9,h2-8))
+                lx1 = l2+rng2.randint(0, max(1,(r2-l2)//4))
+                lx2 = lx1+rng2.randint(max(1,(r2-l2)//5), max(2,(r2-l2)*3//4))
+                d.line([(lx1,lly),(lx2,lly)],
+                       fill=tuple(max(0,c2-15) for c2 in wc), width=1)
+            d.line([(l2,t2),(l2,b2)], fill=tuple(min(255,c2+18) for c2 in wc), width=1)
+            break
+
+        elif cell == 'E':
+            # Exit door
+            dw = (r2-l2)//3; dh = (b2-t2)*2//3
+            dx1=cx-dw//2; dx2=cx+dw//2
+            dy1=_MZ_HORIZON-dh+dh//3; dy2=dy1+dh
+            d.rectangle([l2,t2,r2,b2], fill=_MZ_CEIL[depth])  # back wall
+            d.rectangle([dx1-4,dy1-4,dx2+4,dy2+4], fill=(55,38,18))   # frame
+            d.rectangle([dx1,dy1,dx2,dy2], fill=(95,62,28))            # door
+            for px2 in range(dx1+6, dx2-3, 10):
+                d.line([(px2,dy1+4),(px2,dy2-4)], fill=(75,48,20), width=1)
+            d.ellipse([cx+dw//5-3,_MZ_HORIZON-3,cx+dw//5+3,_MZ_HORIZON+3],fill=(200,165,45))
+            for i in range(4,0,-1):
+                g_col = (0,0,max(0,80-i*18))
+                d.rectangle([dx1-i*2,dy1-i*2,dx2+i*2,dy2+i*2], outline=g_col, width=1)
+            break
+
+        elif cell == 'T':
+            # Treasure chest
+            cw2=(r2-l2)//4; ch2=(b2-t2)//4
+            cy2=_MZ_HORIZON-ch2//2
+            d.rectangle([l2,t2,r2,b2], fill=_MZ_CEIL[depth])
+            d.rectangle([cx-cw2,cy2,cx+cw2,cy2+ch2], fill=(95,62,22))  # body
+            d.rectangle([cx-cw2,cy2-ch2//4,cx+cw2,cy2], fill=(125,82,32))  # lid
+            d.rectangle([cx-cw2,cy2-2,cx+cw2,cy2+2], fill=(175,155,45))   # band
+            d.ellipse([cx-3,cy2-ch2//8-3,cx+3,cy2-ch2//8+3], fill=(200,175,55))
+            # Sparkle
+            for ang in [0, 90, 180, 270]:
+                rad = math.radians(ang)
+                sx, sy = cx+int(math.cos(rad)*8), cy2-ch2//4+int(math.sin(rad)*8)
+                d.ellipse([sx-1,sy-1,sx+1,sy+1], fill=(255,240,100))
+            break
+
+        elif cell == 'P':
+            # Pit
+            d.rectangle([l2,t2,r2,b2], fill=_MZ_CEIL[depth])
+            pw2 = (r2-l2)//3
+            pts = [(cx-pw2,_MZ_HORIZON),(cx+pw2,_MZ_HORIZON),
+                   (cx+pw2//2,b2-6),(cx-pw2//2,b2-6)]
+            d.polygon(pts, fill=(5,3,8))
+            d.polygon(pts, outline=(140,25,18), width=2)
+            rng3 = random.Random(depth*77)
+            for _ in range(4):
+                llx = cx - pw2//2 + rng3.randint(0, pw2)
+                d.line([(llx,_MZ_HORIZON),(llx-4,b2-10)], fill=(70,12,8), width=1)
+            break
+
+        elif cell == 'S':
+            # Spikes
+            d.rectangle([l2,t2,r2,b2], fill=_MZ_CEIL[depth])
+            flo2 = b2-8
+            n_sp = max(3, (r2-l2)//16)
+            for si in range(n_sp):
+                sx2 = l2 + (r2-l2)*si//n_sp + (r2-l2)//(2*n_sp)
+                sh2 = 14 + (depth-1)*4
+                d.polygon([(sx2-4,flo2),(sx2+4,flo2),(sx2,flo2-sh2)], fill=(170,170,195))
+                d.line([(sx2,flo2),(sx2,flo2-sh2)], fill=(210,210,230), width=1)
+            break
+
+    # Depth-0 side walls (immediately beside player)
+    if left[0]:  d.polygon(_mz_poly_l(1), fill=_MZ_WALL[1])
+    if right[0]: d.polygon(_mz_poly_r(1), fill=_MZ_WALL[1])
+
+    # ── HUD ──────────────────────────────────────────
+    d.rectangle([0, 0, W2, _MZ_VT-2],    fill=(7,7,18))
+    d.rectangle([0, _MZ_VB+2, W2, H2], fill=(7,7,18))
+    d.line([(0,_MZ_VT-2),(W2,_MZ_VT-2)], fill=(38,36,52), width=1)
+    d.line([(0,_MZ_VB+2),(W2,_MZ_VB+2)], fill=(38,36,52), width=1)
+
+    pi = player_info or {}
+    direction = pi.get('direction', 0)
+    hp        = pi.get('hp', MAZE_HP_MAX)
+    steps     = pi.get('steps', 0)
+    chests    = pi.get('chests', 0)
+
+    try:
+        fb  = _cr_font(["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"], 16)
+        fsm = _cr_font(["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"], 13)
+
+        # Direction label
+        dir_lbl = ['СЕВЕР','ВОСТОК','ЮГ','ЗАПАД'][direction]
+        d.text((12, 16), dir_lbl, font=fb, fill=(190,182,225))
+
+        # HP hearts
+        for i in range(MAZE_HP_MAX):
+            hc = (200,50,60) if i < hp else (48,32,48)
+            d.text((W2-92+i*28, 16), 'HP' if i==0 else '', font=fsm, fill=(100,90,120))
+            bbox = d.textbbox((0,0),'♥',font=fb)
+            d.text((W2-72+i*28, 15), '♥', font=fb, fill=hc)
+
+        # Bottom bar
+        d.text((12, _MZ_VB+9), f'Шаг {steps}', font=fsm, fill=(140,130,165))
+        if chests:
+            d.text((150, _MZ_VB+9), f'Сундуков: {chests}', font=fsm, fill=(195,168,48))
+
+        # Event overlay
+        ev_map = {
+            'blocked':  ('ПУТЬ ЗАКРЫТ',    (210,100,45)),
+            'trap_pit': ('ЯМА! -1 ♥',      (220,55,55)),
+            'trap_spk': ('ШИПЫ! -1 ♥',     (220,55,55)),
+            'chest':    ('СОКРОВИЩЕ! +VRF', (195,168,48)),
+            'win':      ('ВЫХОД! ПОБЕДА!',  (75,215,115)),
+            'dead':     ('ВЫ ПОГИБЛИ...',   (215,38,38)),
+            'back':     ('ШАГ НАЗАД',       (140,130,175)),
+        }
+        if event in ev_map:
+            et, ec = ev_map[event]
+            bbox = d.textbbox((0,0), et, font=fb)
+            tw = bbox[2]-bbox[0]
+            ey_pos = _MZ_HORIZON - 22
+            d.rectangle([W2//2-tw//2-14, ey_pos-7, W2//2+tw//2+14, ey_pos+26],
+                        fill=(0,0,0))
+            d.rectangle([W2//2-tw//2-12, ey_pos-5, W2//2+tw//2+12, ey_pos+24],
+                        outline=ec, width=2)
+            d.text((W2//2-tw//2, ey_pos), et, font=fb, fill=ec)
+    except Exception:
+        pass
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ── Caption ───────────────────────────────────────────
+
+def _mz_caption(game: dict, event: str = "") -> str:
+    pi   = game
+    hp   = pi['hp']
+    step = pi['steps']
+    bet  = pi['bet']
+    chst = pi['chests']
+    hp_s = '♥' * hp + '🖤' * (MAZE_HP_MAX - hp)
+    dir_s = ['↑Север','→Восток','↓Юг','←Запад'][pi['direction']]
+
+    ev_line = {
+        'blocked':  '🧱 <b>Путь закрыт</b> — выбери другое направление',
+        'trap_pit': '💀 <b>ЯМА!</b> Потеряно 1 сердце',
+        'trap_spk': '⚔️ <b>ШИПЫ!</b> Потеряно 1 сердце',
+        'chest':    '💎 <b>Сокровище найдено!</b> +VRF к награде',
+        'back':     '↩️ Шаг назад',
+        'win':      '🚪 <b>ВЫХОД НАЙДЕН!</b> Ты прошёл лабиринт!',
+        'dead':     '💀 <b>ВЫ ПОГИБЛИ</b> — сердца закончились',
+        '':         '🏰 Исследуй лабиринт и найди выход',
+    }.get(event, '')
+
+    return (
+        f"🏰 <b>Лабиринт</b>  ·  {dir_s}  ·  {hp_s}\n"
+        f"<code>Шаг {step}  ·  Ставка {fmt(bet)} VRF"
+        + (f"  ·  Сундуки {chst}" if chst else "") + "</code>\n\n"
+        + ev_line
+    )
+
+
+# ── Keyboard ──────────────────────────────────────────
+
+def _mz_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
+    def b(lbl, act, style="primary"):
+        return SBtn(lbl, style=style, callback_data=f"mz:{act}:{uid}:{cid}")
+    return InlineKeyboardMarkup([
+        [b("↑  Вперёд",  "F")],
+        [b("← Повернуть","L"), b("Повернуть →","R")],
+        [b("↓  Назад",   "B", "primary")],
+        [b("🏳 Сдаться", "Q", "danger")],
+    ])
+
+
+def _mz_result_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        SBtn("🔄 Новый лабиринт", style="success",
+             callback_data=f"ra:maze:{cid}:0")
+    ]])
+
+
+# ── Game start / movement ─────────────────────────────
+
+async def _mz_send(bot, game: dict, event: str = "") -> None:
+    uid, cid = game['uid'], game['cid']
+    scene = _mz_scene(game['grid'], game['px'], game['py'], game['direction'])
+    pi = {k: game[k] for k in ('hp','steps','chests','direction')}
+    loop = asyncio.get_running_loop()
+    img  = await loop.run_in_executor(None, _mz_image_sync, scene, pi, event)
+    cap  = _mz_caption(game, event)
+    kb   = _mz_kb(uid, cid) if game['state'] == 'playing' else _mz_result_kb(cid)
+
+    try:
+        if game.get('msg_id'):
+            if img:
+                await bot.edit_message_media(
+                    chat_id=cid, message_id=game['msg_id'],
+                    media=InputMediaPhoto(media=io.BytesIO(img),
+                                         caption=cap, parse_mode=ParseMode.HTML),
+                    reply_markup=kb,
+                )
+            else:
+                await bot.edit_message_caption(
+                    chat_id=cid, message_id=game['msg_id'],
+                    caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+        else:
+            if img:
+                msg = await bot.send_photo(
+                    chat_id=cid, photo=io.BytesIO(img),
+                    caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+            else:
+                msg = await bot.send_message(
+                    cid, cap, parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+            game['msg_id'] = msg.message_id
+    except TelegramError:
+        pass
+
+
+async def _mz_end(bot, game: dict, won: bool) -> None:
+    uid, cid = game['uid'], game['cid']
+    bet      = game['bet']
+    steps    = game['steps']
+    chests   = game['chests']
+    optimal  = game['optimal']
+    key      = (uid, cid)
+
+    if won:
+        ratio = optimal / max(1, steps)
+        mult  = next(m for r, m in MAZE_MULT if ratio >= r)
+        chest_bonus = round(bet * MAZE_CHEST_PCT * chests)
+        payout = round(bet * mult) + chest_bonus
+        await db_add_vrf(uid, cid, payout)
+        await db_add_xp(uid, cid, XP_PER_WIN)
+        await db_record_game(uid, cid, won=True)
+
+        rich_h = (
+            f"<h2>🚪 Лабиринт — ПОБЕДА!</h2>"
+            f"<table bordered striped>"
+            f"<tr><td>💎 Ставка</td><td><b>{fmt(bet)} VRF</b></td></tr>"
+            f"<tr><td>📍 Шагов</td><td>{steps} <i>(мин. {optimal})</i></td></tr>"
+            f"<tr><td>💰 Множитель</td><td><b>x{mult:.1f}</b></td></tr>"
+            f"<tr><td>🎁 Сундуков</td><td>{chests} <i>(+{fmt(chest_bonus)} VRF)</i></td></tr>"
+            f"<tr><td>🏆 Итого</td><td><mark><b>+{fmt(payout)} VRF</b></mark></td></tr>"
+            f"</table>"
+        )
+        fb_h = (
+            f"🏆 <b>Лабиринт пройден!</b>\n"
+            f"Шагов: {steps} · x{mult:.1f} · +{fmt(payout)} VRF"
+        )
+    else:
+        await db_add_xp(uid, cid, XP_PER_GAME)
+        await db_record_game(uid, cid, won=False)
+        rich_h = (
+            f"<h2>💀 Лабиринт — ПОРАЖЕНИЕ</h2>"
+            f"<table bordered striped>"
+            f"<tr><td>💎 Ставка</td><td><b>-{fmt(bet)} VRF</b></td></tr>"
+            f"<tr><td>📍 Шагов</td><td>{steps}</td></tr>"
+            f"<tr><td>🎁 Сундуков</td><td>{chests}</td></tr>"
+            f"</table>"
+        )
+        fb_h = f"💀 <b>Погиб в лабиринте!</b>\n-{fmt(bet)} VRF"
+
+    maze_games.pop(key, None)
+    game['state'] = 'won' if won else 'dead'
+    event = 'win' if won else 'dead'
+    await _mz_send(bot, game, event)
+    await send_rich(bot, cid, html=rich_h, fallback_html=fb_h,
+                    reply_markup=_mz_result_kb(cid))
+
+
+async def _mz_move(bot, game: dict, action: str) -> None:
+    """Process one player action and update game state."""
+    G    = len(game['grid'])
+    px, py = game['px'], game['py']
+    d    = game['direction']
+    fx, fy = _MZ_FWD[d]
+    event = ''
+
+    if action == 'L':
+        game['direction'] = _mz_turn_left(d)
+        game['steps'] += 1
+        event = ''
+
+    elif action == 'R':
+        game['direction'] = _mz_turn_right(d)
+        game['steps'] += 1
+        event = ''
+
+    elif action == 'B':
+        nx, ny = px - fx, py - fy
+        if 0<=nx<G and 0<=ny<G and game['grid'][ny][nx] != 'W':
+            game['px'], game['py'] = nx, ny
+            game['steps'] += 1
+            event = 'back'
+        else:
+            event = 'blocked'
+
+    elif action == 'F':
+        nx, ny = px + fx, py + fy
+        if not (0<=nx<G and 0<=ny<G):
+            event = 'blocked'
+        else:
+            cell = game['grid'][ny][nx]
+            if cell == 'W':
+                event = 'blocked'
+            else:
+                game['px'], game['py'] = nx, ny
+                game['steps'] += 1
+                game['visited'].add((nx, ny))
+
+                if cell == 'E':
+                    await _mz_end(bot, game, won=True)
+                    return
+                elif cell == 'P':
+                    game['hp'] -= 1
+                    game['grid'][ny][nx] = '.'   # pit remains but no respawn trap
+                    event = 'trap_pit'
+                elif cell == 'S':
+                    game['hp'] -= 1
+                    game['grid'][ny][nx] = '.'
+                    event = 'trap_spk'
+                elif cell == 'T':
+                    game['chests'] += 1
+                    game['grid'][ny][nx] = '.'
+                    event = 'chest'
+
+                if game['hp'] <= 0:
+                    await _mz_end(bot, game, won=False)
+                    return
+
+    await _mz_send(bot, game, event)
+
+
+# ── /maze command ─────────────────────────────────────
+
+@only_groups
+async def cmd_maze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u   = update.effective_user
+    cid = update.effective_chat.id
+    key = (u.id, cid)
+
+    existing = maze_games.get(key)
+    if existing and existing['state'] == 'playing':
+        await update.message.reply_text(
+            "🏰 Ты уже в лабиринте! Используй кнопки под картинкой.")
+        return
+
+    await db_ensure_user(u.id, cid, u.username or '', u.first_name)
+
+    # Bet selection
+    rows = [
+        [SBtn(f"{a} VRF", style="primary",
+              callback_data=f"mz:bet:{u.id}:{cid}:{a}")
+         for a in MAZE_BET_PRESETS[:3]],
+        [SBtn(f"{a} VRF", style="primary",
+              callback_data=f"mz:bet:{u.id}:{cid}:{a}")
+         for a in MAZE_BET_PRESETS[3:]],
+    ]
+    uu = await db_get_user(u.id, cid)
+    bal = uu['vrf'] if uu else 0
+    await update.message.reply_text(
+        f"🏰 <b>Лабиринт</b>\n\n"
+        f"Иди вперёд и выбирай путь. Впереди — мрак.\n"
+        f"За каждым поворотом: ловушки, сокровища или выход.\n\n"
+        f"💎 Баланс: <b>{fmt(bal)} VRF</b>\n"
+        f"❤ Жизней: {MAZE_HP_MAX}\n\n"
+        f"Выбери ставку:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
 def main() -> None:
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN environment variable is not set!")
@@ -8466,6 +9149,7 @@ def main() -> None:
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
     app.add_handler(CommandHandler("crash",     cmd_crash))
     app.add_handler(CommandHandler("tower",     cmd_tower))
+    app.add_handler(CommandHandler("maze",      cmd_maze))
     app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 

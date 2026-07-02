@@ -6553,6 +6553,116 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _mz_move(context.bot, game, action)
         return
 
+    # ── Managed Bots control 🤖 ────────────────────────────
+    if data.startswith("mb:"):
+        parts  = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "add":
+            await query.answer()
+            await query.message.reply_text(
+                "Чтобы привязать ещё один бот:\n\n"
+                "1. Создай бота в @BotFather (/newbot)\n"
+                "2. Скопируй токен\n"
+                "3. Отправь: <code>/link_bot ТОКЕН</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if action == "restart" and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            # Проверяем что это бот юзера
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Это не твой бот!", show_alert=True)
+                return
+            # Получаем токен из БД
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT bot_token, bot_username FROM managed_bots WHERE bot_user_id=?",
+                    (bot_uid,)
+                ) as cur:
+                    row = await cur.fetchone()
+            if not row:
+                await query.answer("Бот не найден в БД!", show_alert=True)
+                return
+            token, uname = row
+            await query.answer("▶ Перезапускаю...")
+            _spawn_child(token, bot_uid)
+            await asyncio.sleep(2)
+            t = _managed_threads.get(bot_uid)
+            alive = t and t.is_alive()
+            name = f"@{uname}" if uname else f"ID {bot_uid}"
+            try:
+                await query.edit_message_text(
+                    f"{'✅ Бот ' + name + ' запущен!' if alive else '❌ Запустить не удалось — проверь токен в @BotFather'}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "delete" and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Это не твой бот!", show_alert=True)
+                return
+            uname = next((row[1] for row in bots if row[0] == bot_uid), "")
+            name  = f"@{uname}" if uname else f"ID {bot_uid}"
+            # Confirm button
+            await query.answer()
+            await query.message.reply_text(
+                f"⚠️ Удалить бота <b>{name}</b>?\n\n"
+                "Бот будет остановлен и удалён из системы. "
+                "Сам аккаунт бота в Telegram останется — "
+                "управляй им через @BotFather.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    SBtn("🗑 Да, удалить", style="danger",
+                         callback_data=f"mb:confirm_delete:{bot_uid}"),
+                    SBtn("Отмена", style="primary",
+                         callback_data="mb:cancel"),
+                ]]),
+            )
+            return
+
+        if action == "confirm_delete" and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Это не твой бот!", show_alert=True)
+                return
+            # Останавливаем поток (daemon — умрёт сам, но флаг снимаем)
+            t = _managed_threads.pop(bot_uid, None)
+            # Деактивируем в БД
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE managed_bots SET active=0 WHERE bot_user_id=?",
+                    (bot_uid,)
+                )
+                await db.commit()
+            await query.answer("Бот удалён из системы")
+            try:
+                await query.edit_message_text(
+                    "✅ Бот удалён. Процесс завершится автоматически.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "cancel":
+            await query.answer()
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
+            return
+
+        await query.answer()
+        return
+
     # ── Play Again 🔄 ─────────────────────────────────────────
     if data.startswith("ra:"):
         _, game_name, rcid_s, *rest = data.split(":")
@@ -9267,6 +9377,7 @@ def _register_handlers(app, is_child: bool = False) -> None:
     if not is_child:
         app.add_handler(CommandHandler("create_bot", cmd_create_bot))
         app.add_handler(CommandHandler("my_bots",    cmd_my_bots))
+        app.add_handler(CommandHandler("link_bot",   cmd_link_bot))
 
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -9278,7 +9389,7 @@ def _register_handlers(app, is_child: bool = False) -> None:
 # ── Child bot runner ──────────────────────────────────
 
 def _spawn_child(token: str, bot_uid: int) -> None:
-    """Launch a cloned game-bot in a daemon thread."""
+    """Launch a cloned game-bot in a daemon thread (fire-and-forget)."""
     t = _managed_threads.get(bot_uid)
     if t and t.is_alive():
         return
@@ -9288,19 +9399,22 @@ def _spawn_child(token: str, bot_uid: int) -> None:
         from telegram.ext import Application as _App
 
         async def _run() -> None:
-            child = _App.builder().token(token).post_init(on_startup).build()
-            _register_handlers(child, is_child=True)
-            async with child:
-                await child.start()
-                log.info("Managed bot uid=%s online", bot_uid)
-                await child.updater.start_polling(
-                    drop_pending_updates=True,
-                    allowed_updates=[
-                        "message", "callback_query", "inline_query",
-                        "message_reaction", "chat_member", "my_chat_member",
-                    ],
-                )
-                await _aio.Event().wait()   # run forever
+            try:
+                child = _App.builder().token(token).post_init(on_startup).build()
+                _register_handlers(child, is_child=True)
+                async with child:
+                    await child.start()
+                    log.info("Managed bot uid=%s online", bot_uid)
+                    await child.updater.start_polling(
+                        drop_pending_updates=True,
+                        allowed_updates=[
+                            "message", "callback_query", "inline_query",
+                            "message_reaction", "chat_member", "my_chat_member",
+                        ],
+                    )
+                    await _aio.Event().wait()
+            except Exception as exc:
+                log.exception("Managed bot uid=%s crashed: %s", bot_uid, exc)
 
         _aio.run(_run())
 
@@ -9308,6 +9422,20 @@ def _spawn_child(token: str, bot_uid: int) -> None:
     t.start()
     _managed_threads[bot_uid] = t
     log.info("Spawned thread for managed bot uid=%s", bot_uid)
+
+
+async def _spawn_child_safe(token: str, bot_uid: int, wait: float = 3.0) -> Optional[str]:
+    """Spawn a child bot and wait *wait* seconds to see if it stays alive.
+    Returns None on success, or an error string."""
+    import asyncio as _aio
+
+    _spawn_child(token, bot_uid)
+    await _aio.sleep(wait)
+
+    t = _managed_threads.get(bot_uid)
+    if not t or not t.is_alive():
+        return f"Поток завершился через {wait:.0f}с (возможно неверный токен или конфликт)"
+    return None
 
 
 # ── Managed-bot creation handler ──────────────────────
@@ -9477,21 +9605,171 @@ async def cmd_my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not bots:
         await update.message.reply_text(
             "У тебя пока нет ботов.\n\n"
-            "Используй /create_bot чтобы создать своего клона игрового бота!",
+            "Используй /create_bot — получишь кнопку для создания бота через Telegram.\n"
+            "Или привяжи готовый бот: /link_bot <b>ТОКЕН</b>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     lines = []
+    kb_rows = []
     for uid, uname, created_at in bots:
         alive  = uid in _managed_threads and _managed_threads[uid].is_alive()
         status = "🟢 работает" if alive else "🔴 остановлен"
         name   = f"@{uname}" if uname else f"ID {uid}"
         date   = created_at[:10] if created_at else "—"
         lines.append(f"• <b>{name}</b>  {status}\n  Создан: {date}")
+        if not alive:
+            kb_rows.append([SBtn(f"▶ Перезапустить {name}",
+                                 style="primary",
+                                 callback_data=f"mb:restart:{uid}")])
+        kb_rows.append([SBtn(f"🗑 Удалить {name}",
+                             style="danger",
+                             callback_data=f"mb:delete:{uid}")])
+
+    kb_rows.append([SBtn("➕ Привязать ещё", style="primary",
+                         callback_data="mb:add")])
 
     await update.message.reply_text(
         "🤖 <b>Твои игровые боты:</b>\n\n" + "\n\n".join(lines) +
         "\n\nДобавь бота в группу и назначь его администратором.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+    )
+
+
+async def cmd_link_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Привязать бота вручную: /link_bot ТОКЕН
+
+    Токен можно получить у @BotFather (/newbot → токен).
+    Один владелец — один бот.
+    """
+    u   = update.effective_user
+    msg = update.message
+
+    # Проверяем: уже есть бот?
+    existing = await _mb_by_owner(u.id)
+    if existing:
+        names = ", ".join(
+            f"@{row[1]}" if row[1] else f"ID {row[0]}"
+            for row in existing
+        )
+        await msg.reply_text(
+            f"❌ У тебя уже привязан бот: {names}\n\n"
+            "Используй /my_bots для управления.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Извлекаем токен из аргументов
+    args = context.args or []
+    if not args:
+        await msg.reply_text(
+            "❌ Укажи токен бота.\n\n"
+            "<b>Как получить токен:</b>\n"
+            "1. Открой @BotFather\n"
+            "2. Напиши /newbot\n"
+            "3. Введи имя и @username нового бота\n"
+            "4. Скопируй токен вида <code>123456:ABC...</code>\n\n"
+            "Затем отправь: <code>/link_bot 123456:ABC...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    token = args[0].strip()
+
+    # Базовая проверка формата токена
+    if ":" not in token or len(token) < 20:
+        await msg.reply_text(
+            "❌ Неверный формат токена.\n"
+            "Токен выглядит так: <code>123456789:AAHdqTcvp...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Удаляем сообщение с токеном из истории (приватность)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+
+    status_msg = await update.effective_chat.send_message(
+        "🔍 Проверяю токен...", parse_mode=ParseMode.HTML
+    )
+
+    # Проверяем токен через Bot API
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as s:
+            async with s.get(
+                f"https://api.telegram.org/bot{token}/getMe",
+                timeout=_aio.ClientTimeout(total=15),
+            ) as r:
+                data = await r.json()
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Не удалось подключиться к Telegram API: <code>{e}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not data.get("ok"):
+        err = data.get("description", "Unknown error")
+        await status_msg.edit_text(
+            f"❌ Токен не принят: <b>{err}</b>\n\n"
+            "Проверь токен в @BotFather (/mybots → API Token).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    bot_info     = data["result"]
+    bot_uid      = bot_info["id"]
+    bot_username = bot_info.get("username", "")
+    bot_name     = bot_info.get("first_name", "")
+    uname_str    = f"@{bot_username}" if bot_username else f"ID {bot_uid}"
+
+    # Проверяем: этот бот уже в системе?
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT owner_user_id FROM managed_bots WHERE bot_user_id=? AND active=1",
+            (bot_uid,)
+        ) as cur:
+            row = await cur.fetchone()
+    if row:
+        await status_msg.edit_text(
+            f"❌ Бот {uname_str} уже привязан к другому аккаунту.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await status_msg.edit_text(
+        f"✅ Токен принят: <b>{bot_name}</b> {uname_str}\n"
+        "⚙️ Запускаю бота...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Сохраняем в БД и запускаем
+    await _mb_save(bot_uid, token, bot_username, u.id)
+    error = await _spawn_child_safe(token, bot_uid)
+
+    if error:
+        await status_msg.edit_text(
+            f"⚠️ Бот сохранён, но при запуске возникла ошибка:\n"
+            f"<code>{error}</code>\n\n"
+            f"Попробуй перезапустить через /my_bots.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await status_msg.edit_text(
+        f"🎉 <b>Бот {uname_str} запущен!</b>\n\n"
+        f"<b>Что делать дальше:</b>\n"
+        f"1. Добавь <b>{uname_str}</b> в свою группу\n"
+        f"2. Назначь его <b>администратором</b> "
+        f"(иначе не сможет удалять сообщения)\n"
+        f"3. Запускай игры:\n"
+        f"   /duel /cubes /crash /tower /maze /mines /slot\n\n"
+        f"📋 Управление ботами: /my_bots",
         parse_mode=ParseMode.HTML,
     )
 

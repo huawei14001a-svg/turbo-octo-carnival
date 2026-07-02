@@ -1148,6 +1148,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         pass
                     await update.message.reply_text(new_user_msg, parse_mode=ParseMode.HTML)
 
+    # ── Константа кнопок — одинакова везде ─────────────
+    _API_URL = "https://t.me/VerifureBot?startapp=db0bc7a5f6a70d9c"
+    _MAIN_KB  = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🤖 Создать своего бота",
+                             callback_data="start:create_bot"),
+        InlineKeyboardButton("🔗 Наше API", url=_API_URL),
+    ]])
+
     if update.effective_chat.type == "private":
         rich_h = (
             "<h1>👋 Verifure Game</h1>"
@@ -1158,6 +1166,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "<li>⚔️ <b>Дуэль</b> · 🎲 <b>Кубики</b> · 🎰 <b>Слот-машина</b></li>"
             "<li>🏀 Баскетбол · ⚽ Футбол · 🎳 Боулинг · 🎯 Дартс</li>"
             "<li>💣 <b>Мины</b> <i>(соло)</i> · ❌⭕ <b>Крестики-нолики</b> · 🚢 <b>Морской Бой</b></li>"
+            "<li>💥 Краш · 🏢 Башня · 🏰 Лабиринт</li>"
             "</ul>"
             "<hr/>"
             f"<blockquote>💎 Стартовый баланс: <b>{STARTING_VRF} VRF</b></blockquote>"
@@ -1167,7 +1176,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "👋 <b>Привет! Я Verifure Game</b>\n\n"
             f"💎 Стартовый баланс: <b>{STARTING_VRF} VRF</b>\n\n"
             "⚔️ Дуэль · 🎲 Кубики · 🏀 Баскетбол · ⚽ Футбол\n"
-            "🎳 Боулинг · 🎯 Дартс · 🎰 Слот · 💣 Мины · ❌⭕ Крестики\n\n"
+            "🎳 Боулинг · 🎯 Дартс · 🎰 Слот · 💣 Мины · ❌⭕ Крестики\n"
+            "💥 Краш · 🏢 Башня · 🏰 Лабиринт\n\n"
             "📌 Добавь меня в группу и напиши /start"
         )
 
@@ -1177,19 +1187,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             settings = await _mb_get_settings(my_bot_id)
             welcome  = settings.get("welcome_text", "") if settings else ""
             if welcome:
-                # Custom welcome text set by owner
                 await update.message.reply_text(
                     welcome + "\n\n"
                     "<i>🤖 Создан через <a href=\"https://t.me/VerifureGameBot\">@VerifureGameBot</a></i>",
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
+                    reply_markup=_MAIN_KB,
                 )
                 return
-            # Append attribution to standard message
             fb_h += "\n\n<i>🤖 Создан через <a href=\"https://t.me/VerifureGameBot\">@VerifureGameBot</a></i>"
 
         await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
-                        reply_to_id=update.message.message_id)
+                        reply_to_id=update.message.message_id,
+                        reply_markup=_MAIN_KB)
         return
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
@@ -1206,9 +1216,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<li>/cubes — 🎲 Кубики <i>(ответом)</i></li>"
         "<li>/slot — 🎰 Слот PvP <i>(ответом)</i></li>"
         "<li>/mines — 💣 Мины <i>(соло)</i></li>"
-        "<li>/tictac — ❌⭕ Крестики-нолики <i>(ответом)</i></li>"
-        "<li>/seabattle — 🚢 Морской Бой <i>(ответом, PvP в ЛС)</i></li>"
-        "<li>/crash — 🚀 Краш <i>(весь чат, лови множитель!)</i></li>"
+        "<li>/crash — 💥 Краш <i>(весь чат)</i></li>"
+        "<li>/tower — 🏢 Башня · /maze — 🏰 Лабиринт</li>"
         "<li>/daily — ⚡ Ежедневный бонус</li>"
         "</ul>"
         "<footer>📖 /help — посмотреть все команды</footer>"
@@ -1216,11 +1225,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     fb_h = (
         f"👋 Привет, {mention(u.id, u.first_name)}!\n\n"
         f"💎 Баланс: <b>{fmt(bal)} VRF</b>\n\n"
-        "⚔️ /duel · 🎲 /cubes · 🎰 /slot · 💣 /mines · ❌⭕ /tictac\n"
+        "⚔️ /duel · 🎲 /cubes · 🎰 /slot · 💣 /mines\n"
+        "💥 /crash · 🏢 /tower · 🏰 /maze\n"
         "⚡ /daily · 📖 /help"
     )
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
+                    reply_to_id=update.message.message_id,
+                    reply_markup=_MAIN_KB)
 
 
 
@@ -6499,6 +6510,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ── Start callback (кнопки под /start) ──────────────────
+    if data.startswith("start:"):
+        action = data.split(":", 1)[1]
+        if action == "create_bot":
+            await query.answer()
+            # Показываем меню создания бота
+            me = context.bot.username or "VerifureGameBot"
+            newbot_url = f"https://t.me/newbot/{me}"
+            await query.message.reply_text(
+                "🤖 <b>Создай своего игрового бота!</b>\n\n"
+                "Получишь <b>полный клон</b> с играми:\n"
+                "🎲 Дуэль · Кубики · Слот · 💥 Краш · 🏢 Башня · 🏰 Лабиринт\n\n"
+                "<b>Способы:</b>\n"
+                "1️⃣ Кнопка ниже → @BotFather → создать → токен сам придёт\n"
+                "2️⃣ Создай в @BotFather вручную → <code>/link_bot ТОКЕН</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🤖 Создать через Telegram",
+                                         url=newbot_url)],
+                    [InlineKeyboardButton("🔑 Привязать токен вручную",
+                                         callback_data="mb:add")],
+                ]),
+            )
+        return
+
     # ── Maze 🏰 ────────────────────────────────────────────
     if data.startswith("mz:"):
         parts  = data.split(":")
@@ -9660,6 +9696,19 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(CommandHandler(["predlist",  "warnlist"],   cmd_warnlist))
     app.add_handler(CommandHandler(["mutelist"],                cmd_mutelist))
 
+    # ── Новые Bot API 10.x команды ────────────────────────
+    app.add_handler(CommandHandler("chatinfo",     cmd_chatinfo))
+    app.add_handler(CommandHandler("admins",       cmd_admins))
+    app.add_handler(CommandHandler("clearreacts",  cmd_clearreacts))
+    app.add_handler(CommandHandler("pin",          cmd_pin))
+    app.add_handler(CommandHandler(["unpin", "unpinall"], cmd_unpin))
+    app.add_handler(CommandHandler("setdesc",      cmd_setdesc))
+    app.add_handler(CommandHandler("settitle",     cmd_settitle))
+    app.add_handler(CommandHandler("react",        cmd_react))
+    app.add_handler(CommandHandler("invite",       cmd_invite))
+    app.add_handler(CommandHandler("botcaps",      cmd_botcaps))
+    app.add_handler(CommandHandler(["fwd", "forward"], cmd_fwd))
+
     # Managed-bot commands (parent only — children don't spawn sub-bots)
     if not is_child:
         app.add_handler(CommandHandler("create_bot", cmd_create_bot))
@@ -10179,7 +10228,268 @@ async def cmd_link_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def main() -> None:
+
+# ══════════════════════════════════════════════════════
+#   НОВЫЕ КОМАНДЫ — Bot API 10.x методы
+# ══════════════════════════════════════════════════════
+
+# ── /chatinfo — детальная инфо о чате ────────────────
+
+@only_groups
+async def cmd_chatinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Детальная информация о чате (getChat + getChatMemberCount)."""
+    cid = update.effective_chat.id
+    try:
+        chat = await context.bot.get_chat(cid)
+        count = await context.bot.get_chat_member_count(cid)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+
+    lines = [
+        f"💬 <b>{chat.title or chat.first_name or 'Чат'}</b>",
+        f"🆔 ID: <code>{cid}</code>",
+        f"👥 Участников: <b>{count}</b>",
+        f"📋 Тип: {chat.type}",
+    ]
+    if getattr(chat, "username", None):
+        lines.append(f"🔗 @{chat.username}")
+    if getattr(chat, "description", None):
+        lines.append(f"📝 {chat.description[:100]}")
+    if getattr(chat, "invite_link", None):
+        lines.append(f"🔒 Ссылка: {chat.invite_link}")
+    if getattr(chat, "slow_mode_delay", None):
+        lines.append(f"⏱ Медленный режим: {chat.slow_mode_delay}с")
+    if getattr(chat, "has_aggressive_anti_spam_enabled", None):
+        lines.append("🛡 Антиспам: ✅")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+# ── /admins — список администраторов (Bot API 10.0 return_bots) ──
+
+@only_groups
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Список администраторов чата, включая ботов (Bot API 10.0)."""
+    cid = update.effective_chat.id
+    try:
+        members = await context.bot.get_chat_administrators(cid, return_bots=True)
+    except TypeError:
+        # older PTB - no return_bots param
+        members = await context.bot.get_chat_administrators(cid)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+
+    lines = ["👮 <b>Администраторы:</b>\n"]
+    for m in members:
+        u2 = m.user
+        title = ""
+        if m.status == "creator":
+            title = "👑 Владелец"
+        elif hasattr(m, "custom_title") and m.custom_title:
+            title = f"🔹 {m.custom_title}"
+        else:
+            title = "🛡 Админ"
+        bot_tag = " 🤖" if u2.is_bot else ""
+        name = u2.first_name + (f" @{u2.username}" if u2.username else "")
+        lines.append(f"{title}: <b>{name}</b>{bot_tag}")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+# ── /clearreacts — удалить все реакции (Bot API 10.0) ──
+
+@only_groups
+async def cmd_clearreacts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удалить все реакции с указанного сообщения (ответом)."""
+    if not await is_group_or_bot_admin(update):
+        return
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("❌ Ответь на сообщение, реакции которого нужно удалить.")
+        return
+    cid = update.effective_chat.id
+    try:
+        await context.bot.do_api_request(
+            "deleteAllMessageReactions",
+            api_kwargs={"chat_id": cid, "message_id": reply.message_id}
+        )
+        await update.message.reply_text("✅ Все реакции удалены.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /pin — закрепить сообщение ──────────────────────
+
+@only_groups
+async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Закрепить сообщение (ответом). /pin [silent]"""
+    if not await is_group_or_bot_admin(update):
+        return
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("❌ Ответь на сообщение, которое нужно закрепить.")
+        return
+    silent = bool(context.args and context.args[0].lower() == "silent")
+    try:
+        await context.bot.pin_chat_message(
+            update.effective_chat.id,
+            reply.message_id,
+            disable_notification=silent,
+        )
+        await update.message.reply_text("📌 Закреплено!")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /unpin — открепить ──────────────────────────────
+
+@only_groups
+async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Открепить последнее закреплённое сообщение. /unpinall — открепить все."""
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    try:
+        if context.args and context.args[0] == "all":
+            await context.bot.unpin_all_chat_messages(cid)
+            await update.message.reply_text("📌 Все сообщения откреплены.")
+        else:
+            await context.bot.unpin_chat_message(cid)
+            await update.message.reply_text("📌 Откреплено.")
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /setdesc — изменить описание чата ──────────────
+
+@only_groups
+async def cmd_setdesc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Изменить описание группы: /setdesc Новое описание"""
+    if not await is_bot_admin(update.effective_user.id):
+        return
+    desc = " ".join(context.args or [])
+    try:
+        await context.bot.set_chat_description(update.effective_chat.id, desc or None)
+        msg = "✅ Описание удалено." if not desc else f"✅ Описание обновлено:\n{desc}"
+        await update.message.reply_text(msg)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /settitle — изменить название чата ─────────────
+
+@only_groups
+async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Изменить название группы: /settitle Новое название"""
+    if not await is_bot_admin(update.effective_user.id):
+        return
+    title = " ".join(context.args or [])
+    if not title:
+        await update.message.reply_text("❌ Укажи новое название: /settitle Название")
+        return
+    try:
+        await context.bot.set_chat_title(update.effective_chat.id, title)
+        await update.message.reply_text(f"✅ Название изменено на: <b>{title}</b>", parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /react — поставить реакцию на сообщение ────────
+
+@only_groups
+async def cmd_react(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Поставить реакцию ответом на сообщение: /react 👍"""
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("❌ Ответь на сообщение.")
+        return
+    emoji = (context.args[0] if context.args else "👍").strip()
+    try:
+        await context.bot.set_message_reaction(
+            update.effective_chat.id,
+            reply.message_id,
+            reaction=[{"type": "emoji", "emoji": emoji}],
+        )
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /invite — создать пригласительную ссылку ──────
+
+@only_groups
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Создать новую пригласительную ссылку в чат."""
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    try:
+        link_obj = await context.bot.create_chat_invite_link(cid)
+        await update.message.reply_text(
+            f"🔗 <b>Новая ссылка для вступления:</b>\n{link_obj.invite_link}",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as e:
+        await update.message.reply_text(f"❌ {e}")
+
+
+# ── /botcaps — возможности бота (getMe) ─────────────
+
+async def cmd_botcaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает возможности этого экземпляра бота."""
+    me = await context.bot.get_me()
+    caps = []
+    if getattr(me, "can_join_groups",              False): caps.append("✅ Можно добавить в группы")
+    if getattr(me, "can_read_all_group_messages",  False): caps.append("✅ Читает все сообщения")
+    if getattr(me, "supports_inline_queries",       False): caps.append("✅ Инлайн-режим")
+    if getattr(me, "can_connect_to_business",       False): caps.append("✅ Бизнес-аккаунты")
+    if getattr(me, "has_main_web_app",              False): caps.append("✅ Главный Mini App")
+    if getattr(me, "can_manage_bots",               False): caps.append("✅ Создание управляемых ботов")
+    if getattr(me, "supports_guest_queries",        False): caps.append("✅ Гостевой режим (Bot API 10.0)")
+    if getattr(me, "supports_join_request_queries", False): caps.append("✅ Обработка заявок вступления")
+
+    await update.message.reply_text(
+        f"🤖 <b>{me.first_name}</b> (@{me.username})\n"
+        f"🆔 ID: <code>{me.id}</code>\n\n"
+        "<b>Возможности:</b>\n" + ("\n".join(caps) if caps else "—"),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ── /forward — переслать сообщение в ЛС ────────────
+
+@only_groups
+async def cmd_fwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Переслать ответное сообщение себе в ЛС: /fwd"""
+    reply = update.message.reply_to_message
+    if not reply:
+        await update.message.reply_text("❌ Ответь на сообщение.")
+        return
+    uid = update.effective_user.id
+    try:
+        await context.bot.forward_message(
+            chat_id=uid,
+            from_chat_id=update.effective_chat.id,
+            message_id=reply.message_id,
+        )
+        await update.message.reply_text("📨 Переслано в ЛС!")
+    except TelegramError:
+        await update.message.reply_text(
+            "❌ Не могу переслать — сначала напиши мне в ЛС: "
+            f"<a href=\"tg://user?id={uid}\">открыть ЛС</a>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+# ── Callback: start:create_bot ──────────────────────
+# Обрабатывается в on_callback через prefix "start:"
+
+
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN environment variable is not set!")
         raise SystemExit(1)

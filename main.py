@@ -9098,38 +9098,126 @@ async def cmd_maze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
-def main() -> None:
-    if not BOT_TOKEN:
-        log.critical("BOT_TOKEN environment variable is not set!")
-        raise SystemExit(1)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+# ══════════════════════════════════════════════════════
+#   MANAGED BOTS — клоны игрового бота для других чатов
+# ══════════════════════════════════════════════════════
+# Docs: Bot API 9.6 — KeyboardButtonRequestManagedBot,
+#       ManagedBotCreated, getManagedBotToken
+#
+# Юзер пишет /create_bot → видит кнопку «Создать бота»
+# → Telegram показывает диалог создания → родительский бот
+# получает managed_bot_created → запрашивает токен через
+# getManagedBotToken → запускает клона в отдельном потоке.
+
+_managed_threads: dict = {}   # bot_user_id → threading.Thread
+
+
+# ── DB ────────────────────────────────────────────────
+
+async def db_init_managed_bots() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS managed_bots (
+                bot_user_id   INTEGER PRIMARY KEY,
+                bot_token     TEXT    NOT NULL,
+                bot_username  TEXT    DEFAULT '',
+                owner_user_id INTEGER,
+                active        INTEGER DEFAULT 1,
+                created_at    TEXT
+            )
+        """)
+        await db.commit()
+
+
+async def _mb_save(bot_uid: int, token: str, username: str, owner_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO managed_bots
+               (bot_user_id, bot_token, bot_username, owner_user_id, active, created_at)
+               VALUES (?, ?, ?, ?, 1, ?)""",
+            (bot_uid, token, username, owner_id, datetime.now().isoformat()),
+        )
+        await db.commit()
+
+
+async def _mb_all() -> list:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT bot_user_id, bot_token, bot_username, owner_user_id "
+                "FROM managed_bots WHERE active=1"
+            ) as cur:
+                return await cur.fetchall()
+    except Exception:
+        return []
+
+
+async def _mb_by_owner(owner_id: int) -> list:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT bot_user_id, bot_username, created_at "
+                "FROM managed_bots WHERE owner_user_id=? AND active=1",
+                (owner_id,),
+            ) as cur:
+                return await cur.fetchall()
+    except Exception:
+        return []
+
+
+# ── Token fetch via raw HTTP ──────────────────────────
+# PTB may not yet expose getManagedBotToken as a method,
+# so we call the Bot API directly.
+
+async def _mb_get_token(bot_uid: int) -> Optional[str]:
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as s:
+            async with s.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getManagedBotToken",
+                json={"user_id": bot_uid},
+                timeout=_aio.ClientTimeout(total=10),
+            ) as r:
+                d = await r.json()
+                if d.get("ok"):
+                    return d["result"]
+                log.warning("getManagedBotToken %s → %s", bot_uid, d.get("description"))
+    except Exception:
+        log.exception("getManagedBotToken failed for uid=%s", bot_uid)
+    return None
+
+
+# ── Handler registration (shared by parent + children) ─
+
+def _register_handlers(app, is_child: bool = False) -> None:
+    """Register all handlers on *app*. Children skip create_bot / my_bots."""
 
     # Core
     app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("help",     cmd_help))
 
-    # Profile
-    app.add_handler(CommandHandler("profile", cmd_profile))
-    app.add_handler(CommandHandler("statsimg",  cmd_statsimg))
-    app.add_handler(CommandHandler("activity",  cmd_activity))
-    app.add_handler(CommandHandler("top",     cmd_top))
+    # Profile / stats
+    app.add_handler(CommandHandler("profile",  cmd_profile))
+    app.add_handler(CommandHandler("statsimg", cmd_statsimg))
+    app.add_handler(CommandHandler("activity", cmd_activity))
+    app.add_handler(CommandHandler("top",      cmd_top))
     app.add_handler(CommandHandler(["leaderboard", "lb"], cmd_top))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
-    app.add_handler(CommandHandler("daily",   cmd_daily))
-    app.add_handler(CommandHandler("bonus",   cmd_bonus))
-    app.add_handler(CommandHandler("ref",     cmd_ref))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("daily",    cmd_daily))
+    app.add_handler(CommandHandler("bonus",    cmd_bonus))
+    app.add_handler(CommandHandler("ref",      cmd_ref))
 
-    # Inline mode (@BotName in any chat)
+    # Inline
     app.add_handler(InlineQueryHandler(on_inline_query))
 
     # Marriage
-    app.add_handler(CommandHandler("marry",    cmd_marry))
-    app.add_handler(CommandHandler("accept",   cmd_accept))
-    app.add_handler(CommandHandler("reject",   cmd_reject))
-    app.add_handler(CommandHandler("divorce",  cmd_divorce))
-    app.add_handler(CommandHandler("marriage", cmd_marriage))
-    app.add_handler(CommandHandler("marriages",cmd_marriages))
+    app.add_handler(CommandHandler("marry",     cmd_marry))
+    app.add_handler(CommandHandler("accept",    cmd_accept))
+    app.add_handler(CommandHandler("reject",    cmd_reject))
+    app.add_handler(CommandHandler("divorce",   cmd_divorce))
+    app.add_handler(CommandHandler("marriage",  cmd_marriage))
+    app.add_handler(CommandHandler("marriages", cmd_marriages))
 
     # Social
     app.add_handler(CommandHandler("gift",    cmd_gift))
@@ -9137,21 +9225,21 @@ def main() -> None:
     app.add_handler(CommandHandler("love",    cmd_love))
 
     # Games
-    app.add_handler(CommandHandler("duel",    cmd_duel))
-    app.add_handler(CommandHandler("cubes",   cmd_cubes))
-    app.add_handler(CommandHandler("basket",  cmd_basket))
-    app.add_handler(CommandHandler("football",cmd_football))
-    app.add_handler(CommandHandler("bowling", cmd_bowling))
-    app.add_handler(CommandHandler("darts",   cmd_darts))
-    app.add_handler(CommandHandler("slot",    cmd_slot))
-    app.add_handler(CommandHandler("mines",   cmd_mines))
-    app.add_handler(CommandHandler(["tictac", "ttt"], cmd_ttt))
+    app.add_handler(CommandHandler("duel",      cmd_duel))
+    app.add_handler(CommandHandler("cubes",     cmd_cubes))
+    app.add_handler(CommandHandler("basket",    cmd_basket))
+    app.add_handler(CommandHandler("football",  cmd_football))
+    app.add_handler(CommandHandler("bowling",   cmd_bowling))
+    app.add_handler(CommandHandler("darts",     cmd_darts))
+    app.add_handler(CommandHandler("slot",      cmd_slot))
+    app.add_handler(CommandHandler("mines",     cmd_mines))
+    app.add_handler(CommandHandler(["tictac","ttt"], cmd_ttt))
     app.add_handler(CommandHandler("seabattle", cmd_seabattle))
     app.add_handler(CommandHandler("crash",     cmd_crash))
     app.add_handler(CommandHandler("tower",     cmd_tower))
     app.add_handler(CommandHandler("maze",      cmd_maze))
     app.add_handler(CommandHandler("giveaway",  cmd_giveaway))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     # Admin
     app.add_handler(CommandHandler("admin",        cmd_admin))
@@ -9163,18 +9251,22 @@ def main() -> None:
     app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
     app.add_handler(CommandHandler("listadmins",   cmd_listadmins))
 
-    # Moderation (hidden — not in BotCommand list or /help)
-    # Note: Telegram only accepts [a-z0-9_] in command names
-    app.add_handler(CommandHandler(["mute",      "mut"],       cmd_mute))
-    app.add_handler(CommandHandler(["unmute",    "unmut"],     cmd_unmute))
-    app.add_handler(CommandHandler(["kick"],                   cmd_kick))
-    app.add_handler(CommandHandler(["ban"],                    cmd_ban))
-    app.add_handler(CommandHandler(["unban"],                  cmd_unban))
-    app.add_handler(CommandHandler(["pred",      "warn"],      cmd_warn))
-    app.add_handler(CommandHandler(["unpred",    "unwarn"],    cmd_unwarn))
-    app.add_handler(CommandHandler(["clearpred", "clearwarns"],cmd_clearwarns))
-    app.add_handler(CommandHandler(["predlist",  "warnlist"],  cmd_warnlist))
-    app.add_handler(CommandHandler(["mutelist"],               cmd_mutelist))
+    # Moderation
+    app.add_handler(CommandHandler(["mute",      "mut"],        cmd_mute))
+    app.add_handler(CommandHandler(["unmute",    "unmut"],      cmd_unmute))
+    app.add_handler(CommandHandler(["kick"],                    cmd_kick))
+    app.add_handler(CommandHandler(["ban"],                     cmd_ban))
+    app.add_handler(CommandHandler(["unban"],                   cmd_unban))
+    app.add_handler(CommandHandler(["pred",      "warn"],       cmd_warn))
+    app.add_handler(CommandHandler(["unpred",    "unwarn"],     cmd_unwarn))
+    app.add_handler(CommandHandler(["clearpred", "clearwarns"], cmd_clearwarns))
+    app.add_handler(CommandHandler(["predlist",  "warnlist"],   cmd_warnlist))
+    app.add_handler(CommandHandler(["mutelist"],                cmd_mutelist))
+
+    # Managed-bot commands (parent only — children don't spawn sub-bots)
+    if not is_child:
+        app.add_handler(CommandHandler("create_bot", cmd_create_bot))
+        app.add_handler(CommandHandler("my_bots",    cmd_my_bots))
 
     # Callbacks, messages & reactions
     app.add_handler(CallbackQueryHandler(on_callback))
@@ -9182,14 +9274,305 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    # ── Start Mini App web server in background thread ─────────────────────
+
+# ── Child bot runner ──────────────────────────────────
+
+def _spawn_child(token: str, bot_uid: int) -> None:
+    """Launch a cloned game-bot in a daemon thread."""
+    t = _managed_threads.get(bot_uid)
+    if t and t.is_alive():
+        return
+
+    def _thread() -> None:
+        import asyncio as _aio
+        from telegram.ext import Application as _App
+
+        async def _run() -> None:
+            child = _App.builder().token(token).post_init(on_startup).build()
+            _register_handlers(child, is_child=True)
+            async with child:
+                await child.start()
+                log.info("Managed bot uid=%s online", bot_uid)
+                await child.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=[
+                        "message", "callback_query", "inline_query",
+                        "message_reaction", "chat_member", "my_chat_member",
+                    ],
+                )
+                await _aio.Event().wait()   # run forever
+
+        _aio.run(_run())
+
+    t = threading.Thread(target=_thread, daemon=True, name=f"mb-{bot_uid}")
+    t.start()
+    _managed_threads[bot_uid] = t
+    log.info("Spawned thread for managed bot uid=%s", bot_uid)
+
+
+# ── Managed-bot creation handler ──────────────────────
+
+async def _finish_managed_bot_setup(
+    bot,
+    bot_uid: int,
+    bot_username: str,
+    owner_id: int,
+    notify_chat_id: int,
+) -> None:
+    """Fetch token, save to DB, spawn child, notify owner."""
+    token = await _mb_get_token(bot_uid)
+    if not token:
+        try:
+            await bot.send_message(
+                notify_chat_id,
+                "❌ Не удалось получить токен.\n"
+                "Убедись что у бота включено управление (@BotFather → Bot Settings → "
+                "Allow Bots to Manage This Bot) и попробуй снова.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        return
+
+    await _mb_save(bot_uid, token, bot_username, owner_id)
+    _spawn_child(token, bot_uid)
+
+    uname_str = f"@{bot_username}" if bot_username else f"ID {bot_uid}"
+    try:
+        await bot.send_message(
+            notify_chat_id,
+            f"✅ <b>Бот запущен!</b>\n\n"
+            f"🤖 {uname_str}\n\n"
+            f"<b>Что делать дальше:</b>\n"
+            f"1. Добавь <b>{uname_str}</b> в свою группу\n"
+            f"2. Назначь его <b>администратором</b> (чтобы работала модерация)\n"
+            f"3. Запускай игры: /duel /crash /tower /maze /mines и другие\n\n"
+            f"Все игры, статистика и VRF — как здесь, но твои!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except TelegramError:
+        pass
+
+
+async def on_managed_bot_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the managed_bot_created service message (Bot API 9.6)."""
+    msg = update.message
+    if not msg:
+        return
+
+    owner_id = update.effective_user.id if update.effective_user else None
+    chat_id  = update.effective_chat.id if update.effective_chat else owner_id
+
+    # Try PTB attribute first; fall back to raw dict
+    created = getattr(msg, "managed_bot_created", None)
+    if created is not None:
+        bot_info     = getattr(created, "bot", None)
+        bot_uid      = getattr(bot_info, "id", None) if bot_info else None
+        bot_username = getattr(bot_info, "username", "") if bot_info else ""
+    else:
+        raw  = update.to_dict().get("message", {})
+        info = raw.get("managed_bot_created", {}).get("bot", {})
+        bot_uid      = info.get("id")
+        bot_username = info.get("username", "")
+
+    if not bot_uid or not owner_id:
+        return
+
+    await context.bot.send_message(
+        chat_id, "⚙️ Настраиваю бота...", parse_mode=ParseMode.HTML
+    )
+    await _finish_managed_bot_setup(
+        context.bot, bot_uid, bot_username, owner_id, chat_id
+    )
+
+
+async def on_managed_bot_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle managed_bot Update (token replacement / owner change, Bot API 9.6)."""
+    raw = update.to_dict()
+    mb  = raw.get("managed_bot", {})
+    if not mb:
+        return
+
+    bot_uid = mb.get("bot", {}).get("id")
+    if not bot_uid:
+        return
+
+    # Token changed — re-fetch and restart child
+    token = await _mb_get_token(bot_uid)
+    if token:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE managed_bots SET bot_token=? WHERE bot_user_id=?",
+                (token, bot_uid),
+            )
+            await db.commit()
+        _spawn_child(token, bot_uid)
+        log.info("Managed bot uid=%s token updated & respawned", bot_uid)
+
+
+# ── /create_bot  /my_bots ────────────────────────────
+
+async def cmd_create_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a button that lets users create their own clone game-bot."""
+    u   = update.effective_user
+    cid = update.effective_chat.id
+
+    existing = await _mb_by_owner(u.id)
+    if existing:
+        lines = []
+        for uid, uname, created_at in existing:
+            alive  = uid in _managed_threads and _managed_threads[uid].is_alive()
+            status = "🟢" if alive else "🔴"
+            name   = f"@{uname}" if uname else f"ID {uid}"
+            lines.append(f"{status} {name}")
+        await update.message.reply_text(
+            "🤖 <b>Твои боты:</b>\n\n" + "\n".join(lines) +
+            "\n\nДобавь бота в группу как администратора и запускай игры!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Try to send the native Telegram button
+    try:
+        from telegram import KeyboardButtonRequestManagedBot as _KBRMB  # PTB 22+
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton(
+                "🤖 Создать игрового бота",
+                request_managed_bot=_KBRMB(request_id=1),
+            )]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await update.message.reply_text(
+            "🤖 <b>Создай своего игрового бота!</b>\n\n"
+            "Нажми кнопку ниже — Telegram попросит выбрать имя и @username бота.\n"
+            "После создания бот автоматически получит <b>все игры</b>:\n\n"
+            "🎲 Дуэль · Кубики · Спорт · Слот\n"
+            "💥 Краш · 🏢 Башня · 🏰 Лабиринт · 💣 Мины\n"
+            "🎁 Подарки · 💍 Браки · 🐻 Медведи · Статистика\n\n"
+            "Добавь готового бота в свою группу и играй!",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+    except (ImportError, TypeError):
+        # PTB older than 22 — показываем ссылку на BotFather
+        me = (await context.bot.get_me()).username or "VerifureGameBot"
+        await update.message.reply_text(
+            "🤖 <b>Создай своего игрового бота!</b>\n\n"
+            f"Нажми ссылку и создай бота через BotFather:\n"
+            f"👉 https://t.me/newbot/{me}\n\n"
+            "После создания перешли сюда токен командой:\n"
+            "<code>/link_bot ТОКЕН</code>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+async def cmd_my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user's list of managed bots with live/dead status."""
+    u    = update.effective_user
+    bots = await _mb_by_owner(u.id)
+
+    if not bots:
+        await update.message.reply_text(
+            "У тебя пока нет ботов.\n\n"
+            "Используй /create_bot чтобы создать своего клона игрового бота!",
+        )
+        return
+
+    lines = []
+    for uid, uname, created_at in bots:
+        alive  = uid in _managed_threads and _managed_threads[uid].is_alive()
+        status = "🟢 работает" if alive else "🔴 остановлен"
+        name   = f"@{uname}" if uname else f"ID {uid}"
+        date   = created_at[:10] if created_at else "—"
+        lines.append(f"• <b>{name}</b>  {status}\n  Создан: {date}")
+
+    await update.message.reply_text(
+        "🤖 <b>Твои игровые боты:</b>\n\n" + "\n\n".join(lines) +
+        "\n\nДобавь бота в группу и назначь его администратором.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        log.critical("BOT_TOKEN environment variable is not set!")
+        raise SystemExit(1)
+
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+
+    # ── Register all handlers ──────────────────────────
+    _register_handlers(app, is_child=False)
+
+    # ── Service message: managed_bot_created ──────────
+    # Filter for messages that contain managed_bot_created field.
+    # PTB may not have a dedicated filter yet, so we use a custom one.
+    try:
+        from telegram.ext import filters as _f
+        _mb_filter = _f.StatusUpdate.ALL  # broadest; handler checks inside
+    except Exception:
+        _mb_filter = filters.ALL
+
+    app.add_handler(
+        MessageHandler(
+            _mb_filter,
+            on_managed_bot_msg,
+        ),
+        group=99,   # low priority — runs after normal message handler
+    )
+
+    # ── Raw update for managed_bot (token change etc.) ─
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(object, on_managed_bot_update), group=98)
+
+    # ── Mini App web server ────────────────────────────
     if WEBAPP_URL or os.getenv("PORT"):
-        t = threading.Thread(target=_run_clicker_webserver, daemon=True, name="webapp-server")
+        t = threading.Thread(
+            target=_run_clicker_webserver, daemon=True, name="webapp-server"
+        )
         t.start()
         log.info("Mini App web server thread started")
 
+    # ── Load & spawn previously-created managed bots ──
+    async def _load_managed_bots(app2) -> None:
+        await db_init_managed_bots()
+        rows = await _mb_all()
+        if rows:
+            log.info("Loading %d managed bot(s)...", len(rows))
+            for bot_uid, token, bot_uname, owner_id in rows:
+                _spawn_child(token, bot_uid)
+        # Also init the table on first run
+        pass
+
+    app.post_init = _load_managed_bots   # override post_init to chain
+
+    # Keep original on_startup:
+    _orig_post_init = on_startup
+
+    async def _combined_post_init(app2) -> None:
+        await _orig_post_init(app2)
+        await _load_managed_bots(app2)
+
+    # Rebuild with combined post_init
+    app2 = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_combined_post_init)
+        .build()
+    )
+    _register_handlers(app2, is_child=False)
+    app2.add_handler(MessageHandler(_mb_filter, on_managed_bot_msg), group=99)
+    app2.add_handler(TypeHandler(object, on_managed_bot_update),     group=98)
+
+    if WEBAPP_URL or os.getenv("PORT"):
+        threading.Thread(
+            target=_run_clicker_webserver, daemon=True, name="webapp-server"
+        ).start()
+
     log.info("Starting polling...")
-    app.run_polling(
+    app2.run_polling(
         drop_pending_updates=True,
         allowed_updates=[
             "message",
@@ -9198,6 +9581,7 @@ def main() -> None:
             "message_reaction",
             "chat_member",
             "my_chat_member",
+            "managed_bot",        # Bot API 9.6 — managed bot updates
         ],
     )
 

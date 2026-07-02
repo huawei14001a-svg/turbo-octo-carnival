@@ -990,6 +990,9 @@ async def db_list_admins() -> list:
 async def is_bot_admin(uid: int) -> bool:
     if uid in ADMIN_IDS:
         return True
+    # Child-bot owners are super-admins in their own clone
+    if uid in _child_bot_owners.values():
+        return True
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)) as cur:
             return bool(await cur.fetchone())
@@ -1167,6 +1170,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "🎳 Боулинг · 🎯 Дартс · 🎰 Слот · 💣 Мины · ❌⭕ Крестики\n\n"
             "📌 Добавь меня в группу и напиши /start"
         )
+
+        # Child bot attribution
+        my_bot_id = context.bot.id
+        if my_bot_id in _child_bot_owners:
+            settings = await _mb_get_settings(my_bot_id)
+            welcome  = settings.get("welcome_text", "") if settings else ""
+            if welcome:
+                # Custom welcome text set by owner
+                await update.message.reply_text(
+                    welcome + "\n\n"
+                    "<i>🤖 Создан через <a href=\"https://t.me/VerifureGameBot\">@VerifureGameBot</a></i>",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+            # Append attribution to standard message
+            fb_h += "\n\n<i>🤖 Создан через <a href=\"https://t.me/VerifureGameBot\">@VerifureGameBot</a></i>"
+
         await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                         reply_to_id=update.message.message_id)
         return
@@ -6560,12 +6581,128 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if action == "add":
             await query.answer()
+            me = context.bot.username or "VerifureGameBot"
             await query.message.reply_text(
-                "Чтобы привязать ещё один бот:\n\n"
-                "1. Создай бота в @BotFather (/newbot)\n"
-                "2. Скопируй токен\n"
-                "3. Отправь: <code>/link_bot ТОКЕН</code>",
+                "🔑 <b>Привязка существующего бота</b>\n\n"
+                "1. Создай бота в @BotFather: /newbot\n"
+                "2. Скопируй токен (вида <code>123456:ABC...</code>)\n"
+                "3. Отправь команду:\n"
+                "   <code>/link_bot ТВОЙ_ТОКЕН</code>",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🤖 Открыть @BotFather",
+                        url=f"https://t.me/newbot/{me}"
+                    )
+                ]]),
+            )
+            return
+
+        if action == "manage" and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Это не твой бот!", show_alert=True)
+                return
+            settings = await _mb_get_settings(bot_uid)
+            if not settings:
+                await query.answer("Бот не найден!", show_alert=True)
+                return
+            uname = settings.get("bot_username", "")
+            name  = f"@{uname}" if uname else f"ID {bot_uid}"
+            alive = bot_uid in _managed_threads and _managed_threads[bot_uid].is_alive()
+            status = "🟢 работает" if alive else "🔴 остановлен"
+            wtext = settings.get("welcome_text", "") or "(не задан)"
+            desc  = settings.get("description", "") or "(не задан)"
+            await query.answer()
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить приветствие",
+                                      callback_data=f"mb:edit_welcome:{bot_uid}")],
+                [InlineKeyboardButton("📝 Изменить описание",
+                                      callback_data=f"mb:edit_desc:{bot_uid}")],
+                [InlineKeyboardButton("🔑 Обновить токен",
+                                      callback_data=f"mb:edit_token:{bot_uid}")],
+                [InlineKeyboardButton("⚡ Обновить команды",
+                                      callback_data=f"mb:refresh_cmds:{bot_uid}")],
+                [InlineKeyboardButton("▶ Перезапустить" if not alive else "🔄 Перезапустить",
+                                      callback_data=f"mb:restart:{bot_uid}")],
+                [InlineKeyboardButton("🗑 Удалить бота",
+                                      callback_data=f"mb:delete:{bot_uid}")],
+            ])
+            try:
+                await query.edit_message_text(
+                    f"⚙️ <b>Управление {name}</b>\n\n"
+                    f"Статус: {status}\n"
+                    f"Приветствие: <i>{wtext[:80]}</i>\n"
+                    f"Описание: <i>{desc[:80]}</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+            except TelegramError:
+                await query.message.reply_text(
+                    f"⚙️ <b>Управление {name}</b>\n\nСтатус: {status}",
+                    parse_mode=ParseMode.HTML, reply_markup=kb,
+                )
+            return
+
+        if action == "refresh_cmds" and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Не твой бот!", show_alert=True)
+                return
+            settings = await _mb_get_settings(bot_uid)
+            if not settings:
+                await query.answer("Бот не найден!", show_alert=True)
+                return
+            token = settings["bot_token"]
+            await query.answer("⚡ Обновляю команды...")
+            try:
+                from telegram import Bot as _Bot
+                tmp = _Bot(token=token)
+                await _setup_child_bot(tmp, who.id)
+                await tmp.close()
+                await query.edit_message_text(
+                    "✅ Команды обновлены! Напиши <code>/help</code> в боте.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as exc:
+                await query.edit_message_text(f"❌ Ошибка: {exc}")
+            return
+
+        if action in ("edit_welcome", "edit_desc", "edit_token") and len(parts) >= 3:
+            bot_uid = int(parts[2])
+            bots = await _mb_by_owner(who.id)
+            if not any(row[0] == bot_uid for row in bots):
+                await query.answer("Не твой бот!", show_alert=True)
+                return
+            prompts = {
+                "edit_welcome": (
+                    "✏️ <b>Отправь новый текст приветствия</b>\n\n"
+                    "Это сообщение пользователи увидят при /start.\n"
+                    "HTML-теги поддерживаются.\n\n"
+                    "Отправь текст следующим сообщением:"
+                ),
+                "edit_desc": (
+                    "📝 <b>Отправь новое описание бота</b>\n\n"
+                    "Описание отображается в профиле бота.\n"
+                    "Атрибуция @VerifureGameBot добавляется автоматически.\n\n"
+                    "Отправь текст следующим сообщением:"
+                ),
+                "edit_token": (
+                    "🔑 <b>Отправь новый токен бота</b>\n\n"
+                    "Получи токен у @BotFather: /mybots → Выбери бота → API Token\n\n"
+                    "⚠️ Бот перезапустится после смены токена.\n"
+                    "Отправь токен следующим сообщением:"
+                ),
+            }
+            await query.answer()
+            context.user_data[f"mb_edit_{action.replace('edit_', '')}"] = bot_uid
+            await query.message.reply_text(
+                prompts[action], parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="mb:cancel")
+                ]]),
             )
             return
 
@@ -7225,10 +7362,102 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
+
+    u    = update.effective_user
+    text = (update.message.text or "").strip()
+
+    # ── Managed bot settings editor (private chat) ────────────
+    if update.effective_chat.type == "private" and text and not u.is_bot:
+        ud = context.user_data
+
+        # Edit welcome text
+        if "mb_edit_welcome" in ud:
+            bot_uid = ud.pop("mb_edit_welcome")
+            await _mb_update_settings(bot_uid, welcome_text=text)
+            await update.message.reply_text(
+                "✅ Приветствие обновлено!\n\n"
+                f"Теперь при /start пользователи увидят:\n<i>{text[:200]}</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← Назад к управлению",
+                                         callback_data=f"mb:manage:{bot_uid}")
+                ]]),
+            )
+            return
+
+        # Edit description
+        if "mb_edit_desc" in ud:
+            bot_uid = ud.pop("mb_edit_desc")
+            await _mb_update_settings(bot_uid, description=text)
+            # Try to actually update bot's description via API
+            settings = await _mb_get_settings(bot_uid)
+            if settings:
+                try:
+                    from telegram import Bot as _Bot
+                    tmp = _Bot(token=settings["bot_token"])
+                    await tmp.set_my_description(text + "\n\n🤖 @VerifureGameBot")
+                    await tmp.close()
+                except Exception as exc:
+                    log.warning("set_my_description failed: %s", exc)
+            await update.message.reply_text(
+                "✅ Описание обновлено!",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← Назад к управлению",
+                                         callback_data=f"mb:manage:{bot_uid}")
+                ]]),
+            )
+            return
+
+        # Edit token
+        if "mb_edit_token" in ud:
+            bot_uid = ud.pop("mb_edit_token")
+            new_token = text.strip()
+            if ":" not in new_token or len(new_token) < 20:
+                await update.message.reply_text("❌ Неверный формат токена.")
+                return
+            # Validate token
+            try:
+                import aiohttp as _aio
+                async with _aio.ClientSession() as s:
+                    async with s.get(
+                        f"https://api.telegram.org/bot{new_token}/getMe",
+                        timeout=_aio.ClientTimeout(total=10)
+                    ) as r:
+                        d = await r.json()
+            except Exception:
+                await update.message.reply_text("❌ Не удалось проверить токен.")
+                return
+            if not d.get("ok"):
+                await update.message.reply_text(
+                    f"❌ Токен не принят: {d.get('description')}"
+                )
+                return
+            # Delete token message for security
+            try:
+                await update.message.delete()
+            except TelegramError:
+                pass
+            # Update DB and restart
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE managed_bots SET bot_token=? WHERE bot_user_id=?",
+                    (new_token, bot_uid)
+                )
+                await db.commit()
+            # Respawn
+            _spawn_child(new_token, bot_uid, owner_id=u.id)
+            bot_info = d["result"]
+            uname = bot_info.get("username", "")
+            name  = f"@{uname}" if uname else f"ID {bot_uid}"
+            await update.effective_chat.send_message(
+                f"✅ Токен обновлён, бот {name} перезапускается...",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("← Управление", callback_data=f"mb:manage:{bot_uid}")
+                ]]),
+            )
+            return
+
     if update.effective_chat.type == "private":
-        return
-    u = update.effective_user
-    if u.is_bot:
         return
 
     cid  = update.effective_chat.id
@@ -9221,6 +9450,7 @@ async def cmd_maze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # getManagedBotToken → запускает клона в отдельном потоке.
 
 _managed_threads: dict = {}   # bot_user_id → threading.Thread
+_child_bot_owners: dict = {}  # child_bot_uid → owner_user_id (for admin check)
 
 
 # ── DB ────────────────────────────────────────────────
@@ -9232,23 +9462,80 @@ async def db_init_managed_bots() -> None:
                 bot_user_id   INTEGER PRIMARY KEY,
                 bot_token     TEXT    NOT NULL,
                 bot_username  TEXT    DEFAULT '',
+                bot_name      TEXT    DEFAULT '',
                 owner_user_id INTEGER,
+                welcome_text  TEXT    DEFAULT '',
+                description   TEXT    DEFAULT '',
                 active        INTEGER DEFAULT 1,
                 created_at    TEXT
             )
         """)
+        # migrate old table — add columns if missing
+        for col, defval in [
+            ("bot_name",     "''"),
+            ("welcome_text", "''"),
+            ("description",  "''"),
+        ]:
+            try:
+                await db.execute(
+                    f"ALTER TABLE managed_bots ADD COLUMN {col} TEXT DEFAULT {defval}"
+                )
+            except Exception:
+                pass
         await db.commit()
 
 
-async def _mb_save(bot_uid: int, token: str, username: str, owner_id: int) -> None:
+async def _mb_save(bot_uid: int, token: str, username: str, owner_id: int,
+                   bot_name: str = "") -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT OR REPLACE INTO managed_bots
-               (bot_user_id, bot_token, bot_username, owner_user_id, active, created_at)
-               VALUES (?, ?, ?, ?, 1, ?)""",
-            (bot_uid, token, username, owner_id, datetime.now().isoformat()),
+               (bot_user_id, bot_token, bot_username, bot_name, owner_user_id, active, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)""",
+            (bot_uid, token, username, bot_name, owner_id, datetime.now().isoformat()),
         )
         await db.commit()
+    # Make the bot owner a super-admin in the bot's admin table
+    try:
+        await db_add_admin(owner_id, "", "", added_by=0)
+    except Exception:
+        pass
+
+
+async def _mb_update_settings(
+    bot_uid: int,
+    welcome_text: Optional[str] = None,
+    description: Optional[str] = None,
+    bot_name: Optional[str] = None,
+) -> None:
+    """Update editable fields for a managed bot."""
+    fields, vals = [], []
+    if welcome_text is not None:
+        fields.append("welcome_text=?"); vals.append(welcome_text)
+    if description is not None:
+        fields.append("description=?"); vals.append(description)
+    if bot_name is not None:
+        fields.append("bot_name=?"); vals.append(bot_name)
+    if not fields:
+        return
+    vals.append(bot_uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE managed_bots SET {', '.join(fields)} WHERE bot_user_id=?",
+            vals,
+        )
+        await db.commit()
+
+
+async def _mb_get_settings(bot_uid: int) -> Optional[dict]:
+    """Return all managed bot settings as dict."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM managed_bots WHERE bot_user_id=?", (bot_uid,)
+        ) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def _mb_all() -> list:
@@ -9386,13 +9673,95 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
 
+# ── Child bot helpers ─────────────────────────────────
+
+_CHILD_GAME_COMMANDS = [
+    ("start",     "👋 Приветствие"),
+    ("help",      "📖 Справка"),
+    ("profile",   "👤 Профиль"),
+    ("daily",     "⚡ Ежедневный бонус"),
+    ("top",       "🏆 Топ игроков"),
+    ("duel",      "⚔️ Дуэль"),
+    ("cubes",     "🎲 Кубики"),
+    ("slot",      "🎰 Слот"),
+    ("mines",     "💣 Мины"),
+    ("crash",     "🚀 Краш"),
+    ("tower",     "🏢 Башня"),
+    ("maze",      "🏰 Лабиринт"),
+    ("basket",    "🏀 Баскетбол"),
+    ("football",  "⚽ Футбол"),
+    ("bowling",   "🎳 Боулинг"),
+    ("darts",     "🎯 Дартс"),
+    ("tictac",    "❌ Крестики-нолики"),
+    ("seabattle", "🚢 Морской бой"),
+    ("giveaway",  "🎁 Раздача"),
+    ("marry",     "💍 Брак"),
+    ("gift",      "🎀 Подарок"),
+    ("ref",       "🔗 Реферальная ссылка"),
+]
+
+_CHILD_ADMIN_COMMANDS = [
+    ("admin",       "🛠 Меню администратора"),
+    ("addadmin",    "➕ Добавить администратора"),
+    ("removeadmin", "➖ Убрать администратора"),
+    ("givevrf",     "💎 Выдать VRF"),
+    ("takevrf",     "💸 Забрать VRF"),
+    ("mute",        "🔇 Мут"),
+    ("unmute",      "🔊 Снять мут"),
+    ("kick",        "👢 Кик"),
+    ("ban",         "🚫 Бан"),
+]
+
+
+async def _setup_child_bot(bot, owner_id: int, bot_name: str = "", description: str = "") -> None:
+    """Set commands, description and other profile settings for a child bot."""
+    from telegram import BotCommand as _BC
+
+    # Commands visible to all users
+    user_cmds = [_BC(cmd, desc) for cmd, desc in _CHILD_GAME_COMMANDS]
+    # Commands visible to admins in groups
+    admin_cmds = user_cmds + [_BC(cmd, desc) for cmd, desc in _CHILD_ADMIN_COMMANDS]
+
+    try:
+        from telegram.constants import BotCommandScopeType
+        from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+
+        await bot.set_my_commands(user_cmds, scope=BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands(user_cmds, scope=BotCommandScopeAllGroupChats())
+    except Exception:
+        try:
+            await bot.set_my_commands(user_cmds)
+        except Exception as exc:
+            log.warning("set_my_commands failed: %s", exc)
+
+    # Set description with attribution
+    me = await bot.get_me()
+    parent_username = "VerifureGameBot"  # hardcoded parent username
+    desc = description or (
+        f"Игровой бот с VRF-валютой.\n"
+        f"Создан через @{parent_username}\n\n"
+        f"🎮 Дуэль · Кубики · Краш · Башня · Лабиринт · Мины · Слот"
+    )
+    try:
+        await bot.set_my_short_description(f"Клон @{parent_username} с играми на VRF")
+        await bot.set_my_description(desc)
+    except Exception as exc:
+        log.warning("set_my_description failed: %s", exc)
+
+    log.info("Child bot @%s setup complete", me.username)
+
+
 # ── Child bot runner ──────────────────────────────────
 
-def _spawn_child(token: str, bot_uid: int) -> None:
+def _spawn_child(token: str, bot_uid: int, owner_id: int = 0) -> None:
     """Launch a cloned game-bot in a daemon thread (fire-and-forget)."""
     t = _managed_threads.get(bot_uid)
     if t and t.is_alive():
         return
+
+    # Remember owner for admin checks
+    if owner_id:
+        _child_bot_owners[bot_uid] = owner_id
 
     def _thread() -> None:
         import asyncio as _aio
@@ -9404,6 +9773,12 @@ def _spawn_child(token: str, bot_uid: int) -> None:
                 _register_handlers(child, is_child=True)
                 async with child:
                     await child.start()
+                    # Setup commands + description
+                    oid = _child_bot_owners.get(bot_uid, owner_id)
+                    settings = await _mb_get_settings(bot_uid)
+                    desc = settings.get("description", "") if settings else ""
+                    bname = settings.get("bot_name", "") if settings else ""
+                    await _setup_child_bot(child.bot, oid, bname, desc)
                     log.info("Managed bot uid=%s online", bot_uid)
                     await child.updater.start_polling(
                         drop_pending_updates=True,
@@ -9421,17 +9796,16 @@ def _spawn_child(token: str, bot_uid: int) -> None:
     t = threading.Thread(target=_thread, daemon=True, name=f"mb-{bot_uid}")
     t.start()
     _managed_threads[bot_uid] = t
-    log.info("Spawned thread for managed bot uid=%s", bot_uid)
+    log.info("Spawned thread for managed bot uid=%s (owner=%s)", bot_uid, owner_id)
 
 
-async def _spawn_child_safe(token: str, bot_uid: int, wait: float = 3.0) -> Optional[str]:
-    """Spawn a child bot and wait *wait* seconds to see if it stays alive.
+async def _spawn_child_safe(token: str, bot_uid: int, owner_id: int = 0,
+                             wait: float = 4.0) -> Optional[str]:
+    """Spawn child bot and wait to confirm it stays alive.
     Returns None on success, or an error string."""
     import asyncio as _aio
-
-    _spawn_child(token, bot_uid)
+    _spawn_child(token, bot_uid, owner_id=owner_id)
     await _aio.sleep(wait)
-
     t = _managed_threads.get(bot_uid)
     if not t or not t.is_alive():
         return f"Поток завершился через {wait:.0f}с (возможно неверный токен или конфликт)"
@@ -9542,58 +9916,83 @@ async def on_managed_bot_update(update: Update, context: ContextTypes.DEFAULT_TY
 # ── /create_bot  /my_bots ────────────────────────────
 
 async def cmd_create_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a button that lets users create their own clone game-bot."""
+    """Показывает меню создания клона бота с кнопками."""
     u   = update.effective_user
-    cid = update.effective_chat.id
+    msg = update.message
 
     existing = await _mb_by_owner(u.id)
     if existing:
-        lines = []
-        for uid, uname, created_at in existing:
+        lines, kb_rows = [], []
+        for uid, uname, _ in existing:
             alive  = uid in _managed_threads and _managed_threads[uid].is_alive()
             status = "🟢" if alive else "🔴"
             name   = f"@{uname}" if uname else f"ID {uid}"
-            lines.append(f"{status} {name}")
-        await update.message.reply_text(
-            "🤖 <b>Твои боты:</b>\n\n" + "\n".join(lines) +
-            "\n\nДобавь бота в группу как администратора и запускай игры!",
+            lines.append(f"{status} <b>{name}</b>")
+            kb_rows.append([
+                InlineKeyboardButton(
+                    f"⚙️ Управлять {name}", callback_data=f"mb:manage:{uid}"
+                )
+            ])
+        kb_rows.append([
+            InlineKeyboardButton(
+                "➕ Привязать ещё бота", callback_data="mb:add"
+            )
+        ])
+        await msg.reply_text(
+            "🤖 <b>Твои игровые боты:</b>\n\n" + "\n".join(lines) +
+            "\n\nВыбери бота для управления или привяжи новый:",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
         )
         return
 
-    # Try to send the native Telegram button
+    # Определяем username родительского бота
+    me = context.bot.username or "VerifureGameBot"
+    newbot_url = f"https://t.me/newbot/{me}"
+
+    # Кнопки: нативный Telegram способ И ссылка на BotFather
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Создать бота через Telegram", url=newbot_url)],
+        [InlineKeyboardButton("🔑 Привязать существующий бот", callback_data="mb:add")],
+    ])
+
+    # Попробуем также показать нативную Reply-кнопку (Bot API 9.6)
     try:
-        from telegram import KeyboardButtonRequestManagedBot as _KBRMB  # PTB 22+
-        kb = ReplyKeyboardMarkup(
-            [[KeyboardButton(
-                "🤖 Создать игрового бота",
-                request_managed_bot=_KBRMB(request_id=1),
-            )]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
+        from telegram import KeyboardButtonRequestManagedBot as _KBRMB
+        reply_kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("🤖 Создать управляемый бот",
+                             request_managed_bot=_KBRMB(request_id=1))]],
+            resize_keyboard=True, one_time_keyboard=True,
         )
-        await update.message.reply_text(
+        await msg.reply_text(
             "🤖 <b>Создай своего игрового бота!</b>\n\n"
-            "Нажми кнопку ниже — Telegram попросит выбрать имя и @username бота.\n"
-            "После создания бот автоматически получит <b>все игры</b>:\n\n"
+            "У тебя будет <b>полный клон</b> со всеми играми:\n"
             "🎲 Дуэль · Кубики · Спорт · Слот\n"
             "💥 Краш · 🏢 Башня · 🏰 Лабиринт · 💣 Мины\n"
-            "🎁 Подарки · 💍 Браки · 🐻 Медведи · Статистика\n\n"
-            "Добавь готового бота в свою группу и играй!",
+            "🎁 Подарки · 💍 Браки · Статистика\n\n"
+            "<b>Способы привязать бота:</b>\n\n"
+            "1️⃣ Нажми кнопку «🤖 Создать управляемый бот» ниже — "
+            "Telegram сам создаст бота и передаст его тебе\n\n"
+            "2️⃣ Или используй инлайн-кнопку «Создать через Telegram»",
             parse_mode=ParseMode.HTML,
+            reply_markup=reply_kb,
+        )
+        await msg.reply_text(
+            "👆 Выбери способ создания или привяжи уже существующий бот:",
             reply_markup=kb,
         )
     except (ImportError, TypeError):
-        # PTB older than 22 — показываем ссылку на BotFather
-        me = (await context.bot.get_me()).username or "VerifureGameBot"
-        await update.message.reply_text(
+        # PTB без поддержки Bot API 9.6 — только URL кнопки
+        await msg.reply_text(
             "🤖 <b>Создай своего игрового бота!</b>\n\n"
-            f"Нажми ссылку и создай бота через BotFather:\n"
-            f"👉 https://t.me/newbot/{me}\n\n"
-            "После создания перешли сюда токен командой:\n"
-            "<code>/link_bot ТОКЕН</code>",
+            "У тебя будет полный клон со всеми играми.\n\n"
+            "<b>Инструкция:</b>\n"
+            f"1. Нажми кнопку ниже — откроется @BotFather\n"
+            f"2. Введи имя бота и @username\n"
+            f"3. Скопируй токен вида <code>123456:ABC...</code>\n"
+            f"4. Вставь его сюда: <code>/link_bot ТОКЕН</code>",
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            reply_markup=kb,
         )
 
 
@@ -9749,8 +10148,8 @@ async def cmd_link_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     # Сохраняем в БД и запускаем
-    await _mb_save(bot_uid, token, bot_username, u.id)
-    error = await _spawn_child_safe(token, bot_uid)
+    await _mb_save(bot_uid, token, bot_username, u.id, bot_name=bot_name)
+    error = await _spawn_child_safe(token, bot_uid, owner_id=u.id)
 
     if error:
         await status_msg.edit_text(
@@ -9765,12 +10164,18 @@ async def cmd_link_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🎉 <b>Бот {uname_str} запущен!</b>\n\n"
         f"<b>Что делать дальше:</b>\n"
         f"1. Добавь <b>{uname_str}</b> в свою группу\n"
-        f"2. Назначь его <b>администратором</b> "
-        f"(иначе не сможет удалять сообщения)\n"
-        f"3. Запускай игры:\n"
-        f"   /duel /cubes /crash /tower /maze /mines /slot\n\n"
-        f"📋 Управление ботами: /my_bots",
+        f"2. Назначь его <b>администратором</b>\n"
+        f"3. Ты <b>владелец</b> — тебе доступны /admin, /addadmin, /givevrf\n"
+        f"4. Запускай: /duel /crash /tower /maze /mines /slot\n\n"
+        f"📌 Атрибуция @VerifureGameBot будет в приветствии\n"
+        f"⚙️ Управление — кнопка ниже или /my_bots",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"⚙️ Управлять {uname_str}",
+                callback_data=f"mb:manage:{bot_uid}"
+            )
+        ]]),
     )
 
 
@@ -9820,7 +10225,8 @@ def main() -> None:
         if rows:
             log.info("Loading %d managed bot(s)...", len(rows))
             for bot_uid, token, bot_uname, owner_id in rows:
-                _spawn_child(token, bot_uid)
+                _child_bot_owners[bot_uid] = owner_id  # restore mapping
+                _spawn_child(token, bot_uid, owner_id=owner_id)
         # Also init the table on first run
         pass
 

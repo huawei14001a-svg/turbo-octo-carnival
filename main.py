@@ -10490,6 +10490,7 @@ async def cmd_fwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Обрабатывается в on_callback через prefix "start:"
 
 
+def main() -> None:
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN environment variable is not set!")
         raise SystemExit(1)

@@ -777,6 +777,57 @@ async def delete_ephemeral(bot, chat_id: int, ephemeral_message_id: int) -> bool
         return False
 
 
+# ══════════════════════════════════════════════════════
+#   ПРИВАТНАЯ ДОСТАВКА  🔒  (реально работает уже сейчас)
+# ══════════════════════════════════════════════════════
+# receiver_user_id/эфемерные сообщения (Bot API 10.2, выше) на практике
+# ещё не активны на серверах Telegram — вызов тихо откатывается на обычное
+# сообщение, то есть его всё ещё видно всем в чате. Это НЕ настоящая
+# приватность. Для реально приватной доставки прямо сейчас есть только
+# один рабочий путь — личные сообщения (ЛС) бота с пользователем.
+# Ограничение Telegram: бот не может первым написать пользователю, пока
+# тот хотя бы раз не нажал /start в ЛС с ботом — если это ещё не
+# произошло, оставляем короткую подсказку в группе с кнопкой запуска ЛС.
+
+async def send_private_or_prompt(
+    context, group_chat_id: int, user, text: str,
+    reply_markup=None, prompt_reply_to_id: int = None,
+) -> bool:
+    """Пытается отправить `text` пользователю в ЛС (обычным send_message —
+    у send_rich() все исключения гасятся внутри, поэтому для надёжного
+    определения успеха/неудачи он тут не годится). При успехе возвращает
+    True и в группе ничего лишнего не появляется. Если бот не может писать
+    в ЛС (пользователь не жал /start боту) — оставляет короткую публичную
+    подсказку с кнопкой «Открыть ЛС» и возвращает False."""
+    try:
+        await context.bot.send_message(
+            chat_id=user.id, text=text, parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+        return True
+    except TelegramError as e:
+        log.debug("Can't DM user %s yet: %s", user.id, e)
+
+    # Не получилось — пользователь ещё не открывал ЛС с ботом
+    try:
+        bot_username = (await context.bot.get_me()).username
+        start_url = f"https://t.me/{bot_username}?start=hi"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Открыть ЛС с ботом", url=start_url),
+        ]])
+        await context.bot.send_message(
+            chat_id=group_chat_id,
+            text=(f"🔒 {mention(user.id, user.first_name)}, это приватная информация — "
+                  f"я не могу написать тебе в ЛС, пока ты не нажмёшь /start у бота.\n"
+                  f"Открой ЛС и повтори команду."),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            reply_parameters={"message_id": prompt_reply_to_id} if prompt_reply_to_id else None,
+        )
+    except TelegramError:
+        pass
+    return False
+
 
 # ══════════════════════════════════════════════════════
 #                    DATABASE
@@ -2948,22 +2999,6 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uname = f"@{u['username']}" if u["username"] else u["first_name"]
     bars  = xp_bar(u["experience"], 14)
 
-    # ── Rich profile card ────────────────────────────
-    rich_h = (
-        f"<h2>👤 {uname}</h2>"
-        "<table bordered striped>"
-        f"<tr><td>🏅 Уровень</td><td><b>{lvl}</b> — {rank_nm}</td></tr>"
-        f"<tr><td>📊 Прогресс</td><td><code>{bars}</code> {int(pct*100)}%</td></tr>"
-        f"<tr><td>💎 VRF</td><td><mark><b>{fmt(u['vrf'])}</b></mark></td></tr>"
-        f"<tr><td>🏆 Место</td><td><b>#{pos}</b></td></tr>"
-        f"<tr><td>🎮 Всего игр</td><td><b>{u['total_games']}</b></td></tr>"
-        f"<tr><td>✅ Побед</td><td><b>{u['wins']}</b> ({wr}%)</td></tr>"
-        f"<tr><td>❌ Поражений</td><td><b>{u['losses']}</b></td></tr>"
-        f"<tr><td>🔥 Серия</td><td><b>{u['win_streak']}</b> (макс. {u['max_streak']})</td></tr>"
-        f"<tr><td>🐻 Медведей</td><td><b>{u['bears']}</b></td></tr>"
-        "</table>"
-        f"<blockquote>{m_line}</blockquote>"
-    )
     fb_h = (
         f"👤 <b>{mention(target.id, u['first_name'])}</b>\n\n"
         f"🏅 Ур. <b>{lvl}</b> — {rank_nm}  📊 [{bars}] {int(pct*100)}%\n"
@@ -2972,8 +3007,19 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔥 Серия: <b>{u['win_streak']}</b> (макс. {u['max_streak']})  🐻 <b>{u['bears']}</b>\n\n"
         f"{m_line}"
     )
-    await send_rich(context.bot, update.effective_chat.id, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
+
+    # Приватно: карточка уходит в ЛС тому, кто вызвал /profile (не всей
+    # группе). Если ЛС ещё не открыт — короткая публичная подсказка.
+    caller = update.effective_user
+    delivered = await send_private_or_prompt(
+        context, update.effective_chat.id, caller, fb_h,
+        prompt_reply_to_id=update.message.message_id,
+    )
+    if delivered:
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="👀")])
+        except TelegramError:
+            pass
 
 
 @only_groups
@@ -3300,8 +3346,16 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🐻 Медведей: <b>{u['bears']}</b>\n"
         f"🏆 Побед: <b>{u['wins']}</b> · 🎮 Игр: <b>{u['total_games']}</b>"
     )
-    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
+
+    # Приватно: как и /profile — уходит в ЛС вызвавшему, не в общий чат.
+    delivered = await send_private_or_prompt(
+        context, cid, u_obj, fb_h, prompt_reply_to_id=update.message.message_id,
+    )
+    if delivered:
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="👀")])
+        except TelegramError:
+            pass
 
 
 @only_groups
@@ -4904,20 +4958,16 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("🛡️ Модерация",    callback_data="ap:mod")],
         [SBtn("Закрыть", style="danger",          callback_data="ap:close")],
     ])
-    text = f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:"
-
-    # Эфемерно (Bot API 10.2) — в группе панель видна только вызвавшему её
-    # админу, а не всем участникам чата. Если сервер ещё не поддерживает
-    # receiver_user_id — тихо откатываемся на обычный ответ.
-    if update.effective_chat.type != "private":
-        sent = await send_ephemeral(
-            context.bot, update.effective_chat.id, update.effective_user.id,
-            text, reply_markup=kb, reply_to_id=update.message.message_id,
-        )
-        if sent is not None:
-            return
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # Примечание: панель нарочно НЕ приватная — кнопки (ap:stats и т.д.)
+    # завязаны на ID текущей группы через контекст callback-сообщения,
+    # перенос в ЛС потребовал бы отдельно прокидывать group_id через каждый
+    # callback_data. Плюс сама админ-панель — не такие чувствительные
+    # персональные данные, как профиль/баланс, так что оставляем как есть.
+    await update.message.reply_text(
+        f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
 
 
 @only_groups

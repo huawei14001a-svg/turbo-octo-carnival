@@ -84,6 +84,14 @@ class SBtn(InlineKeyboardButton):
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 DB_PATH:   str = os.getenv("DB_PATH", "verifure.db")
 WEBAPP_URL: str = os.getenv("WEBAPP_URL", "")  # Railway URL e.g. https://your-app.up.railway.app
+# ⚠️ Bot API security update: с 20 июля 2026 Telegram по умолчанию запрещает
+# Mini App'ам вызывать методы Mini App API с источников, отличных от
+# домена самого Mini App'а. Наш /clicker — полностью самодостаточная HTML-
+# страница без сторонних доменов/скриптов, так что это её не затрагивает.
+# Если когда-нибудь начнём грузить сторонние ресурсы внутри Mini App —
+# нужно либо привести их к домену WEBAPP_URL, либо отключить защиту через
+# @BotFather (тогда ответственность за отсутствие ссылок на ненадёжные
+# сайты внутри Mini App — на боте).
 
 # ── VRF Economy ───────────────────────────────────────
 STARTING_VRF        = 500
@@ -503,17 +511,31 @@ async def send_rich(
     reply_to_id: int = None,
     reply_markup=None,
     html: str = "",
+    blocks: list = None,
+    media: list = None,
 ) -> bool:
     """
     Send via sendRichMessage (tables, headings, lists…) with fallback to plain HTML.
     html=          → rich HTML content (full sendRichMessage tags)
     fallback_html= → simple HTML for regular send_message
-    markdown=      → rich Markdown alternative (used when html is empty)
+    markdown=      → rich Markdown alternative (used when html/blocks are empty)
+    blocks=        → Bot API 10.1+ structured InputRichBlock list (takes priority
+                      over html/markdown when given — see rich_* builders below)
+    media=         → Bot API 10.2 InputRichMessageMedia list, used together with
+                      html/markdown when they reference tg://photo?id=/video?id=/audio?id=
     """
     fb_text = fallback_html or html or markdown
 
     # ── Try sendRichMessage ───────────────────────────
-    rich_msg: dict = {"html": html} if html else {"markdown": markdown or " "}
+    if blocks:
+        rich_msg: dict = {"blocks": blocks}
+    elif html:
+        rich_msg = {"html": html}
+    else:
+        rich_msg = {"markdown": markdown or " "}
+    if media:
+        rich_msg["media"] = media
+
     kw: dict = {"chat_id": chat_id, "rich_message": rich_msg}
     if reply_to_id:
         kw["reply_parameters"] = {"message_id": reply_to_id}
@@ -552,6 +574,209 @@ async def send_rich(
         except Exception:
             pass
     return False
+
+
+# ══════════════════════════════════════════════════════
+#   RICH BLOCKS  🧱  (Bot API 10.1 — InputRichBlock* builders)
+# ══════════════════════════════════════════════════════
+# PTB не имеет типизированных классов для этих новых объектов, поэтому
+# собираем обычные dict'ы точно по схеме InputRichBlock* — sendRichMessage
+# принимает их напрямую через rich_message.blocks (см. send_rich выше).
+# Используется, например, в /chatinfo и админ-панели (ap:stats).
+
+def rich_heading(text, size: int = 2) -> dict:
+    return {"type": "heading", "text": text, "size": max(1, min(6, size))}
+
+
+def rich_paragraph(text) -> dict:
+    return {"type": "paragraph", "text": text}
+
+
+def rich_footer(text) -> dict:
+    return {"type": "footer", "text": text}
+
+
+def rich_divider() -> dict:
+    return {"type": "divider"}
+
+
+def rich_table_cell(text=None, header: bool = False, align: str = None,
+                    colspan: int = None, rowspan: int = None) -> dict:
+    cell: dict = {}
+    if text is not None:
+        cell["text"] = text
+    if header:
+        cell["is_header"] = True
+    if align:
+        cell["align"] = align
+    if colspan and colspan > 1:
+        cell["colspan"] = colspan
+    if rowspan and rowspan > 1:
+        cell["rowspan"] = rowspan
+    return cell
+
+
+def rich_table(cells: list, bordered: bool = True, striped: bool = True, caption=None) -> dict:
+    d: dict = {"type": "table", "cells": cells}
+    if bordered:
+        d["is_bordered"] = True
+    if striped:
+        d["is_striped"] = True
+    if caption:
+        d["caption"] = caption
+    return d
+
+
+def rich_list_item(content, has_checkbox: bool = False, is_checked: bool = False) -> dict:
+    blocks = [rich_paragraph(content)] if isinstance(content, str) else content
+    item: dict = {"blocks": blocks}
+    if has_checkbox:
+        item["has_checkbox"] = True
+        if is_checked:
+            item["is_checked"] = True
+    return item
+
+
+def rich_list(items: list) -> dict:
+    return {"type": "list", "items": items}
+
+
+def rich_blockquote(blocks: list, credit=None) -> dict:
+    d: dict = {"type": "blockquote", "blocks": blocks}
+    if credit:
+        d["credit"] = credit
+    return d
+
+
+def rich_pullquote(text, credit=None) -> dict:
+    d: dict = {"type": "pullquote", "text": text}
+    if credit:
+        d["credit"] = credit
+    return d
+
+
+def rich_details(summary, blocks: list, is_open: bool = False) -> dict:
+    d: dict = {"type": "details", "summary": summary, "blocks": blocks}
+    if is_open:
+        d["is_open"] = True
+    return d
+
+
+# ── InputRichMessageMedia (Bot API 10.2) ─────────────────
+# Позволяет явно передать медиафайлы, на которые ссылается html/markdown
+# через tg://photo?id=XXX, tg://video?id=XXX, tg://audio?id=XXX. Используются
+# вместе с send_rich(..., media=[...]) при html=/markdown=.
+
+def rich_media_photo(media_id: str, file) -> dict:
+    return {"id": media_id, "media": {"type": "photo", "media": file}}
+
+
+def rich_media_video(media_id: str, file) -> dict:
+    return {"id": media_id, "media": {"type": "video", "media": file}}
+
+
+def rich_media_audio(media_id: str, file) -> dict:
+    return {"id": media_id, "media": {"type": "audio", "media": file}}
+
+
+def rich_media_voice_note(media_id: str, file) -> dict:
+    """InputMediaVoiceNote (Bot API 10.2) — голосовое сообщение как медиа
+    внутри расширенного сообщения (ссылка tg://audio?id=... в тексте)."""
+    return {"id": media_id, "media": {"type": "voice_note", "media": file}}
+
+
+def rich_media_animation(media_id: str, file) -> dict:
+    return {"id": media_id, "media": {"type": "animation", "media": file}}
+
+
+# ══════════════════════════════════════════════════════
+#   EPHEMERAL MESSAGES  👻  (Bot API 10.2)
+# ══════════════════════════════════════════════════════
+# Сообщение, отправленное с receiver_user_id, в группе видно ТОЛЬКО
+# указанному пользователю + боту (остальные участники его не видят) —
+# удобно для приватных вещей вроде админ-панели или личного баланса
+# без спама в общий чат. PTB может ещё не знать про эти параметры/методы,
+# поэтому всё идёт через do_api_request с аккуратным откатом на обычные
+# send_message/edit_message_text/delete_message, если сервер не поддерживает.
+
+async def send_ephemeral(
+    bot, chat_id: int, receiver_user_id: int, text: str,
+    reply_markup=None, reply_to_id: int = None, parse_mode=ParseMode.HTML,
+) -> Optional[dict]:
+    """Пытается отправить эфемерное сообщение (видно только receiver_user_id).
+    Возвращает распарсенный Message-словарь при успехе (с полем
+    ephemeral_message_id), иначе None. При неудаче — НЕ шлёт fallback сама,
+    вызывающий код должен сам решить, слать ли обычное сообщение."""
+    kw: dict = {
+        "chat_id": chat_id, "text": text,
+        "receiver_user_id": receiver_user_id, "parse_mode": parse_mode,
+    }
+    if reply_to_id:
+        kw["reply_parameters"] = {"message_id": reply_to_id}
+    if reply_markup:
+        try:
+            kw["reply_markup"] = reply_markup.to_dict()
+        except Exception:
+            pass
+    try:
+        result = await bot.do_api_request("sendMessage", api_kwargs=kw)
+        return result
+    except Exception as e:
+        log.debug("send_ephemeral fallback (not supported yet?): %s", e)
+        return None
+
+
+async def send_ephemeral_or_normal(
+    bot, chat_id: int, receiver_user_id: int, text: str,
+    reply_markup=None, reply_to_id: int = None, parse_mode=ParseMode.HTML,
+):
+    """Как send_ephemeral, но с гарантированной доставкой: если эфемерный
+    режим недоступен на сервере — просто шлёт обычное сообщение (ответом)."""
+    result = await send_ephemeral(
+        bot, chat_id, receiver_user_id, text,
+        reply_markup=reply_markup, reply_to_id=reply_to_id, parse_mode=parse_mode,
+    )
+    if result is not None:
+        return result
+    try:
+        return await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            reply_parameters={"message_id": reply_to_id} if reply_to_id else None,
+        )
+    except Exception:
+        return None
+
+
+async def edit_ephemeral_text(bot, chat_id: int, ephemeral_message_id: int,
+                              text: str, reply_markup=None, parse_mode=ParseMode.HTML) -> bool:
+    kw = {"chat_id": chat_id, "ephemeral_message_id": ephemeral_message_id,
+          "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        try:
+            kw["reply_markup"] = reply_markup.to_dict()
+        except Exception:
+            pass
+    try:
+        await bot.do_api_request("editEphemeralMessageText", api_kwargs=kw)
+        return True
+    except Exception as e:
+        log.debug("editEphemeralMessageText unavailable: %s", e)
+        return False
+
+
+async def delete_ephemeral(bot, chat_id: int, ephemeral_message_id: int) -> bool:
+    try:
+        await bot.do_api_request(
+            "deleteEphemeralMessage",
+            api_kwargs={"chat_id": chat_id, "ephemeral_message_id": ephemeral_message_id},
+        )
+        return True
+    except Exception as e:
+        log.debug("deleteEphemeralMessage unavailable: %s", e)
+        return False
+
+
 
 # ══════════════════════════════════════════════════════
 #                    DATABASE
@@ -4679,11 +4904,20 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton("🛡️ Модерация",    callback_data="ap:mod")],
         [SBtn("Закрыть", style="danger",          callback_data="ap:close")],
     ])
-    await update.message.reply_text(
-        f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+    text = f"🛡️ <b>Verifure Admin Panel</b>\n\n{E_ALERT} Выбери раздел:"
+
+    # Эфемерно (Bot API 10.2) — в группе панель видна только вызвавшему её
+    # админу, а не всем участникам чата. Если сервер ещё не поддерживает
+    # receiver_user_id — тихо откатываемся на обычный ответ.
+    if update.effective_chat.type != "private":
+        sent = await send_ephemeral(
+            context.bot, update.effective_chat.id, update.effective_user.id,
+            text, reply_markup=kb, reply_to_id=update.message.message_id,
+        )
+        if sent is not None:
+            return
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 @only_groups
@@ -7399,6 +7633,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.effective_user:
         return
 
+    # ── Community events (Bot API 10.2) ───────────────────────
+    # community_chat_added / community_chat_removed — сервисные сообщения
+    # о том, что этот чат добавили/убрали из сообщества. Поля новые и
+    # могут отсутствовать в текущей версии PTB/сервера — читаем безопасно.
+    _cca = getattr(update.message, "community_chat_added", None)
+    if _cca is not None:
+        try:
+            await update.message.reply_text(
+                "🌐 Этот чат добавлен в сообщество.", parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+    _ccr = getattr(update.message, "community_chat_removed", None)
+    if _ccr is not None:
+        try:
+            await update.message.reply_text("🌐 Этот чат исключён из сообщества.")
+        except TelegramError:
+            pass
+
     u    = update.effective_user
     text = (update.message.text or "").strip()
 
@@ -7802,6 +8055,24 @@ async def on_startup(app: Application) -> None:
         await app.bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
     except Exception:
         pass
+
+    # ── is_ephemeral (Bot API 10.2) — попытка пометить /admin как эфемерную
+    # команду, чтобы сама подсказка команды в меню тоже была приватной.
+    # BotCommand в установленной версии PTB может не знать про этот kwarg —
+    # тогда просто соберём сырой dict и пошлём через do_api_request.
+    try:
+        ephemeral_cmds = [
+            {"command": c.command, "description": c.description,
+             **({"is_ephemeral": True} if c.command == "admin" else {})}
+            for c in cmds
+        ]
+        await app.bot.do_api_request(
+            "setMyCommands",
+            api_kwargs={"commands": ephemeral_cmds, "scope": {"type": "all_group_chats"}},
+        )
+    except Exception as e:
+        log.debug("is_ephemeral BotCommand not supported yet: %s", e)
+
     log.info("Verifure Game 10.1 is online!")
 
 
@@ -9834,6 +10105,7 @@ def _spawn_child(token: str, bot_uid: int, owner_id: int = 0) -> None:
                         allowed_updates=[
                             "message", "callback_query", "inline_query",
                             "message_reaction", "chat_member", "my_chat_member",
+                            "subscription",   # Bot API 10.2 — BotSubscriptionUpdated
                         ],
                     )
                     await _aio.Event().wait()
@@ -9960,6 +10232,26 @@ async def on_managed_bot_update(update: Update, context: ContextTypes.DEFAULT_TY
             await db.commit()
         _spawn_child(token, bot_uid)
         log.info("Managed bot uid=%s token updated & respawned", bot_uid)
+
+
+async def on_subscription_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка BotSubscriptionUpdated (Bot API 10.2) — изменение подписки
+    пользователя на платные услуги бота. Поле update.subscription — новое,
+    в текущей версии PTB типов может ещё не быть, поэтому читаем безопасно
+    через сырой dict, как и для managed_bot выше."""
+    sub = getattr(update, "subscription", None)
+    if sub is None:
+        raw = update.to_dict()
+        sub = raw.get("subscription")
+    if not sub:
+        return
+    try:
+        log.info("BotSubscriptionUpdated: %s", sub)
+    except Exception:
+        pass
+    # Точка расширения: здесь можно, например, начислять/снимать привилегии
+    # пользователю в БД в зависимости от sub["status"] / sub["user"], когда
+    # у бота появятся платные подписки.
 
 
 # ── /create_bot  /my_bots ────────────────────────────
@@ -10233,11 +10525,14 @@ async def cmd_link_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 #   НОВЫЕ КОМАНДЫ — Bot API 10.x методы
 # ══════════════════════════════════════════════════════
 
-# ── /chatinfo — детальная инфо о чате ────────────────
+# ── /chatinfo — детальная инфо о чате (Rich Blocks + Community) ──
 
 @only_groups
 async def cmd_chatinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Детальная информация о чате (getChat + getChatMemberCount)."""
+    """Детальная информация о чате (getChat + getChatMemberCount).
+    Оформлена через Rich Blocks (Bot API 10.1) — структурированная таблица
+    вместо HTML-разметки, плюс блок Community (Bot API 10.2), если чат
+    состоит в сообществе."""
     cid = update.effective_chat.id
     try:
         chat = await context.bot.get_chat(cid)
@@ -10246,26 +10541,55 @@ async def cmd_chatinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ {e}")
         return
 
-    lines = [
+    rows = [
+        [rich_table_cell("🆔 ID"), rich_table_cell(str(cid))],
+        [rich_table_cell("👥 Участников"), rich_table_cell(str(count))],
+        [rich_table_cell("📋 Тип"), rich_table_cell(chat.type)],
+    ]
+    if getattr(chat, "username", None):
+        rows.append([rich_table_cell("🔗 Username"), rich_table_cell(f"@{chat.username}")])
+    if getattr(chat, "invite_link", None):
+        rows.append([rich_table_cell("🔒 Ссылка"), rich_table_cell(chat.invite_link)])
+    if getattr(chat, "slow_mode_delay", None):
+        rows.append([rich_table_cell("⏱ Медленный режим"), rich_table_cell(f"{chat.slow_mode_delay}с")])
+    if getattr(chat, "has_aggressive_anti_spam_enabled", None):
+        rows.append([rich_table_cell("🛡 Антиспам"), rich_table_cell("✅")])
+
+    blocks = [
+        rich_heading(chat.title or chat.first_name or "Чат", size=2),
+        rich_table(rows, bordered=True, striped=True),
+    ]
+    if getattr(chat, "description", None):
+        blocks.append(rich_paragraph(chat.description[:300]))
+
+    # Community (Bot API 10.2) — несколько супергрупп/каналов/ботов под
+    # одной темой. Поле может отсутствовать в старых версиях PTB/сервера,
+    # поэтому читаем максимально защищённо.
+    community = getattr(chat, "community", None)
+    if community is not None:
+        c_name = getattr(community, "title", None) or getattr(community, "name", None) or "—"
+        blocks.append(rich_divider())
+        blocks.append(rich_heading("🌐 Сообщество", size=3))
+        blocks.append(rich_paragraph(f"Этот чат состоит в сообществе: {c_name}"))
+
+    fb_lines = [
         f"💬 <b>{chat.title or chat.first_name or 'Чат'}</b>",
         f"🆔 ID: <code>{cid}</code>",
         f"👥 Участников: <b>{count}</b>",
         f"📋 Тип: {chat.type}",
     ]
     if getattr(chat, "username", None):
-        lines.append(f"🔗 @{chat.username}")
+        fb_lines.append(f"🔗 @{chat.username}")
     if getattr(chat, "description", None):
-        lines.append(f"📝 {chat.description[:100]}")
-    if getattr(chat, "invite_link", None):
-        lines.append(f"🔒 Ссылка: {chat.invite_link}")
-    if getattr(chat, "slow_mode_delay", None):
-        lines.append(f"⏱ Медленный режим: {chat.slow_mode_delay}с")
-    if getattr(chat, "has_aggressive_anti_spam_enabled", None):
-        lines.append("🛡 Антиспам: ✅")
+        fb_lines.append(f"📝 {chat.description[:100]}")
+    if community is not None:
+        fb_lines.append("🌐 Состоит в сообществе")
 
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=ParseMode.HTML
+    await send_rich(
+        context.bot, cid, blocks=blocks, fallback_html="\n".join(fb_lines),
+        reply_to_id=update.message.message_id,
     )
+
 
 
 # ── /admins — список администраторов (Bot API 10.0 return_bots) ──
@@ -10560,6 +10884,7 @@ def main() -> None:
     _register_handlers(app2, is_child=False)
     app2.add_handler(MessageHandler(_mb_filter, on_managed_bot_msg), group=99)
     app2.add_handler(TypeHandler(object, on_managed_bot_update),     group=98)
+    app2.add_handler(TypeHandler(object, on_subscription_update),    group=97)
 
     if WEBAPP_URL or os.getenv("PORT"):
         threading.Thread(
@@ -10577,6 +10902,7 @@ def main() -> None:
             "chat_member",
             "my_chat_member",
             "managed_bot",        # Bot API 9.6 — managed bot updates
+            "subscription",       # Bot API 10.2 — BotSubscriptionUpdated
         ],
     )
 

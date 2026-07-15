@@ -7926,6 +7926,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     low  = text.lower()
     pts  = low.split()
     word = pts[0] if pts else ""
+    pend_key = (cid, u.id)   # ← используется и Tower, и Crash секциями ниже
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
 
@@ -7971,7 +7972,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return
 
     # ── Crash: custom bet amount reply ─────────────────────
-    pend_key = (cid, u.id)
     if pend_key in crash_custom_pending:
         pend = crash_custom_pending[pend_key]
         if datetime.now() > pend["expires"]:

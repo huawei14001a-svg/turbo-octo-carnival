@@ -7991,15 +7991,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return
 
     # ── Text shortcuts ────────────────────────────────────
-    # б / баланс → balance
+    # б / баланс → короткий приватный баланс (эфемерно, как /profile)
     if word in ("б", "баланс", "balance", "bal"):
         uu = await db_get_user(u.id, cid)
         bal = uu["vrf"] if uu else 0
         lvl = get_level(uu["experience"]) if uu else 1
-        await update.message.reply_text(
-            f"💎 {mention(u.id, u.first_name)}: <b>{fmt(bal)} VRF</b>  |  🏅 Ур. {lvl}",
-            parse_mode=ParseMode.HTML,
+        short_bal = f"💎 <b>{fmt(bal)} VRF</b>  |  🏅 Ур. {lvl}"
+        result = await send_ephemeral_or_normal(
+            context.bot, cid, u.id, short_bal, reply_to_id=update.message.message_id,
         )
+        if isinstance(result, dict) and result.get("ephemeral_message_id"):
+            try:
+                await update.message.react([ReactionTypeEmoji(emoji="👀")])
+            except TelegramError:
+                pass
         return
 
     # отмена → cancel games
@@ -8021,6 +8026,32 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # бонус → daily status
     if word in ("бонус", "bonus"):
         await cmd_bonus(update, context)
+        return
+
+    # брак → карточка брака / статус (reuse cmd_marriage)
+    if word in ("брак", "свадьба", "marriage"):
+        context.args = []
+        await cmd_marriage(update, context)
+        return
+
+    # дуэль → вызов на дуэль (обязательно ответом на сообщение соперника,
+    # так же, как у команды /duel — cmd_duel сама проверит и подскажет,
+    # если реплея нет)
+    if word in ("дуэль", "duel", "дуэл"):
+        context.args = []
+        await cmd_duel(update, context)
+        return
+
+    # помощь → /help
+    if word in ("помощь", "help", "хелп", "справка"):
+        context.args = []
+        await cmd_help(update, context)
+        return
+
+    # мины → /mines (соло-игра, реплей не нужен)
+    if word in ("мины", "мина", "mines"):
+        context.args = []
+        await cmd_mines(update, context)
         return
 
     # ── Transfer: пер [сумма] (с реплеем или @username [сумма]) ─

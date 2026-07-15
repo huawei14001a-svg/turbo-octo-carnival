@@ -3076,8 +3076,26 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔥 Серия: <b>{u['win_streak']}</b> (макс. {u['max_streak']})  🐻 <b>{u['bears']}</b>\n\n"
         f"{m_line}"
     )
-    await send_rich(context.bot, update.effective_chat.id, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
+
+    caller = update.effective_user
+    result = await send_ephemeral_or_normal(
+        context.bot, update.effective_chat.id, caller.id, fb_h,
+        reply_to_id=update.message.message_id,
+    )
+    if isinstance(result, dict) and result.get("ephemeral_message_id"):
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="👀")])
+        except TelegramError:
+            pass
+    elif not await is_bot_chat_admin(context.bot, update.effective_chat.id):
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "ℹ️ Сделай бота администратором чата, чтобы /profile был виден только тебе.",
+                reply_to_message_id=update.message.message_id,
+            )
+        except TelegramError:
+            pass
 
 
 @only_groups
@@ -3405,8 +3423,22 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 Побед: <b>{u['wins']}</b> · 🎮 Игр: <b>{u['total_games']}</b>"
     )
 
-    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
-                    reply_to_id=update.message.message_id)
+    result = await send_ephemeral_or_normal(
+        context.bot, cid, u_obj.id, fb_h, reply_to_id=update.message.message_id,
+    )
+    if isinstance(result, dict) and result.get("ephemeral_message_id"):
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="👀")])
+        except TelegramError:
+            pass
+    elif not await is_bot_chat_admin(context.bot, cid):
+        try:
+            await context.bot.send_message(
+                cid, "ℹ️ Сделай бота администратором чата, чтобы /bonus был виден только тебе.",
+                reply_to_message_id=update.message.message_id,
+            )
+        except TelegramError:
+            pass
 
 
 @only_groups

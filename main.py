@@ -699,19 +699,58 @@ def rich_media_animation(media_id: str, file) -> dict:
 # поэтому всё идёт через do_api_request с аккуратным откатом на обычные
 # send_message/edit_message_text/delete_message, если сервер не поддерживает.
 
+async def is_bot_chat_admin(bot, chat_id: int) -> bool:
+    """Проверяет, является ли сам бот администратором чата — при этом
+    эфемерные сообщения можно слать любому участнику в любой момент,
+    без callback_query_id / reply_parameters.ephemeral_message_id."""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
 async def send_ephemeral(
     bot, chat_id: int, receiver_user_id: int, text: str,
     reply_markup=None, reply_to_id: int = None, parse_mode=ParseMode.HTML,
+    callback_query_id: str = None, ephemeral_reply_message_id: int = None,
+    bot_is_admin: bool = None,
 ) -> Optional[dict]:
     """Пытается отправить эфемерное сообщение (видно только receiver_user_id).
-    Возвращает распарсенный Message-словарь при успехе (с полем
-    ephemeral_message_id), иначе None. При неудаче — НЕ шлёт fallback сама,
-    вызывающий код должен сам решить, слать ли обычное сообщение."""
+
+    По правилам Bot API 10.2 запрос валиден ТОЛЬКО если выполнено одно из:
+      1) передан callback_query_id — ответ на нажатие кнопки (в течение 15с);
+      2) передан ephemeral_reply_message_id — ответ на входящее эфемерное
+         сообщение (через reply_parameters.ephemeral_message_id);
+      3) бот сам является администратором чата — тогда можно всегда,
+         без (1) и (2). Проверяется автоматически, если bot_is_admin
+         не передан явно (лишний API-вызов get_chat_member).
+
+    Если ни одно из условий не выполнено — не шлём запрос вообще (чтобы не
+    получить в ответ обычное видимое всем сообщение по ошибке), возвращаем
+    None. Вызывающий код сам решает, что делать дальше (обычно — обычное
+    сообщение как fallback).
+
+    Возвращает распарсенный Message при успехе (там будет ephemeral_message_id),
+    иначе None."""
+    if bot_is_admin is None and not callback_query_id and not ephemeral_reply_message_id:
+        bot_is_admin = await is_bot_chat_admin(bot, chat_id)
+
+    if not (callback_query_id or ephemeral_reply_message_id or bot_is_admin):
+        log.debug("send_ephemeral: none of callback_query_id/ephemeral_reply/admin — skipping, "
+                  "would just send a normal visible message")
+        return None
+
     kw: dict = {
         "chat_id": chat_id, "text": text,
         "receiver_user_id": receiver_user_id, "parse_mode": parse_mode,
     }
-    if reply_to_id:
+    if callback_query_id:
+        kw["callback_query_id"] = callback_query_id
+    if ephemeral_reply_message_id:
+        kw["reply_parameters"] = {"ephemeral_message_id": ephemeral_reply_message_id}
+    elif reply_to_id:
         kw["reply_parameters"] = {"message_id": reply_to_id}
     if reply_markup:
         try:
@@ -720,21 +759,35 @@ async def send_ephemeral(
             pass
     try:
         result = await bot.do_api_request("sendMessage", api_kwargs=kw)
-        return result
+        # Настоящее эфемерное сообщение обязано вернуть ephemeral_message_id —
+        # если его нет, сервер молча прислал обычное сообщение (не поддерживает
+        # ещё эту функцию), и нельзя считать это успехом приватной доставки.
+        if isinstance(result, dict) and result.get("ephemeral_message_id"):
+            return result
+        log.debug("send_ephemeral: server accepted the call but returned no "
+                 "ephemeral_message_id — feature likely not live yet on this server")
+        return None
     except Exception as e:
-        log.debug("send_ephemeral fallback (not supported yet?): %s", e)
+        log.debug("send_ephemeral request failed: %s", e)
         return None
 
 
 async def send_ephemeral_or_normal(
     bot, chat_id: int, receiver_user_id: int, text: str,
     reply_markup=None, reply_to_id: int = None, parse_mode=ParseMode.HTML,
+    callback_query_id: str = None, ephemeral_reply_message_id: int = None,
+    bot_is_admin: bool = None,
 ):
     """Как send_ephemeral, но с гарантированной доставкой: если эфемерный
-    режим недоступен на сервере — просто шлёт обычное сообщение (ответом)."""
+    режим недоступен на сервере (или условия для него не выполнены) —
+    просто шлёт обычное сообщение (ответом), чтобы пользователь точно
+    получил ответ."""
     result = await send_ephemeral(
         bot, chat_id, receiver_user_id, text,
         reply_markup=reply_markup, reply_to_id=reply_to_id, parse_mode=parse_mode,
+        callback_query_id=callback_query_id,
+        ephemeral_reply_message_id=ephemeral_reply_message_id,
+        bot_is_admin=bot_is_admin,
     )
     if result is not None:
         return result
@@ -2999,6 +3052,22 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     uname = f"@{u['username']}" if u["username"] else u["first_name"]
     bars  = xp_bar(u["experience"], 14)
 
+    # ── Rich profile card ────────────────────────────
+    rich_h = (
+        f"<h2>👤 {uname}</h2>"
+        "<table bordered striped>"
+        f"<tr><td>🏅 Уровень</td><td><b>{lvl}</b> — {rank_nm}</td></tr>"
+        f"<tr><td>📊 Прогресс</td><td><code>{bars}</code> {int(pct*100)}%</td></tr>"
+        f"<tr><td>💎 VRF</td><td><mark><b>{fmt(u['vrf'])}</b></mark></td></tr>"
+        f"<tr><td>🏆 Место</td><td><b>#{pos}</b></td></tr>"
+        f"<tr><td>🎮 Всего игр</td><td><b>{u['total_games']}</b></td></tr>"
+        f"<tr><td>✅ Побед</td><td><b>{u['wins']}</b> ({wr}%)</td></tr>"
+        f"<tr><td>❌ Поражений</td><td><b>{u['losses']}</b></td></tr>"
+        f"<tr><td>🔥 Серия</td><td><b>{u['win_streak']}</b> (макс. {u['max_streak']})</td></tr>"
+        f"<tr><td>🐻 Медведей</td><td><b>{u['bears']}</b></td></tr>"
+        "</table>"
+        f"<blockquote>{m_line}</blockquote>"
+    )
     fb_h = (
         f"👤 <b>{mention(target.id, u['first_name'])}</b>\n\n"
         f"🏅 Ур. <b>{lvl}</b> — {rank_nm}  📊 [{bars}] {int(pct*100)}%\n"
@@ -3007,19 +3076,8 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🔥 Серия: <b>{u['win_streak']}</b> (макс. {u['max_streak']})  🐻 <b>{u['bears']}</b>\n\n"
         f"{m_line}"
     )
-
-    # Приватно: карточка уходит в ЛС тому, кто вызвал /profile (не всей
-    # группе). Если ЛС ещё не открыт — короткая публичная подсказка.
-    caller = update.effective_user
-    delivered = await send_private_or_prompt(
-        context, update.effective_chat.id, caller, fb_h,
-        prompt_reply_to_id=update.message.message_id,
-    )
-    if delivered:
-        try:
-            await update.message.react([ReactionTypeEmoji(emoji="👀")])
-        except TelegramError:
-            pass
+    await send_rich(context.bot, update.effective_chat.id, html=rich_h, fallback_html=fb_h,
+                    reply_to_id=update.message.message_id)
 
 
 @only_groups
@@ -3347,15 +3405,8 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 Побед: <b>{u['wins']}</b> · 🎮 Игр: <b>{u['total_games']}</b>"
     )
 
-    # Приватно: как и /profile — уходит в ЛС вызвавшему, не в общий чат.
-    delivered = await send_private_or_prompt(
-        context, cid, u_obj, fb_h, prompt_reply_to_id=update.message.message_id,
-    )
-    if delivered:
-        try:
-            await update.message.react([ReactionTypeEmoji(emoji="👀")])
-        except TelegramError:
-            pass
+    await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
+                    reply_to_id=update.message.message_id)
 
 
 @only_groups
@@ -4942,6 +4993,45 @@ async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ══════════════════════════════════════════════════════
 #              ADMIN PANEL
 # ══════════════════════════════════════════════════════
+
+async def cmd_checkephemeral(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Реальная проверка: поддерживает ли сервер Telegram эфемерные
+    сообщения ПРЯМО СЕЙЧАС. Не гадаем — пробуем настоящий вызов и смотрим,
+    вернулся ли ephemeral_message_id."""
+    if not await is_group_or_bot_admin(update):
+        await update.message.reply_text("❌ Только для администраторов")
+        return
+
+    cid = update.effective_chat.id
+    u   = update.effective_user
+    bot_admin = await is_bot_chat_admin(context.bot, cid)
+
+    lines = [
+        "🔍 <b>Диагностика эфемерных сообщений</b>\n",
+        f"{'✅' if bot_admin else '❌'} Бот — админ этого чата "
+        f"({'можно слать эфемерные без ограничений' if bot_admin else 'нужен callback_query_id или ephemeral reply'})",
+    ]
+
+    if bot_admin:
+        result = await send_ephemeral(
+            context.bot, cid, u.id,
+            "🔒 Тестовое эфемерное сообщение — если ты это видишь, а другие "
+            "участники чата — нет, значит функция реально работает.",
+            bot_is_admin=True,
+        )
+        if result:
+            lines.append(f"✅ Сервер вернул ephemeral_message_id: <code>{result.get('ephemeral_message_id')}</code>")
+            lines.append("🎉 Эфемерные сообщения РАБОТАЮТ на этом сервере!")
+        else:
+            lines.append("❌ Сервер принял запрос, но НЕ вернул ephemeral_message_id")
+            lines.append("➡️ Значит функция технически ещё не активна на серверах Telegram "
+                         "(даже при правильном вызове по всем правилам API).")
+    else:
+        lines.append("\nℹ️ Сделай бота администратором чата и повтори /checkephemeral, "
+                     "чтобы протестировать без необходимости в callback_query_id.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_group_or_bot_admin(update):
@@ -9996,7 +10086,8 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
 
     # Admin
-    app.add_handler(CommandHandler("admin",        cmd_admin))
+    app.add_handler(CommandHandler("admin",          cmd_admin))
+    app.add_handler(CommandHandler("checkephemeral", cmd_checkephemeral))
     app.add_handler(CommandHandler("givevrf",      cmd_givevrf))
     app.add_handler(CommandHandler("takevrf",      cmd_takevrf))
     app.add_handler(CommandHandler("givebear",     cmd_givebear))

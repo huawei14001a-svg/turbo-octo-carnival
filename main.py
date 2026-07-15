@@ -1898,22 +1898,20 @@ def _gw_kb_react(sid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _gw_kb_bw(sid: str, max_bears: int) -> InlineKeyboardMarkup:
-    """Step 2: bears per winner × number of winners."""
+def _gw_kb_bw(sid: str) -> InlineKeyboardMarkup:
+    """Step 2: bears per winner × number of winners.
+    Без ограничения по "балансу" — медведи не накапливаются внутренним
+    счётчиком бота, их реально раздают админы (как подарки в Telegram),
+    поэтому организатор розыгрыша сам решает, сколько разыграть."""
     presets = [(1,1),(1,2),(1,3),(2,1),(2,2),(3,1),(5,1),(3,3),(5,5),(10,1)]
     rows, row = [], []
     for b, w in presets:
-        if b * w > max_bears:
-            continue
         row.append(SBtn(f"{b}🐻×{w}", style="primary",
                         callback_data=f"gws:{sid}:bw:{b}:{w}"))
         if len(row) == 4:
             rows.append(row); row = []
     if row:
         rows.append(row)
-    if not rows:
-        rows.append([SBtn("1🐻×1", style="primary",
-                          callback_data=f"gws:{sid}:bw:1:1")])
     rows.append([SBtn("Отмена", style="danger",
                       callback_data=f"gws:{sid}:cancel")])
     return InlineKeyboardMarkup(rows)
@@ -1976,19 +1974,15 @@ async def _end_giveaway(bot, key: str) -> None:
     winners_n = gw["winners"]
     parts     = list(gw["participants"])
 
-    # ── No participants → return bears ────────────────
+    # ── No participants → просто ничья, награда никому не идёт ────
+    # (раньше тут "возвращали" медведи организатору — но раз мы больше
+    # не списываем их при старте розыгрыша, это превратилось бы в
+    # бесплатный фарm медведей из ничего)
     if not parts:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
-                (bears * winners_n, org_id, cid),
-            )
-            await db.commit()
         try:
             await bot.edit_message_text(
                 f"🐻 <b>Розыгрыш завершён</b>\n\n"
-                f"😔 Никто не поставил реакцию...\n"
-                f"🐻 Медведи возвращены организатору.",
+                f"😔 Никто не поставил реакцию...",
                 chat_id=cid, message_id=msg_id,
                 parse_mode=ParseMode.HTML,
             )
@@ -2005,12 +1999,6 @@ async def _end_giveaway(bot, key: str) -> None:
             await db.execute(
                 "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
                 (bears, w_id, cid),
-            )
-        unused = (winners_n - actual) * bears
-        if unused > 0:
-            await db.execute(
-                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
-                (unused, org_id, cid),
             )
         await db.commit()
 
@@ -2123,30 +2111,22 @@ async def on_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @only_groups
 async def cmd_giveaway(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Launch the bear giveaway wizard."""
+    """Launch the bear giveaway wizard.
+    Медведи не проверяются по внутреннему балансу бота — их реально выдают
+    админы как подарки прямо в Telegram, бот их не отслеживает 1:1, поэтому
+    любой может настроить и запустить розыгрыш без проверки "баланса"."""
     u   = update.effective_user
     cid = update.effective_chat.id
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
-    uu  = await db_get_user(u.id, cid)
-
-    if not uu or uu.get("bears", 0) < 1:
-        await update.message.reply_text(
-            f"❌ <b>Нет медведей для розыгрыша!</b>\n\n"
-            f"🐻 Медведи выдаются за каждые <b>10 побед</b> в играх.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
     sid = str(uuid.uuid4())[:8]
     giveaway_setups[sid] = {
         "cid": cid, "org_id": u.id, "org_name": u.first_name,
         "reaction": None, "bears": 1, "winners": 1, "minutes": 5,
-        "bears_avail": uu["bears"],
     }
 
     await update.message.reply_text(
         f"🐻 <b>Розыгрыш медведей</b>\n\n"
-        f"У тебя: <b>{uu['bears']}🐻</b>\n\n"
         f"<b>Шаг 1 / 3</b> — Выбери реакцию для участия:",
         parse_mode=ParseMode.HTML,
         reply_markup=_gw_kb_react(sid),
@@ -2955,6 +2935,34 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     u_data = dict(row) if row else None
 
     results = []
+
+    # ── Giveaway launch card ──────────────────────────
+    # Позволяет запустить визард розыгрыша прямо из Inline-режима — не нужно
+    # писать /giveaway руками. ВАЖНО: чтобы бот мог считать реакции, он
+    # обязательно должен уже состоять в том чате, где будет запущен
+    # розыгрыш — это ограничение самого Telegram (апдейты о реакциях
+    # приходят только из чатов, где бот присутствует), а не бота.
+    gw_trigger = any(t in q_text for t in ("розыгрыш", "медвед", "giveaway", "🐻"))
+    gw_sid = str(uuid.uuid4())[:8]
+    giveaway_setups[gw_sid] = {
+        "cid": None,   # определится в момент первого нажатия кнопки в реальном чате
+        "org_id": uid, "org_name": query.from_user.first_name,
+        "reaction": None, "bears": 1, "winners": 1, "minutes": 5,
+    }
+    gw_article = InlineQueryResultArticle(
+        id=f"gw:{gw_sid}",
+        title="🐻 Запустить розыгрыш медведей",
+        description="Работает только в чатах, где бот уже добавлен",
+        input_message_content=InputTextMessageContent(
+            "🐻 <b>Розыгрыш медведей</b>\n\n<b>Шаг 1 / 3</b> — Выбери реакцию для участия:",
+            parse_mode=ParseMode.HTML,
+        ),
+        reply_markup=_gw_kb_react(gw_sid),
+    )
+    if gw_trigger:
+        results.insert(0, gw_article)
+    else:
+        results.append(gw_article)
 
     # ── Referral card ────────────────────────────────
     bot_info     = await context.bot.get_me()
@@ -6702,6 +6710,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("❌ Это не твой розыгрыш!", show_alert=True)
             return
 
+        # cid неизвестен, если визард запущен через Inline-режим (setup["cid"]
+        # изначально None) — как только у callback появляется query.message
+        # (то есть бот реально видит этот чат), запоминаем его. Если бота в
+        # чате нет вообще, query.message будет None и на шаге "go" мы честно
+        # объясним, почему трекать реакции не получится.
+        if setup["cid"] is None and query.message:
+            setup["cid"] = query.message.chat_id
+        cid_gw = setup["cid"]
+
         # ── Cancel ───────────────────────────────────────
         if step == "cancel":
             giveaway_setups.pop(sid, None)
@@ -6721,7 +6738,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"<b>Шаг 2 / 3</b> — Выбери медведей и победителей:\n"
                 f"<i>Формат: 🐻 на победителя × кол-во победителей</i>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=_gw_kb_bw(sid, setup["bears_avail"]),
+                reply_markup=_gw_kb_bw(sid),
             )
             return
 
@@ -6729,12 +6746,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if step == "bw":
             bears   = int(parts[3])
             winners = int(parts[4])
-            if bears * winners > setup["bears_avail"]:
-                await query.answer(
-                    f"❌ Нужно {bears*winners}🐻, у тебя только {setup['bears_avail']}🐻",
-                    show_alert=True,
-                )
-                return
             setup["bears"]   = bears
             setup["winners"] = winners
             rl = "✨ Любую" if setup["reaction"] is None else f"«{setup['reaction']}»"
@@ -6761,7 +6772,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🐻 <b>Розыгрыш — Подтверждение</b>\n\n"
                 f"🎯 Реакция: <b>{rl}</b>\n"
                 f"🎁 Приз: <b>{b}🐻</b> каждому из <b>{w}</b> победителей\n"
-                f"💸 Стоимость: <b>{b*w}🐻</b> (списывается сразу)\n"
                 f"⏱ Время: <b>{m} мин</b>\n\n"
                 f"Всё верно? Запускаем?",
                 parse_mode=ParseMode.HTML,
@@ -6776,23 +6786,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await query.answer("❌ Сессия истекла", show_alert=True)
                 return
 
-            # Re-check bears
-            uu = await db_get_user(setup["org_id"], cid)
-            cost = setup["bears"] * setup["winners"]
-            if not uu or uu.get("bears", 0) < cost:
+            if not cid_gw:
+                # Бот не видит этот чат вообще (запущено через Inline в чате,
+                # где бота нет) — реакции физически невозможно отследить,
+                # честно объясняем вместо того, чтобы тихо не заработать.
                 await query.answer(
-                    f"❌ Недостаточно 🐻 (нужно {cost}, есть {uu.get('bears',0) if uu else 0})",
+                    "❌ Бот должен быть добавлен в этот чат, чтобы считать "
+                    "реакции — иначе Telegram просто не пришлёт боту эти события.",
                     show_alert=True,
                 )
+                try:
+                    await query.edit_message_text(
+                        "❌ <b>Не получилось запустить розыгрыш здесь</b>\n\n"
+                        "Бот не состоит в этом чате, поэтому не сможет увидеть "
+                        "реакции участников (это ограничение самого Telegram, "
+                        "а не бота). Добавь бота в чат и попробуй снова.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
                 return
-
-            # Deduct bears immediately
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE users SET bears=bears-? WHERE user_id=? AND chat_id=?",
-                    (cost, setup["org_id"], cid),
-                )
-                await db.commit()
 
             await query.answer("🚀 Розыгрыш запускается!")
             await query.edit_message_text(
@@ -6813,13 +6826,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"🔮 Победители выбираются случайно!"
             )
             gw_msg = await context.bot.send_message(
-                cid, gw_text, parse_mode=ParseMode.HTML,
+                cid_gw, gw_text, parse_mode=ParseMode.HTML,
             )
 
-            key = f"{cid}:{gw_msg.message_id}"
+            key = f"{cid_gw}:{gw_msg.message_id}"
             giveaway_active[key] = {
                 "sid":        sid,
-                "cid":        cid,
+                "cid":        cid_gw,
                 "msg_id":     gw_msg.message_id,
                 "org_id":     setup["org_id"],
                 "org_name":   setup["org_name"],

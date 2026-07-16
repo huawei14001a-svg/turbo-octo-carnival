@@ -45,6 +45,7 @@ from telegram.ext import (
     InlineQueryHandler,
     MessageHandler,
     MessageReactionHandler,
+    TypeHandler,
     filters,
 )
 
@@ -111,6 +112,45 @@ MIN_BET             = 10
 # ── Referral ──────────────────────────────────────────
 REFERRAL_BONUS_INVITER = 200   # VRF to the person who shared the link
 REFERRAL_BONUS_NEW     = 150   # VRF to the new user
+
+# ── Атаки на игроков (кража баланса у офлайн-пользователей) ──
+# "Онлайн/офлайн" — это приближение: Bot API не даёт боту знать реальный
+# статус присутствия пользователя, поэтому "офлайн" здесь означает
+# "не проявлял активность в этом боте дольше ATTACK_OFFLINE_MIN минут".
+ATTACK_COOLDOWN_MIN   = 20     # раз в сколько минут можно атаковать
+ATTACK_OFFLINE_MIN    = 8      # цель должна молчать хотя бы столько минут
+ATTACK_BASE_CHANCE    = 0.45   # базовый шанс успеха атаки
+ATTACK_STEAL_PCT      = 0.15   # % баланса цели, который крадётся при успехе
+ATTACK_MIN_TARGET_VRF = 100    # цель должна иметь хотя бы столько VRF
+ATTACK_ROLE_BONUS     = 0.15   # бонус к шансу у роли "Налётчик"
+ATTACK_DEFENSE_PENALTY_PER_LVL = 0.05   # штраф к шансу за уровень защиты клана цели
+
+# ── Кланы ──────────────────────────────────────────────
+CLAN_CREATE_COST      = 1000   # стоимость создания клана (спишется с автора)
+CLAN_NAME_MIN, CLAN_NAME_MAX = 3, 24
+CLAN_RAID_COOLDOWN_MIN = 90    # раз в сколько минут клан может рейдить
+CLAN_RAID_BASE_CHANCE  = 0.40
+CLAN_RAID_STEAL_PCT    = 0.12  # % казны цели при успешном рейде
+CLAN_RAID_MIN_TREASURY = 200   # у цели должно быть хотя бы столько в казне
+CLAN_DEFENSE_BASE_COST = 500   # цена апгрейда защиты — растёт с уровнем (×уровень)
+CLAN_MAX_DEFENSE_LVL   = 10
+
+CLAN_ROLES = {
+    "raider":    {"emoji": "⚔️", "label": "Налётчик",
+                 "desc": f"+{int(ATTACK_ROLE_BONUS*100)}% к шансу успеха в атаках/рейдах"},
+    "defender":  {"emoji": "🛡", "label": "Страж",
+                 "desc": "Усиливает защиту казны клана от чужих рейдов"},
+    "treasurer": {"emoji": "💰", "label": "Казначей",
+                 "desc": "Может выводить VRF из казны клана"},
+    "member":    {"emoji": "👤", "label": "Житель",
+                 "desc": "Без особых бонусов — просто участник клана"},
+}
+
+# ── Ферма (заменяет обычный ежедневный бонус, часть уходит в казну) ──
+FARM_COOLDOWN_H   = 3
+FARM_BASE_MIN     = 30
+FARM_BASE_MAX     = 80
+FARM_CLAN_SHARE   = 0.30   # доля фарма, которая автоматически уходит в казну клана
 
 # ── Telegram message effects (private chat only) ──────
 # These are built-in Telegram effect IDs (🔥 ❤ 🎉 👍 💩 🌟)
@@ -973,6 +1013,44 @@ async def db_init() -> None:
                 new_user_paid INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS clans (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id       INTEGER NOT NULL,
+                name          TEXT    NOT NULL,
+                leader_id     INTEGER NOT NULL,
+                treasury      REAL    DEFAULT 0,
+                defense_level INTEGER DEFAULT 1,
+                created_at    TEXT    NOT NULL,
+                UNIQUE (chat_id, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS clan_members (
+                user_id   INTEGER NOT NULL,
+                chat_id   INTEGER NOT NULL,
+                clan_id   INTEGER NOT NULL,
+                role      TEXT    DEFAULT 'member',
+                joined_at TEXT    NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS clan_applications (
+                user_id    INTEGER NOT NULL,
+                chat_id    INTEGER NOT NULL,
+                clan_id    INTEGER NOT NULL,
+                applied_at TEXT    NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS attack_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     INTEGER NOT NULL,
+                attacker_id INTEGER NOT NULL,
+                target_type TEXT    NOT NULL,
+                target_id   INTEGER NOT NULL,
+                success     INTEGER NOT NULL,
+                amount      REAL    DEFAULT 0,
+                ts          TEXT    NOT NULL
+            );
 
         """)
         await db.commit()
@@ -987,6 +1065,9 @@ async def db_init() -> None:
         for col_sql in (
             "ALTER TABLE users ADD COLUMN referral_by    INTEGER DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN last_active     TEXT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN last_attack     TEXT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN last_farm       TEXT DEFAULT NULL",
         ):
             try:
                 await db.execute(col_sql)
@@ -1240,6 +1321,288 @@ async def db_find_user_by_username(username: str, cid: int) -> Optional[dict]:
             return dict(row) if row else None
 
 
+async def db_touch_active(uid: int, cid: int) -> None:
+    """Отмечает пользователя как 'недавно активного' — вызывается на каждое
+    сообщение/команду. 'Офлайн' для атак = давно не было такой отметки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_active=? WHERE user_id=? AND chat_id=?",
+            (_now(), uid, cid),
+        )
+        await db.commit()
+
+
+async def _touch_active_hook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный хук (group=-1, выполняется первым): считает ЛЮБОЕ действие
+    пользователя в группе (сообщение, команду, нажатие кнопки) признаком
+    'онлайн'. Не мешает остальным хендлерам — ничего не возвращает/не глотает."""
+    u = update.effective_user
+    c = update.effective_chat
+    if not u or not c or u.is_bot or c.type == "private":
+        return
+    try:
+        await db_ensure_user(u.id, c.id, u.username or "", u.first_name)
+        await db_touch_active(u.id, c.id)
+    except Exception:
+        pass
+
+
+def user_is_offline(u: dict) -> bool:
+    la = u.get("last_active")
+    if not la:
+        return True
+    try:
+        idle_min = (datetime.now() - datetime.fromisoformat(la)).total_seconds() / 60
+    except Exception:
+        return True
+    return idle_min >= ATTACK_OFFLINE_MIN
+
+
+# ── Кланы ────────────────────────────────────────────────
+
+async def db_create_clan(cid: int, name: str, leader_id: int) -> Optional[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            cur = await db.execute(
+                "INSERT INTO clans (chat_id, name, leader_id, treasury, defense_level, created_at) "
+                "VALUES (?,?,?,0,1,?)",
+                (cid, name, leader_id, _now()),
+            )
+            await db.execute(
+                "INSERT INTO clan_members (user_id, chat_id, clan_id, role, joined_at) VALUES (?,?,?,?,?)",
+                (leader_id, cid, cur.lastrowid, "leader", _now()),
+            )
+            await db.commit()
+            return cur.lastrowid
+        except Exception:
+            return None
+
+
+async def db_get_clan(clan_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM clans WHERE id=?", (clan_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_get_clan_by_name(cid: int, name: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM clans WHERE chat_id=? AND LOWER(name)=?", (cid, name.lower())
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_get_user_clan(uid: int, cid: int) -> Optional[dict]:
+    """Клан пользователя + его роль в нём, одним запросом."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT c.*, m.role AS my_role FROM clan_members m
+               JOIN clans c ON c.id = m.clan_id
+               WHERE m.user_id=? AND m.chat_id=?""",
+            (uid, cid),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_list_clans(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT c.*, COUNT(m.user_id) AS member_count FROM clans c
+               LEFT JOIN clan_members m ON m.clan_id = c.id
+               WHERE c.chat_id=? GROUP BY c.id ORDER BY c.treasury DESC""",
+            (cid,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_clan_members(clan_id: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT m.*, u.first_name, u.username, u.vrf FROM clan_members m
+               JOIN users u ON u.user_id = m.user_id AND u.chat_id = m.chat_id
+               WHERE m.clan_id=? ORDER BY
+                 CASE m.role WHEN 'leader' THEN 0 ELSE 1 END, m.joined_at""",
+            (clan_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_add_clan_member(uid: int, cid: int, clan_id: int, role: str = "member") -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO clan_members (user_id, chat_id, clan_id, role, joined_at) "
+            "VALUES (?,?,?,?,?)",
+            (uid, cid, clan_id, role, _now()),
+        )
+        await db.commit()
+
+
+async def db_remove_clan_member(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM clan_members WHERE user_id=? AND chat_id=?", (uid, cid))
+        await db.commit()
+
+
+async def db_set_member_role(uid: int, cid: int, role: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE clan_members SET role=? WHERE user_id=? AND chat_id=?", (role, uid, cid)
+        )
+        await db.commit()
+
+
+async def db_delete_clan(clan_id: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM clans WHERE id=?", (clan_id,))
+        await db.execute("DELETE FROM clan_members WHERE clan_id=?", (clan_id,))
+        await db.execute("DELETE FROM clan_applications WHERE clan_id=?", (clan_id,))
+        await db.commit()
+
+
+async def db_clan_treasury_add(clan_id: int, amount: float) -> float:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clans SET treasury=treasury+? WHERE id=?", (amount, clan_id))
+        await db.commit()
+        async with db.execute("SELECT treasury FROM clans WHERE id=?", (clan_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0.0
+
+
+async def db_clan_treasury_sub(clan_id: int, amount: float) -> bool:
+    clan = await db_get_clan(clan_id)
+    if not clan or clan["treasury"] < amount:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clans SET treasury=treasury-? WHERE id=?", (amount, clan_id))
+        await db.commit()
+    return True
+
+
+async def db_clan_set_defense(clan_id: int, level: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clans SET defense_level=? WHERE id=?", (level, clan_id))
+        await db.commit()
+
+
+# ── Заявки в клан ──────────────────────────────────────
+
+async def db_apply_to_clan(uid: int, cid: int, clan_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO clan_applications (user_id, chat_id, clan_id, applied_at) VALUES (?,?,?,?)",
+                (uid, cid, clan_id, _now()),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def db_get_application(uid: int, cid: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM clan_applications WHERE user_id=? AND chat_id=?", (uid, cid)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def db_get_clan_applications(clan_id: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT a.*, u.first_name, u.username FROM clan_applications a
+               JOIN users u ON u.user_id=a.user_id AND u.chat_id=a.chat_id
+               WHERE a.clan_id=? ORDER BY a.applied_at""",
+            (clan_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_remove_application(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM clan_applications WHERE user_id=? AND chat_id=?", (uid, cid))
+        await db.commit()
+
+
+# ── Атаки ──────────────────────────────────────────────
+
+async def db_log_attack(cid: int, attacker_id: int, target_type: str, target_id: int,
+                        success: bool, amount: float) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO attack_log (chat_id, attacker_id, target_type, target_id, success, amount, ts) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (cid, attacker_id, target_type, target_id, int(success), amount, _now()),
+        )
+        await db.execute(
+            "UPDATE users SET last_attack=? WHERE user_id=? AND chat_id=?",
+            (_now(), attacker_id, cid),
+        )
+        await db.commit()
+
+
+def attack_cooldown_left(u: dict, cooldown_min: int) -> int:
+    la = u.get("last_attack")
+    if not la:
+        return 0
+    elapsed = (datetime.now() - datetime.fromisoformat(la)).total_seconds()
+    left = cooldown_min * 60 - elapsed
+    return max(0, int(left))
+
+
+async def db_clan_last_raid(clan_id: int) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT ts FROM attack_log WHERE attacker_id=-? AND target_type='clan_raid_marker'
+               ORDER BY ts DESC LIMIT 1""",
+            (clan_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def db_clan_mark_raid(clan_id: int) -> None:
+    """Отдельная 'метка' времени последнего рейда клана — attacker_id=-clan_id
+    (отрицательный), чтобы не заводить отдельную таблицу под один timestamp."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO attack_log (chat_id, attacker_id, target_type, target_id, success, amount, ts) "
+            "VALUES (0, ?, 'clan_raid_marker', 0, 1, 0, ?)",
+            (-clan_id, _now()),
+        )
+        await db.commit()
+
+
+# ── Фарм ───────────────────────────────────────────────
+
+def farm_cooldown_left(u: dict) -> int:
+    lf = u.get("last_farm")
+    if not lf:
+        return 0
+    elapsed = (datetime.now() - datetime.fromisoformat(lf)).total_seconds()
+    left = FARM_COOLDOWN_H * 3600 - elapsed
+    return max(0, int(left))
+
+
+async def db_touch_farm(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_farm=? WHERE user_id=? AND chat_id=?", (_now(), uid, cid)
+        )
+        await db.commit()
+
+
 # ── Marriages ──────────────────────────────────────────
 
 async def db_get_marriage(uid: int, cid: int) -> Optional[dict]:
@@ -1352,7 +1715,8 @@ def mention(uid: int, name: str) -> str:
     safe = str(name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f'<a href="tg://user?id={uid}">{safe}</a>'
 
-def fmt(n: int) -> str:
+def fmt(n) -> str:
+    n = int(round(n))
     if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
     if n >= 10_000:    return f"{n/1_000:.1f}K"
     return f"{n:,}".replace(",", " ")
@@ -7807,7 +8171,501 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
+    # ══════════════════════════════════════════════════════
+    #           КЛАНЫ  🏰  callback-обработчики
+    # ══════════════════════════════════════════════════════
+    if data.startswith("cl:"):
+        parts  = data.split(":")
+        action = parts[1]
+
+        if action == "noop":
+            await query.answer()
+            return
+
+        if action == "cancel_msg":
+            await query.answer("Отменено")
+            try:
+                await query.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+            return
+
+        if action == "back":
+            text, kb = await _clan_hub_text(who.id, cid)
+            await query.answer()
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except TelegramError:
+                pass
+            return
+
+        # ── Создать клан ──────────────────────────────────
+        if action == "create":
+            existing = await db_get_user_clan(who.id, cid)
+            if existing:
+                await query.answer("❌ Ты уже состоишь в клане!", show_alert=True)
+                return
+            uu = await db_get_user(who.id, cid)
+            if not uu or uu["vrf"] < CLAN_CREATE_COST:
+                await query.answer(
+                    f"❌ Нужно {fmt(CLAN_CREATE_COST)} VRF, у тебя {fmt(uu['vrf'] if uu else 0)}",
+                    show_alert=True,
+                )
+                return
+            clan_pending_input[(cid, who.id)] = {
+                "kind": "clan_name", "expires": datetime.now() + timedelta(seconds=90),
+            }
+            await query.answer()
+            try:
+                await context.bot.send_message(
+                    cid,
+                    f"✏️ {mention(who.id, who.first_name)}, напиши название клана "
+                    f"({CLAN_NAME_MIN}-{CLAN_NAME_MAX} символов) ответом на это сообщение:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=ForceReply(selective=True, input_field_placeholder="Название клана"),
+                )
+            except TelegramError:
+                pass
+            return
+
+        # ── Список кланов / вступление ────────────────────
+        if action == "browse":
+            clans = await db_list_clans(cid)
+            if not clans:
+                await query.answer("Кланов в этом чате пока нет", show_alert=True)
+                return
+            rows = [[SBtn(f"🏰 {c['name']} · 👥{c['member_count']} · 💰{fmt(c['treasury'])}",
+                         style="primary", callback_data=f"cl:apply:{c['id']}")]
+                   for c in clans[:15]]
+            rows.append([SBtn("Отмена", style="danger", callback_data="cl:cancel_msg")])
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    "📋 <b>Кланы этого чата</b>\n\nВыбери, куда подать заявку:",
+                    parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "apply":
+            clan_id = int(parts[2])
+            if await db_get_user_clan(who.id, cid):
+                await query.answer("❌ Ты уже состоишь в клане!", show_alert=True)
+                return
+            if await db_get_application(who.id, cid):
+                await query.answer("❌ Заявка уже отправлена, жди решения лидера", show_alert=True)
+                return
+            clan = await db_get_clan(clan_id)
+            if not clan:
+                await query.answer("❌ Клан не найден", show_alert=True)
+                return
+            ok = await db_apply_to_clan(who.id, cid, clan_id)
+            if not ok:
+                await query.answer("❌ Не удалось подать заявку", show_alert=True)
+                return
+            await query.answer("✅ Заявка отправлена!")
+            try:
+                await query.edit_message_text(
+                    f"📨 Заявка в клан <b>{clan['name']}</b> отправлена! Жди решения лидера.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            # Уведомляем лидера эфемерно (или в личку/чат, если недоступно)
+            kb_appr = InlineKeyboardMarkup([[
+                SBtn("✅ Принять", style="success", callback_data=f"cl:appr:{who.id}"),
+                SBtn("❌ Отклонить", style="danger", callback_data=f"cl:rej:{who.id}"),
+            ]])
+            notice = (
+                f"📨 <b>Новая заявка в клан «{clan['name']}»</b>\n\n"
+                f"{mention(who.id, who.first_name)} хочет вступить."
+            )
+            await send_ephemeral_or_normal(
+                context.bot, cid, clan["leader_id"], notice, reply_markup=kb_appr,
+            )
+            return
+
+        # ── Одобрение/отклонение заявки лидером ───────────
+        if action in ("appr", "rej"):
+            applicant_id = int(parts[2])
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan or my_clan["my_role"] != "leader":
+                await query.answer("❌ Решать заявки может только лидер клана", show_alert=True)
+                return
+            app = await db_get_application(applicant_id, cid)
+            if not app or app["clan_id"] != my_clan["id"]:
+                await query.answer("❌ Заявка не найдена или уже обработана", show_alert=True)
+                return
+            await db_remove_application(applicant_id, cid)
+            app_u = await db_get_user(applicant_id, cid)
+            app_name = app_u["first_name"] if app_u else "Игрок"
+            if action == "appr":
+                await db_add_clan_member(applicant_id, cid, my_clan["id"], "member")
+                await query.answer("✅ Принят(а) в клан!")
+                try:
+                    await query.edit_message_text(
+                        f"✅ {mention(applicant_id, app_name)} принят(а) в клан <b>{my_clan['name']}</b>!",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                await send_ephemeral_or_normal(
+                    context.bot, cid, applicant_id,
+                    f"🎉 Тебя приняли в клан <b>{my_clan['name']}</b>! Добро пожаловать.",
+                )
+            else:
+                await query.answer("Отклонено")
+                try:
+                    await query.edit_message_text(
+                        f"❌ Заявка {mention(applicant_id, app_name)} в клан <b>{my_clan['name']}</b> отклонена.",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
+                await send_ephemeral_or_normal(
+                    context.bot, cid, applicant_id,
+                    f"❌ Твою заявку в клан <b>{my_clan['name']}</b> отклонили.",
+                )
+            return
+
+        # ── Список заявок (для лидера) ────────────────────
+        if action == "apps":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan or my_clan["my_role"] != "leader":
+                await query.answer("❌ Только для лидера", show_alert=True)
+                return
+            apps = await db_get_clan_applications(my_clan["id"])
+            await query.answer()
+            if not apps:
+                try:
+                    await query.edit_message_text("📨 Заявок пока нет.",
+                                                  reply_markup=InlineKeyboardMarkup(
+                                                      [[SBtn("← Назад", style="primary", callback_data="cl:back")]]))
+                except TelegramError:
+                    pass
+                return
+            lines = ["📨 <b>Заявки на вступление</b>\n"]
+            rows = []
+            for a in apps[:10]:
+                label = f"@{a['username']}" if a["username"] else a["first_name"]
+                lines.append(f"• {label}")
+                rows.append([
+                    SBtn(f"✅ {label}", style="success", callback_data=f"cl:appr:{a['user_id']}"),
+                    SBtn("❌", style="danger", callback_data=f"cl:rej:{a['user_id']}"),
+                ])
+            rows.append([SBtn("← Назад", style="primary", callback_data="cl:back")])
+            try:
+                await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                              reply_markup=InlineKeyboardMarkup(rows))
+            except TelegramError:
+                pass
+            return
+
+        # ── Роли ───────────────────────────────────────────
+        if action == "roles":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            rows = [[SBtn(f"{r['emoji']} {r['label']}" + (" ✅" if k == my_clan["my_role"] else ""),
+                         style="success" if k == my_clan["my_role"] else "primary",
+                         callback_data=f"cl:setrole:{k}")]
+                   for k, r in CLAN_ROLES.items()]
+            rows.append([SBtn("← Назад", style="primary", callback_data="cl:back")])
+            descs = "\n".join(f"{r['emoji']} <b>{r['label']}</b> — {r['desc']}" for r in CLAN_ROLES.values())
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    f"🎭 <b>Выбери свою роль в клане</b>\n\n{descs}",
+                    parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "setrole":
+            role = parts[2]
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            if role not in CLAN_ROLES or role == "leader":
+                await query.answer("❌ Неверная роль", show_alert=True)
+                return
+            if my_clan["my_role"] == "leader":
+                await query.answer("👑 Лидер не может сменить роль — сначала передай лидерство", show_alert=True)
+                return
+            await db_set_member_role(who.id, cid, role)
+            r = CLAN_ROLES[role]
+            await query.answer(f"✅ Теперь ты {r['emoji']} {r['label']}")
+            text, kb = await _clan_hub_text(who.id, cid)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except TelegramError:
+                pass
+            return
+
+        # ── Участники ────────────────────────────────────
+        if action == "members":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            members = await db_get_clan_members(my_clan["id"])
+            lines = [f"👥 <b>Участники клана «{my_clan['name']}»</b> ({len(members)})\n"]
+            for m in members:
+                r = CLAN_ROLES.get(m["role"], CLAN_ROLES["member"])
+                label = "👑 Лидер" if m["role"] == "leader" else f"{r['emoji']} {r['label']}"
+                lines.append(f"• {mention(m['user_id'], m['first_name'])} — {label}")
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    "\n".join(lines), parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[SBtn("← Назад", style="primary", callback_data="cl:back")]]),
+                )
+            except TelegramError:
+                pass
+            return
+
+        # ── Казна (карточка) ──────────────────────────────
+        if action == "treasury":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            can_withdraw = my_clan["my_role"] in ("leader", "treasurer")
+            text = (
+                f"💰 <b>Казна клана «{my_clan['name']}»</b>\n\n"
+                f"Баланс: <b>{fmt(my_clan['treasury'])} VRF</b>\n\n"
+                f"Пополнить: напиши <code>казна +500</code>\n"
+                + (f"Вывести: напиши <code>казна -200</code> (доступно тебе как {CLAN_ROLES[my_clan['my_role']]['label']})"
+                   if can_withdraw else
+                   "Вывод доступен только 💰 Казначею и 👑 Лидеру.")
+            )
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    text, parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[SBtn("← Назад", style="primary", callback_data="cl:back")]]),
+                )
+            except TelegramError:
+                pass
+            return
+
+        # ── Защита ─────────────────────────────────────────
+        if action == "defense":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            lvl  = my_clan["defense_level"]
+            cost = CLAN_DEFENSE_BASE_COST * lvl
+            can_upgrade = my_clan["my_role"] in ("leader", "treasurer") and lvl < CLAN_MAX_DEFENSE_LVL
+            text = (
+                f"🛡 <b>Защита клана «{my_clan['name']}»</b>\n\n"
+                f"Текущий уровень: <b>{lvl}</b>/{CLAN_MAX_DEFENSE_LVL}\n"
+                f"Снижает шанс успеха вражеских атак и рейдов.\n\n"
+            )
+            rows = []
+            if lvl >= CLAN_MAX_DEFENSE_LVL:
+                text += "✅ Максимальный уровень достигнут!"
+            else:
+                text += f"Апгрейд до <b>{lvl+1}</b>: <b>{fmt(cost)} VRF</b> из казны"
+                if can_upgrade:
+                    rows.append([SBtn(f"🛡 Улучшить за {fmt(cost)} VRF", style="success",
+                                      callback_data="cl:upgrade_def")])
+            rows.append([SBtn("← Назад", style="primary", callback_data="cl:back")])
+            await query.answer()
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                              reply_markup=InlineKeyboardMarkup(rows))
+            except TelegramError:
+                pass
+            return
+
+        if action == "upgrade_def":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan or my_clan["my_role"] not in ("leader", "treasurer"):
+                await query.answer("❌ Нет прав", show_alert=True)
+                return
+            if my_clan["defense_level"] >= CLAN_MAX_DEFENSE_LVL:
+                await query.answer("✅ Уже максимальный уровень", show_alert=True)
+                return
+            cost = CLAN_DEFENSE_BASE_COST * my_clan["defense_level"]
+            ok = await db_clan_treasury_sub(my_clan["id"], cost)
+            if not ok:
+                await query.answer(f"❌ В казне недостаточно средств (нужно {fmt(cost)})", show_alert=True)
+                return
+            await db_clan_set_defense(my_clan["id"], my_clan["defense_level"] + 1)
+            await query.answer(f"🛡 Защита улучшена до уровня {my_clan['defense_level']+1}!")
+            text, kb = await _clan_hub_text(who.id, cid)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except TelegramError:
+                pass
+            return
+
+        # ── Рейд на вражескую казну ────────────────────────
+        if action == "raid_list":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            last_raid = await db_clan_last_raid(my_clan["id"])
+            if last_raid:
+                elapsed = (datetime.now() - datetime.fromisoformat(last_raid)).total_seconds()
+                left = CLAN_RAID_COOLDOWN_MIN * 60 - elapsed
+                if left > 0:
+                    await query.answer(f"⏰ Рейд будет доступен через {fmt_cd(int(left))}", show_alert=True)
+                    return
+            clans = await db_list_clans(cid)
+            targets = [c for c in clans if c["id"] != my_clan["id"] and c["treasury"] >= CLAN_RAID_MIN_TREASURY]
+            await query.answer()
+            if not targets:
+                try:
+                    await query.edit_message_text(
+                        "⚔️ Нет доступных целей для рейда (у остальных кланов слишком мало в казне).",
+                        reply_markup=InlineKeyboardMarkup([[SBtn("← Назад", style="primary", callback_data="cl:back")]]),
+                    )
+                except TelegramError:
+                    pass
+                return
+            try:
+                await query.edit_message_text(
+                    "⚔️ <b>Выбери цель для рейда</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_clan_kb_raid_targets(targets, my_clan["id"]),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "raid":
+            target_clan_id = int(parts[2])
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            target_clan = await db_get_clan(target_clan_id)
+            if not target_clan or target_clan["chat_id"] != cid:
+                await query.answer("❌ Клан-цель не найден", show_alert=True)
+                return
+            if target_clan["treasury"] < CLAN_RAID_MIN_TREASURY:
+                await query.answer("❌ У цели слишком мало в казне", show_alert=True)
+                return
+
+            chance = await calc_raid_chance(my_clan, target_clan)
+            success = random.random() < chance
+            await db_clan_mark_raid(my_clan["id"])
+            await db_log_attack(cid, who.id, "clan", target_clan_id, success, 0)
+
+            if success:
+                steal = round(target_clan["treasury"] * CLAN_RAID_STEAL_PCT)
+                await db_clan_treasury_sub(target_clan_id, steal)
+                await db_clan_treasury_add(my_clan["id"], steal)
+                await query.answer("💥 Рейд удался!")
+                result_text = (
+                    f"⚔️💥 <b>РЕЙД УДАЛСЯ!</b>\n\n"
+                    f"Клан <b>{my_clan['name']}</b> атаковал казну клана "
+                    f"<b>{target_clan['name']}</b> и захватил <b>{fmt(steal)} VRF</b>!\n"
+                    f"(шанс был {int(chance*100)}%)"
+                )
+            else:
+                await query.answer("🛡 Рейд отражён!")
+                result_text = (
+                    f"⚔️🛡 <b>РЕЙД ОТРАЖЁН!</b>\n\n"
+                    f"Клан <b>{my_clan['name']}</b> попытался атаковать казну клана "
+                    f"<b>{target_clan['name']}</b>, но защита устояла.\n"
+                    f"(шанс был {int(chance*100)}%)"
+                )
+            try:
+                await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+            try:
+                await context.bot.send_message(cid, result_text, parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+            return
+
+        # ── Покинуть клан ──────────────────────────────────
+        if action == "leave":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты не в клане", show_alert=True)
+                return
+            if my_clan["my_role"] == "leader":
+                await query.answer("👑 Лидер не может просто уйти — расформируй клан или передай лидерство", show_alert=True)
+                return
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    f"🚪 Точно хочешь покинуть клан <b>{my_clan['name']}</b>?",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        SBtn("✅ Да, покинуть", style="danger", callback_data="cl:leave_confirm"),
+                        SBtn("Отмена", style="primary", callback_data="cl:back"),
+                    ]]),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "leave_confirm":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan:
+                await query.answer("❌ Ты уже не в клане", show_alert=True)
+                return
+            await db_remove_clan_member(who.id, cid)
+            await query.answer("🚪 Ты покинул(а) клан")
+            try:
+                await query.edit_message_text(f"🚪 Ты покинул(а) клан <b>{my_clan['name']}</b>.",
+                                              parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+            return
+
+        # ── Расформировать клан (лидер) ───────────────────
+        if action == "disband":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan or my_clan["my_role"] != "leader":
+                await query.answer("❌ Только лидер может расформировать клан", show_alert=True)
+                return
+            await query.answer()
+            try:
+                await query.edit_message_text(
+                    f"❌ Точно расформировать клан <b>{my_clan['name']}</b>?\n"
+                    f"Казна ({fmt(my_clan['treasury'])} VRF) будет утеряна безвозвратно!",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        SBtn("✅ Да, расформировать", style="danger", callback_data="cl:disband_confirm"),
+                        SBtn("Отмена", style="primary", callback_data="cl:back"),
+                    ]]),
+                )
+            except TelegramError:
+                pass
+            return
+
+        if action == "disband_confirm":
+            my_clan = await db_get_user_clan(who.id, cid)
+            if not my_clan or my_clan["my_role"] != "leader":
+                await query.answer("❌ Нет прав", show_alert=True)
+                return
+            await db_delete_clan(my_clan["id"], cid)
+            await query.answer("Клан расформирован")
+            try:
+                await query.edit_message_text(f"❌ Клан <b>{my_clan['name']}</b> расформирован.",
+                                              parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
+            return
+
+        await query.answer()
+        return
+
     await query.answer()
+    return
 
 
 # ══════════════════════════════════════════════════════
@@ -7942,6 +8800,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     pend_key = (cid, u.id)   # ← используется и Tower, и Crash секциями ниже
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    await db_touch_active(u.id, cid)
 
     # ── Tower: custom bet reply ─────────────────────────────
     pend_tw = tower_custom_pending.get(pend_key)
@@ -8002,6 +8861,46 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"❌ Нужно целое число от {MIN_BET} VRF. Попробуй ещё раз:",
                 )
                 return
+
+    # ── Clan: name reply after "cl:create" ──────────────────
+    if pend_key in clan_pending_input:
+        pend = clan_pending_input[pend_key]
+        if datetime.now() > pend["expires"]:
+            clan_pending_input.pop(pend_key, None)
+        else:
+            clan_pending_input.pop(pend_key, None)
+            name = text.strip()
+            if not (CLAN_NAME_MIN <= len(name) <= CLAN_NAME_MAX):
+                await update.message.reply_text(
+                    f"❌ Название должно быть от {CLAN_NAME_MIN} до {CLAN_NAME_MAX} символов. "
+                    f"Попробуй снова: напиши «клан» → «➕ Создать клан»."
+                )
+                return
+            if await db_get_user_clan(u.id, cid):
+                await update.message.reply_text("❌ Ты уже состоишь в клане!")
+                return
+            if await db_get_clan_by_name(cid, name):
+                await update.message.reply_text("❌ Клан с таким названием уже есть в этом чате.")
+                return
+            uu = await db_get_user(u.id, cid)
+            if not uu or uu["vrf"] < CLAN_CREATE_COST:
+                await update.message.reply_text(
+                    f"❌ Нужно {fmt(CLAN_CREATE_COST)} VRF, у тебя {fmt(uu['vrf'] if uu else 0)}"
+                )
+                return
+            await db_deduct_vrf(u.id, cid, CLAN_CREATE_COST)
+            clan_id = await db_create_clan(cid, name, u.id)
+            if not clan_id:
+                await db_add_vrf(u.id, cid, CLAN_CREATE_COST)  # откат списания
+                await update.message.reply_text("❌ Не удалось создать клан, попробуй другое название.")
+                return
+            await update.message.reply_text(
+                f"🏰 <b>Клан «{name}» создан!</b>\n\n"
+                f"Ты — 👑 лидер. Приглашай участников, собирайте казну "
+                f"командой <code>казна +500</code>, защищайтесь и атакуйте другие кланы!",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
     # ── Text shortcuts ────────────────────────────────────
     # б / баланс → короткий приватный баланс (эфемерно, как /profile)
@@ -8065,6 +8964,53 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if word in ("мины", "мина", "mines"):
         context.args = []
         await cmd_mines(update, context)
+        return
+
+    # клан → клановый хаб (создать/вступить/инфо о своём клане)
+    if word in ("клан", "clan", "кланы"):
+        context.args = []
+        await cmd_clan(update, context)
+        return
+
+    # казна +N / казна -N / просто "казна" → баланс казны
+    if word in ("казна", "treasury"):
+        await handle_treasury_trigger(update, context, pts)
+        return
+
+    # атака → попытка украсть баланс у офлайн-цели (ответом на её сообщение)
+    if word in ("атака", "attack", "грабёж", "ограбить"):
+        await handle_attack_trigger(update, context)
+        return
+
+    # рейд → список кланов для атаки на чужую казну
+    if word in ("рейд", "raid"):
+        clan = await db_get_user_clan(u.id, cid)
+        if not clan:
+            await update.message.reply_text("❌ Ты не состоишь в клане.")
+            return
+        last_raid = await db_clan_last_raid(clan["id"])
+        if last_raid:
+            elapsed = (datetime.now() - datetime.fromisoformat(last_raid)).total_seconds()
+            left = CLAN_RAID_COOLDOWN_MIN * 60 - elapsed
+            if left > 0:
+                await update.message.reply_text(f"⏰ Рейд будет доступен через {fmt_cd(int(left))}")
+                return
+        clans = await db_list_clans(cid)
+        targets = [c for c in clans if c["id"] != clan["id"] and c["treasury"] >= CLAN_RAID_MIN_TREASURY]
+        if not targets:
+            await update.message.reply_text(
+                "⚔️ Нет доступных целей для рейда (у остальных кланов слишком мало в казне)."
+            )
+            return
+        await update.message.reply_text(
+            "⚔️ <b>Выбери цель для рейда</b>", parse_mode=ParseMode.HTML,
+            reply_markup=_clan_kb_raid_targets(targets, clan["id"]),
+        )
+        return
+
+    # ферма / фарм → сбор ресурсов (часть уходит в казну клана)
+    if word in ("ферма", "фарм", "farm"):
+        await handle_farm_trigger(update, context)
         return
 
     # ── Transfer: пер [сумма] (с реплеем или @username [сумма]) ─
@@ -8229,8 +9175,280 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ══════════════════════════════════════════════════════
-#                       MAIN
+#           КЛАНЫ И АТАКИ  🏰⚔️
 # ══════════════════════════════════════════════════════
+# Полная механика: создание клана, заявки на вступление с одобрением
+# лидером, самостоятельный выбор роли участником, общая казна (текстовый
+# триггер "казна +N"/"казна -N"), апгрейд защиты казны, рейды на казну
+# вражеского клана, кража баланса у офлайн-игроков, ферма ресурсов.
+# Всё чувствительное (казна, роли, заявки) — эфемерно, если бот админ чата.
+
+clan_pending_input: dict = {}   # key: (cid, uid) -> {"kind": "clan_name", "expires": datetime}
+
+
+# ── Расчёт шансов ──────────────────────────────────────
+
+async def _clan_role_count(clan_id: int, role: str) -> int:
+    members = await db_get_clan_members(clan_id)
+    return sum(1 for m in members if m["role"] == role)
+
+
+async def calc_attack_chance(attacker: dict, attacker_clan: Optional[dict],
+                             target_clan: Optional[dict]) -> float:
+    chance = ATTACK_BASE_CHANCE
+    if attacker_clan and attacker_clan.get("my_role") == "raider":
+        chance += ATTACK_ROLE_BONUS
+    if target_clan:
+        chance -= target_clan["defense_level"] * ATTACK_DEFENSE_PENALTY_PER_LVL
+        n_def = await _clan_role_count(target_clan["id"], "defender")
+        chance -= n_def * 0.04
+    return max(0.05, min(0.9, chance))
+
+
+async def calc_raid_chance(attacker_clan: dict, target_clan: dict) -> float:
+    n_raid = await _clan_role_count(attacker_clan["id"], "raider")
+    n_def  = await _clan_role_count(target_clan["id"], "defender")
+    chance = CLAN_RAID_BASE_CHANCE + n_raid * (ATTACK_ROLE_BONUS * 0.5)
+    chance -= target_clan["defense_level"] * ATTACK_DEFENSE_PENALTY_PER_LVL
+    chance -= n_def * 0.04
+    return max(0.05, min(0.85, chance))
+
+
+def _clan_kb_hub(has_clan: bool, is_leader: bool, has_apps: bool) -> InlineKeyboardMarkup:
+    if not has_clan:
+        return InlineKeyboardMarkup([
+            [SBtn("➕ Создать клан", style="success", callback_data="cl:create")],
+            [SBtn("📋 Список кланов", style="primary", callback_data="cl:browse")],
+        ])
+    rows = [
+        [SBtn("👥 Участники", style="primary", callback_data="cl:members"),
+         SBtn("🎭 Моя роль", style="primary", callback_data="cl:roles")],
+        [SBtn("💰 Казна", style="primary", callback_data="cl:treasury"),
+         SBtn("🛡 Защита", style="primary", callback_data="cl:defense")],
+        [SBtn("⚔️ Рейд на клан", style="danger", callback_data="cl:raid_list")],
+    ]
+    if is_leader:
+        app_label = "📨 Заявки 🔴" if has_apps else "📨 Заявки"
+        rows.append([SBtn(app_label, style="primary", callback_data="cl:apps"),
+                    SBtn("❌ Расформировать", style="danger", callback_data="cl:disband")])
+    else:
+        rows.append([SBtn("🚪 Покинуть клан", style="danger", callback_data="cl:leave")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _clan_hub_text(uid: int, cid: int) -> Tuple[str, InlineKeyboardMarkup]:
+    clan = await db_get_user_clan(uid, cid)
+    if not clan:
+        text = (
+            "🏰 <b>Кланы</b>\n\n"
+            "Ты пока не состоишь ни в одном клане.\n\n"
+            f"➕ Создать свой — <b>{fmt(CLAN_CREATE_COST)} VRF</b>\n"
+            f"📋 Или вступи в существующий"
+        )
+        return text, _clan_kb_hub(False, False, False)
+
+    role = CLAN_ROLES.get(clan["my_role"], CLAN_ROLES["member"])
+    is_leader = clan["my_role"] == "leader"
+    apps = await db_get_clan_applications(clan["id"]) if is_leader else []
+    members = await db_get_clan_members(clan["id"])
+
+    text = (
+        f"🏰 <b>{clan['name']}</b>\n\n"
+        f"👑 Лидер: {mention(clan['leader_id'], '')}\n"
+        f"💰 Казна: <b>{fmt(clan['treasury'])} VRF</b>\n"
+        f"🛡 Защита: уровень <b>{clan['defense_level']}</b>/{CLAN_MAX_DEFENSE_LVL}\n"
+        f"👥 Участников: <b>{len(members)}</b>\n"
+        f"🎭 Твоя роль: {role['emoji']} <b>{role['label']}</b>\n"
+    )
+    if is_leader and apps:
+        text += f"\n📨 Заявок на вступление: <b>{len(apps)}</b>"
+    return text, _clan_kb_hub(True, is_leader, bool(apps))
+
+
+async def cmd_clan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    text, kb = await _clan_hub_text(u.id, cid)
+    result = await send_ephemeral_or_normal(
+        context.bot, cid, u.id, text, reply_markup=kb,
+        reply_to_id=update.message.message_id,
+    )
+    if isinstance(result, dict) and result.get("ephemeral_message_id"):
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="🏰")])
+        except TelegramError:
+            pass
+
+
+# ── Текстовые триггеры: казна / атака / рейд / ферма ───
+
+async def handle_treasury_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE, pts: list) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    clan = await db_get_user_clan(u.id, cid)
+    if not clan:
+        await update.message.reply_text("❌ Ты не состоишь в клане. Напиши «клан», чтобы вступить или создать свой.")
+        return
+
+    if len(pts) < 2:
+        # просто "казна" — показать баланс приватно
+        result = await send_ephemeral_or_normal(
+            context.bot, cid, u.id,
+            f"💰 Казна клана <b>{clan['name']}</b>: <b>{fmt(clan['treasury'])} VRF</b>",
+            reply_to_id=update.message.message_id,
+        )
+        return
+
+    raw = pts[1].replace(" ", "")
+    sign = 1
+    if raw.startswith("+"):
+        raw = raw[1:]
+    elif raw.startswith("-"):
+        sign = -1
+        raw = raw[1:]
+    try:
+        amount = float(raw.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ Формат: <code>казна +500</code> или <code>казна -200</code>",
+                                        parse_mode=ParseMode.HTML)
+        return
+    if amount <= 0:
+        await update.message.reply_text("❌ Сумма должна быть больше 0")
+        return
+
+    if sign > 0:
+        uu = await db_get_user(u.id, cid)
+        if not uu or uu["vrf"] < amount:
+            await update.message.reply_text(f"❌ Недостаточно VRF! Есть: {fmt(uu['vrf'] if uu else 0)}")
+            return
+        await db_deduct_vrf(u.id, cid, int(amount))
+        new_treasury = await db_clan_treasury_add(clan["id"], amount)
+        await update.message.reply_text(
+            f"💰 {mention(u.id, u.first_name)} пополнил(а) казну клана <b>{clan['name']}</b> "
+            f"на <b>{fmt(amount)} VRF</b>!\nВ казне: <b>{fmt(new_treasury)} VRF</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        if clan["my_role"] not in ("leader", "treasurer"):
+            await update.message.reply_text(
+                "❌ Выводить из казны может только 💰 Казначей или 👑 Лидер клана."
+            )
+            return
+        ok = await db_clan_treasury_sub(clan["id"], amount)
+        if not ok:
+            await update.message.reply_text(f"❌ В казне недостаточно средств (там {fmt(clan['treasury'])} VRF)")
+            return
+        await db_add_vrf(u.id, cid, int(amount))
+        await update.message.reply_text(
+            f"💸 {mention(u.id, u.first_name)} вывел(а) из казны клана <b>{clan['name']}</b> "
+            f"<b>{fmt(amount)} VRF</b> себе на баланс.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def handle_attack_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    attacker = update.effective_user
+    cid = update.effective_chat.id
+
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text(
+            "❌ Ответь командой «атака» на сообщение того, кого хочешь ограбить."
+        )
+        return
+    target_u = update.message.reply_to_message.from_user
+    if target_u.id == attacker.id:
+        await update.message.reply_text("❌ Нельзя атаковать самого себя!")
+        return
+
+    await db_ensure_user(attacker.id, cid, attacker.username or "", attacker.first_name)
+    await db_ensure_user(target_u.id, cid, target_u.username or "", target_u.first_name)
+
+    au = await db_get_user(attacker.id, cid)
+    cd_left = attack_cooldown_left(au, ATTACK_COOLDOWN_MIN)
+    if cd_left > 0:
+        await update.message.reply_text(f"⏰ Следующая атака через {fmt_cd(cd_left)}")
+        return
+
+    tu = await db_get_user(target_u.id, cid)
+    if not tu:
+        await update.message.reply_text("❌ Цель ещё не известна боту")
+        return
+    if not user_is_offline(tu):
+        await update.message.reply_text(
+            f"❌ {mention(target_u.id, target_u.first_name)} сейчас активен(на) — "
+            f"грабить можно только тех, кто молчит хотя бы {ATTACK_OFFLINE_MIN} мин.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if tu["vrf"] < ATTACK_MIN_TARGET_VRF:
+        await update.message.reply_text(
+            f"❌ У цели слишком мало VRF (нужно хотя бы {ATTACK_MIN_TARGET_VRF})."
+        )
+        return
+
+    attacker_clan = await db_get_user_clan(attacker.id, cid)
+    target_clan   = await db_get_user_clan(target_u.id, cid)
+    chance = await calc_attack_chance(au, attacker_clan, target_clan)
+    success = random.random() < chance
+
+    if success:
+        steal = round(tu["vrf"] * ATTACK_STEAL_PCT)
+        await db_deduct_vrf(target_u.id, cid, steal)
+        await db_add_vrf(attacker.id, cid, steal)
+        await db_log_attack(cid, attacker.id, "user", target_u.id, True, steal)
+        await update.message.reply_text(
+            f"💰 <b>Атака удалась!</b>\n\n"
+            f"{mention(attacker.id, attacker.first_name)} застал(а) "
+            f"{mention(target_u.id, target_u.first_name)} врасплох и украл(а) "
+            f"<b>{fmt(steal)} VRF</b>! (шанс был {int(chance*100)}%)",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await db_log_attack(cid, attacker.id, "user", target_u.id, False, 0)
+        await update.message.reply_text(
+            f"🛡 <b>Атака провалилась!</b>\n\n"
+            f"{mention(attacker.id, attacker.first_name)} попытался(ась) ограбить "
+            f"{mention(target_u.id, target_u.first_name)}, но не вышло. (шанс был {int(chance*100)}%)",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def handle_farm_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    uu = await db_get_user(u.id, cid)
+    left = farm_cooldown_left(uu)
+    if left > 0:
+        await update.message.reply_text(f"🌾 Ферма ещё не готова — подожди {fmt_cd(left)}")
+        return
+
+    total = random.randint(FARM_BASE_MIN, FARM_BASE_MAX)
+    clan = await db_get_user_clan(u.id, cid)
+    clan_cut = 0
+    if clan:
+        clan_cut = round(total * FARM_CLAN_SHARE)
+        await db_clan_treasury_add(clan["id"], clan_cut)
+    personal = total - clan_cut
+    await db_add_vrf(u.id, cid, personal)
+    await db_touch_farm(u.id, cid)
+
+    text = f"🌾 <b>Ферма собрана!</b>\n\n💎 Тебе: <b>+{fmt(personal)} VRF</b>"
+    if clan:
+        text += f"\n🏰 В казну клана «{clan['name']}»: <b>+{fmt(clan_cut)} VRF</b>"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def _clan_kb_raid_targets(clans: list, my_clan_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for c in clans:
+        if c["id"] == my_clan_id:
+            continue
+        rows.append([SBtn(f"⚔️ {c['name']} · 💰{fmt(c['treasury'])} · 🛡{c['defense_level']}",
+                          style="danger", callback_data=f"cl:raid:{c['id']}")])
+    if not rows:
+        rows.append([SBtn("Нет доступных целей", style="primary", callback_data="cl:noop")])
+    rows.append([SBtn("Отмена", style="primary", callback_data="cl:cancel_msg")])
+    return InlineKeyboardMarkup(rows)
+
 
 async def on_startup(app: Application) -> None:
     await db_init()
@@ -10113,9 +11331,16 @@ async def _mb_get_token(bot_uid: int) -> Optional[str]:
 def _register_handlers(app, is_child: bool = False) -> None:
     """Register all handlers on *app*. Children skip create_bot / my_bots."""
 
+    # Global "last activity" tracker — считает и обычные сообщения, и любые
+    # команды/нажатия кнопок как признак "пользователь онлайн" (нужно для
+    # честной работы атак — иначе те, кто пишет только команды, всегда
+    # выглядели бы офлайн). group=-1 — выполняется раньше всех остальных.
+    app.add_handler(TypeHandler(Update, _touch_active_hook), group=-1)
+
     # Core
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
+    app.add_handler(CommandHandler(["clan", "clans"], cmd_clan))
 
     # Profile / stats
     app.add_handler(CommandHandler("profile",  cmd_profile))

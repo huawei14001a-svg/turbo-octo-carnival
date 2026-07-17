@@ -1016,6 +1016,20 @@ async def db_init() -> None:
                 new_user_paid INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id           INTEGER PRIMARY KEY,
+                welcome_text      TEXT    DEFAULT NULL,
+                welcome_enabled   INTEGER DEFAULT 1,
+                antiflood_enabled INTEGER DEFAULT 1,
+                rules_text        TEXT    DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS banned_words (
+                chat_id INTEGER NOT NULL,
+                word    TEXT    NOT NULL,
+                PRIMARY KEY (chat_id, word)
+            );
+
             CREATE TABLE IF NOT EXISTS clans (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id       INTEGER NOT NULL,
@@ -1348,6 +1362,87 @@ async def _touch_active_hook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await db_touch_active(u.id, c.id)
     except Exception:
         pass
+
+
+# ══════════════════════════════════════════════════════
+#   ФУНКЦИИ В СТИЛЕ IRIS  👋🚫🌊  (приветствия, стоп-слова, антифлуд)
+# ══════════════════════════════════════════════════════
+
+DEFAULT_WELCOME_TEXT = (
+    "👋 Добро пожаловать, {mention}!\n\n"
+    "Это чат №{count} по счёту для тебя здесь. Напиши <code>помощь</code> "
+    "или загляни в /menu, чтобы узнать, что умеет бот."
+)
+
+async def db_get_chat_settings(cid: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM chat_settings WHERE chat_id=?", (cid,)) as cur:
+            row = await cur.fetchone()
+    if row:
+        return dict(row)
+    return {"chat_id": cid, "welcome_text": None, "welcome_enabled": 1,
+           "antiflood_enabled": 1, "rules_text": None}
+
+
+async def db_set_chat_setting(cid: int, **kwargs) -> None:
+    cur_settings = await db_get_chat_settings(cid)
+    cur_settings.update(kwargs)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO chat_settings (chat_id, welcome_text, welcome_enabled, antiflood_enabled, rules_text)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(chat_id) DO UPDATE SET
+                 welcome_text=excluded.welcome_text,
+                 welcome_enabled=excluded.welcome_enabled,
+                 antiflood_enabled=excluded.antiflood_enabled,
+                 rules_text=excluded.rules_text""",
+            (cid, cur_settings["welcome_text"], cur_settings["welcome_enabled"],
+             cur_settings["antiflood_enabled"], cur_settings["rules_text"]),
+        )
+        await db.commit()
+
+
+async def db_add_banned_word(cid: int, word: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO banned_words (chat_id, word) VALUES (?,?)", (cid, word.lower()))
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def db_remove_banned_word(cid: int, word: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM banned_words WHERE chat_id=? AND word=?", (cid, word.lower()))
+        await db.commit()
+
+
+async def db_list_banned_words(cid: int) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT word FROM banned_words WHERE chat_id=?", (cid,)) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+# ── Антифлуд (в памяти, окно скользящего счётчика) ──────
+ANTIFLOOD_WINDOW_SEC  = 6      # окно наблюдения
+ANTIFLOOD_MAX_MSGS    = 7      # сколько сообщений можно за окно
+ANTIFLOOD_MUTE_MIN    = 10     # на сколько минут мутить нарушителя
+_antiflood_tracker: dict = {}  # (cid, uid) -> [timestamps]
+
+
+def antiflood_check(cid: int, uid: int) -> bool:
+    """Возвращает True, если пользователь превысил лимит сообщений —
+    нужно замьютить. Обновляет скользящее окно таймстампов."""
+    key = (cid, uid)
+    now = datetime.now().timestamp()
+    hist = _antiflood_tracker.setdefault(key, [])
+    hist.append(now)
+    cutoff = now - ANTIFLOOD_WINDOW_SEC
+    while hist and hist[0] < cutoff:
+        hist.pop(0)
+    return len(hist) > ANTIFLOOD_MAX_MSGS
 
 
 def user_is_offline(u: dict) -> bool:
@@ -1741,6 +1836,25 @@ def calc_bet(vrf: int, other_vrf: int) -> int:
     """Auto bet: 10% of lowest balance, clamped."""
     return max(MIN_BET, min(MAX_BET, min(vrf, other_vrf) // 10))
 
+
+def resolve_custom_bet(context, hu_vrf: int, ou_vrf: int, arg_index: int = 0) -> Tuple[int, Optional[str]]:
+    """Общая логика для PvP-игр: если в context.args[arg_index] указана сумма —
+    используем её (проверив границы), иначе — автоматический расчёт calc_bet.
+    Возвращает (bet, error_or_none). Используется дуэлью, спортивными играми
+    и слотом, чтобы "дуэль 500" и подобное работало одинаково везде."""
+    if context.args and len(context.args) > arg_index:
+        raw = context.args[arg_index]
+        try:
+            bet = int(str(raw).replace(",", "").replace(".", ""))
+        except (ValueError, TypeError):
+            return 0, f"❌ Ставка должна быть числом: <code>{raw}</code>"
+        if bet < MIN_BET:
+            return 0, f"❌ Минимальная ставка: {MIN_BET} VRF"
+        if bet > MAX_BET:
+            return 0, f"❌ Максимальная ставка: {MAX_BET} VRF"
+        return bet, None
+    return calc_bet(hu_vrf, ou_vrf), None
+
 MEDALS = [E_FIRST, E_SECOND, "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 def only_groups(func):
@@ -1929,6 +2043,206 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_rich(context.bot, cid, html=rich_h, fallback_html=fb_h,
                     reply_to_id=update.message.message_id,
                     reply_markup=_MAIN_KB)
+
+
+# ══════════════════════════════════════════════════════
+#           ИНТЕРАКТИВНОЕ МЕНЮ  📖  (/menu)
+# ══════════════════════════════════════════════════════
+# Категории с кнопками — как раздел меню у крупных чат-ботов (Iris и т.п.):
+# каждая категория показывает список команд + "быстрые" кнопки для тех
+# действий, что не требуют реплея/аргументов и могут запуститься сразу.
+
+MENU_CATEGORIES = {
+    "econ": {
+        "title": "💎 Профиль и экономика",
+        "text": (
+            "<b>Слэш-команды:</b>\n"
+            "/profile /statsimg /activity /top /stats /daily /bonus /ref /cancel\n\n"
+            "<b>Текстовые триггеры:</b>\n"
+            "<code>б</code> / <code>баланс</code> — короткий приватный баланс\n"
+            "<code>топ</code> — таблица лидеров\n"
+            "<code>проф</code> — карточка профиля\n"
+            "<code>бонус</code> — статус кулдаунов\n"
+            "<code>пер [сумма]</code> — перевод VRF (ответом)\n"
+            "<code>ферма</code> — сбор ресурсов (часть в казну клана)\n"
+            "<code>отмена</code> — отменить ожидающую игру"
+        ),
+        "quick": [("🏆 Топ", "топ"), ("🎁 Бонус", "бонус"), ("🌾 Ферма", "ферма")],
+    },
+    "games": {
+        "title": "🎲 Игры и казино",
+        "text": (
+            "<b>Слэш-команды:</b>\n"
+            "/duel /cubes /basket /football /bowling /darts /slot /mines /tictac "
+            "/seabattle /crash /tower /maze /giveaway\n\n"
+            "<b>Текстовые триггеры (ответом на соперника):</b>\n"
+            "<code>дуэль [ставка]</code> · <code>кости [раунды] [ставка]</code>\n"
+            "<code>баскет / футбол / боулинг / дартс [ставка]</code>\n"
+            "<code>слот [ставка]</code>\n\n"
+            "<b>Соло:</b> <code>мины</code> — открывай клетки, забирай вовремя\n"
+            "<code>куб [1-6] [ставка]</code> — угадай число"
+        ),
+        "quick": [("💣 Мины", "мины")],
+    },
+    "love": {
+        "title": "💍 Отношения",
+        "text": (
+            "/marry /accept /reject /divorce /marriage /marriages /gift /love\n\n"
+            "<code>брак</code> — карточка твоего брака"
+        ),
+        "quick": [("💑 Мой брак", "брак")],
+    },
+    "clan": {
+        "title": "🏰 Кланы и войны",
+        "text": (
+            "/clan — хаб клана (создать/вступить/управление)\n\n"
+            "<b>Текстовые триггеры:</b>\n"
+            "<code>клан</code> — открыть хаб\n"
+            "<code>+клан</code> — мгновенно вступить (ответом на участника)\n"
+            "<code>казна +500</code> / <code>казна -200</code> — пополнить/вывести\n"
+            "<code>атака</code> — украсть VRF у офлайн-игрока (ответом)\n"
+            "<code>рейд</code> — атака на казну другого клана\n\n"
+            "Роли: ⚔️ Налётчик · 🛡 Страж · 💰 Казначей · 👤 Житель"
+        ),
+        "quick": [("🏰 Мой клан", "клан")],
+    },
+    "mod": {
+        "title": "🛡️ Модерация",
+        "text": (
+            "/mute /unmute /kick /ban /unban /pred /unpred /clearpred /predlist /mutelist\n\n"
+            "Все — ответом на сообщение участника. Доступно администраторам."
+        ),
+        "quick": [],
+    },
+    "chatmgmt": {
+        "title": "💬 Управление чатом",
+        "text": (
+            "/chatinfo /admins /clearreacts /pin /unpin /unpinall "
+            "/setdesc /settitle /react /invite /botcaps /fwd\n\n"
+            "Информация о чате и утилиты для администраторов."
+        ),
+        "quick": [],
+    },
+    "admin": {
+        "title": "👑 Администрирование",
+        "text": (
+            "/admin — панель управления\n"
+            "/checkephemeral /givevrf /takevrf /givebear /takebear "
+            "/addadmin /removeadmin /listadmins\n\n"
+            "Экономика чата и права бот-админов."
+        ),
+        "quick": [],
+    },
+    "bots": {
+        "title": "🤖 Управляемые боты",
+        "text": (
+            "/create_bot /my_bots /link_bot\n\n"
+            "Привязка и настройка собственных ботов на базе Verifure (в ЛС)."
+        ),
+        "quick": [],
+    },
+}
+
+MENU_CATEGORY_ORDER = ["econ", "games", "love", "clan", "mod", "chatmgmt", "admin", "bots"]
+
+
+def _menu_main_kb() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for key in MENU_CATEGORY_ORDER:
+        row.append(InlineKeyboardButton(MENU_CATEGORIES[key]["title"], callback_data=f"mn:cat:{key}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _menu_category_kb(key: str) -> InlineKeyboardMarkup:
+    rows = []
+    quick = MENU_CATEGORIES[key]["quick"]
+    qrow = []
+    for label, trigger in quick:
+        qrow.append(SBtn(label, style="success", callback_data=f"mn:run:{trigger}"))
+        if len(qrow) == 2:
+            rows.append(qrow); qrow = []
+    if qrow:
+        rows.append(qrow)
+    rows.append([SBtn("← Все категории", style="primary", callback_data="mn:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    total_cmds = sum(1 for _ in MENU_CATEGORIES)
+    await update.message.reply_text(
+        "📖 <b>Меню Verifure Game</b>\n\n"
+        "Выбери раздел, чтобы увидеть список команд и триггеров. "
+        "Некоторые действия можно запустить сразу кнопкой ниже.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_menu_main_kb(),
+    )
+
+
+async def on_menu_callback(query, context, data: str, who, cid: int) -> None:
+    """Обработчик callback'ов меню (mn:...) — вызывается из on_callback."""
+    parts = data.split(":")
+    action = parts[1]
+
+    if action == "home":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                "📖 <b>Меню Verifure Game</b>\n\n"
+                "Выбери раздел, чтобы увидеть список команд и триггеров.",
+                parse_mode=ParseMode.HTML, reply_markup=_menu_main_kb(),
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action == "cat":
+        key = parts[2]
+        cat = MENU_CATEGORIES.get(key)
+        if not cat:
+            await query.answer("❌ Раздел не найден", show_alert=True)
+            return
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                f"<b>{cat['title']}</b>\n\n{cat['text']}",
+                parse_mode=ParseMode.HTML, reply_markup=_menu_category_kb(key),
+            )
+        except TelegramError:
+            pass
+        return
+
+    if action == "run":
+        trigger_word = parts[2]
+        await query.answer(f"▶️ {trigger_word}")
+        # Симулируем нажатие как будто пользователь написал триггер-слово —
+        # переиспользуем реальный текстовый обработчик, чтобы не дублировать логику.
+        class _FakeMsg:
+            def __init__(self, orig_msg, text):
+                self._orig = orig_msg
+                self.text = text
+                self.caption = None
+                self.message_id = orig_msg.message_id
+                self.reply_to_message = None
+            async def reply_text(self, *a, **kw):
+                return await context.bot.send_message(cid, *a, **kw)
+            async def react(self, *a, **kw):
+                pass
+        fake_update_msg = _FakeMsg(query.message, trigger_word)
+
+        class _FakeUpdate:
+            pass
+        fu = _FakeUpdate()
+        fu.message = fake_update_msg
+        fu.effective_user = who
+        fu.effective_chat = query.message.chat
+        await on_message(fu, context)
+        return
+
+    await query.answer()
 
 
 
@@ -4248,8 +4562,11 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cu = await db_get_user(challenger.id, cid)
     ou = await db_get_user(opponent.id,   cid)
 
-    bet = calc_bet(cu["vrf"], ou["vrf"])
-    if cu["vrf"] < bet or ou["vrf"] < MIN_BET:
+    bet, err = resolve_custom_bet(context, cu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+    if cu["vrf"] < bet or ou["vrf"] < bet:
         await update.message.reply_text(f"❌ Недостаточно VRF для дуэли!\nМинимум: {MIN_BET} VRF")
         return
 
@@ -4541,7 +4858,10 @@ async def _cmd_sport(update: Update, context: ContextTypes.DEFAULT_TYPE, game_ty
     await db_ensure_user(opponent.id, cid, opponent.username or "", opponent.first_name)
     hu = await db_get_user(host.id, cid)
     ou = await db_get_user(opponent.id, cid)
-    bet = calc_bet(hu["vrf"], ou["vrf"])
+    bet, err = resolve_custom_bet(context, hu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
 
     if hu["vrf"] < bet or ou["vrf"] < bet:
         await update.message.reply_text(f"❌ Нужно {bet} VRF у обоих игроков!")
@@ -4703,7 +5023,10 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db_ensure_user(opponent.id, cid, opponent.username or "", opponent.first_name)
     hu = await db_get_user(host.id, cid)
     ou = await db_get_user(opponent.id, cid)
-    bet = calc_bet(hu["vrf"], ou["vrf"])
+    bet, err = resolve_custom_bet(context, hu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
 
     if hu["vrf"] < bet or ou["vrf"] < bet:
         await update.message.reply_text(f"❌ Нужно {bet} VRF у обоих игроков!")
@@ -5399,6 +5722,112 @@ async def cmd_mutelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ══════════════════════════════════════════════════════
+#      IRIS-СТИЛЬ: ПРИВЕТСТВИЕ, СТОП-СЛОВА, ПРАВИЛА
+# ══════════════════════════════════════════════════════
+
+async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    text = update.message.text.split(maxsplit=1)
+    if len(text) < 2:
+        await update.message.reply_text(
+            "✏️ Использование: <code>/setwelcome текст</code>\n\n"
+            "Доступны плейсхолдеры: <code>{mention}</code> (упоминание), "
+            "<code>{name}</code> (имя), <code>{count}</code> (номер участника).\n\n"
+            f"Текущий текст:\n{(await db_get_chat_settings(cid))['welcome_text'] or DEFAULT_WELCOME_TEXT}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await db_set_chat_setting(cid, welcome_text=text[1])
+    await update.message.reply_text("✅ Приветствие обновлено!")
+
+
+async def cmd_togglewelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    settings = await db_get_chat_settings(cid)
+    new_val = 0 if settings.get("welcome_enabled", 1) else 1
+    await db_set_chat_setting(cid, welcome_enabled=new_val)
+    await update.message.reply_text("✅ Приветствие " + ("включено" if new_val else "выключено"))
+
+
+async def cmd_toggleantiflood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    settings = await db_get_chat_settings(cid)
+    new_val = 0 if settings.get("antiflood_enabled", 1) else 1
+    await db_set_chat_setting(cid, antiflood_enabled=new_val)
+    await update.message.reply_text(
+        f"✅ Антифлуд " + ("включён" if new_val else "выключен") +
+        f" (лимит: {ANTIFLOOD_MAX_MSGS} сообщений / {ANTIFLOOD_WINDOW_SEC}с → мут на {ANTIFLOOD_MUTE_MIN} мин)"
+    )
+
+
+async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("✏️ Использование: <code>/addword слово</code>", parse_mode=ParseMode.HTML)
+        return
+    cid = update.effective_chat.id
+    word = " ".join(context.args).lower().strip()
+    ok = await db_add_banned_word(cid, word)
+    await update.message.reply_text(f"✅ Слово «{word}» добавлено в стоп-лист" if ok
+                                    else f"ℹ️ Слово «{word}» уже в стоп-листе")
+
+
+async def cmd_removeword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("✏️ Использование: <code>/removeword слово</code>", parse_mode=ParseMode.HTML)
+        return
+    cid = update.effective_chat.id
+    word = " ".join(context.args).lower().strip()
+    await db_remove_banned_word(cid, word)
+    await update.message.reply_text(f"✅ Слово «{word}» убрано из стоп-листа")
+
+
+async def cmd_wordlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    words = await db_list_banned_words(cid)
+    if not words:
+        await update.message.reply_text("✅ Стоп-лист пуст")
+        return
+    await update.message.reply_text(
+        "🚫 <b>Стоп-слова чата</b>:\n\n" + "\n".join(f"• {w}" for w in words),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await is_group_or_bot_admin(update):
+        return
+    cid = update.effective_chat.id
+    text = update.message.text.split(maxsplit=1)
+    if len(text) < 2:
+        await update.message.reply_text("✏️ Использование: <code>/setrules текст правил</code>", parse_mode=ParseMode.HTML)
+        return
+    await db_set_chat_setting(cid, rules_text=text[1])
+    await update.message.reply_text("✅ Правила чата обновлены!")
+
+
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cid = update.effective_chat.id
+    settings = await db_get_chat_settings(cid)
+    rules = settings.get("rules_text")
+    if not rules:
+        await update.message.reply_text("ℹ️ В этом чате ещё не заданы правила. Админ может задать их: /setrules текст")
+        return
+    await update.message.reply_text(f"📜 <b>Правила чата</b>\n\n{rules}", parse_mode=ParseMode.HTML)
+
+
+# ══════════════════════════════════════════════════════
 #              ADMIN PANEL
 # ══════════════════════════════════════════════════════
 
@@ -5732,7 +6161,10 @@ async def cmd_ttt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hu = await db_get_user(host.id, cid)
     ou = await db_get_user(opponent.id, cid)
 
-    bet = calc_bet(hu["vrf"], ou["vrf"])
+    bet, err = resolve_custom_bet(context, hu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
     bet = max(bet, 1)
     if hu["vrf"] < 1 or ou["vrf"] < 1:
         await update.message.reply_text("❌ Недостаточно VRF!")
@@ -5903,7 +6335,10 @@ async def cmd_seabattle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await db_ensure_user(opp.id,  cid, opp.username  or "", opp.first_name)
     hu  = await db_get_user(host.id, cid)
     ou  = await db_get_user(opp.id,  cid)
-    bet = calc_bet(hu["vrf"], ou["vrf"])
+    bet, err = resolve_custom_bet(context, hu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
     if hu["vrf"] < bet or ou["vrf"] < bet:
         await update.message.reply_text(
             f"❌ Нужно <b>{fmt(bet)} VRF</b> у каждого!", parse_mode=ParseMode.HTML
@@ -6023,6 +6458,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data     = query.data
     cid      = query.message.chat_id
     who      = query.from_user
+
+    # ── Menu ──────────────────────────────────────────
+    if data.startswith("mn:"):
+        await on_menu_callback(query, context, data, who, cid)
+        return
 
     # ── Top tabs ────────────────────────────────────────
     if data.startswith("top:"):
@@ -8632,10 +9072,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await query.edit_message_text(result_text, parse_mode=ParseMode.HTML)
             except TelegramError:
                 pass
-            try:
-                await context.bot.send_message(cid, result_text, parse_mode=ParseMode.HTML)
-            except TelegramError:
-                pass
             return
 
         # ── Покинуть клан ──────────────────────────────────
@@ -8848,6 +9284,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ══════════════════════════════════════════════════════
+#           ПРИВЕТСТВИЕ НОВЫХ УЧАСТНИКОВ  👋
+# ══════════════════════════════════════════════════════
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+    cid = update.effective_chat.id
+    settings = await db_get_chat_settings(cid)
+    if not settings.get("welcome_enabled", 1):
+        return
+    template = settings.get("welcome_text") or DEFAULT_WELCOME_TEXT
+    try:
+        count = await context.bot.get_chat_member_count(cid)
+    except TelegramError:
+        count = 0
+    for member in msg.new_chat_members:
+        if member.is_bot:
+            continue
+        await db_ensure_user(member.id, cid, member.username or "", member.first_name)
+        text = template.replace("{mention}", mention(member.id, member.first_name)) \
+                       .replace("{name}", member.first_name) \
+                       .replace("{count}", str(count))
+        try:
+            await context.bot.send_message(cid, text, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+
+
+# ══════════════════════════════════════════════════════
 #           MESSAGE HANDLER (XP from chat)
 # ══════════════════════════════════════════════════════
 
@@ -8980,6 +9446,44 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await db_ensure_user(u.id, cid, u.username or "", u.first_name)
     await db_touch_active(u.id, cid)
+
+    # ── Стоп-слова + антифлуд (в стиле Iris) ────────────────
+    # Админов (реальных и бот-админов) не трогаем — обычная логика модерации.
+    if text and not await is_group_or_bot_admin(update):
+        banned = await db_list_banned_words(cid)
+        if banned and any(w in low for w in banned):
+            try:
+                await update.message.delete()
+            except TelegramError:
+                pass
+            try:
+                warn_count = await db_add_warn(u.id, cid, context.bot.id, "стоп-слово")
+                note = await context.bot.send_message(
+                    cid, f"🚫 {mention(u.id, u.first_name)}, сообщение удалено — запрещённое слово. "
+                        f"Предупреждение {warn_count}/3.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            return
+
+        settings = await db_get_chat_settings(cid)
+        if settings.get("antiflood_enabled", 1) and antiflood_check(cid, u.id):
+            try:
+                until = datetime.now() + timedelta(minutes=ANTIFLOOD_MUTE_MIN)
+                await context.bot.restrict_chat_member(
+                    cid, u.id,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=until,
+                )
+                await context.bot.send_message(
+                    cid, f"🌊 {mention(u.id, u.first_name)} замьючен(а) на {ANTIFLOOD_MUTE_MIN} мин "
+                        f"— слишком много сообщений подряд (антифлуд).",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            return
 
     # ── Tower: custom bet reply ─────────────────────────────
     pend_tw = tower_custom_pending.get(pend_key)
@@ -9129,8 +9633,39 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # так же, как у команды /duel — cmd_duel сама проверит и подскажет,
     # если реплея нет)
     if word in ("дуэль", "duel", "дуэл"):
-        context.args = []
+        context.args = pts[1:]
         await cmd_duel(update, context)
+        return
+
+    # баскет/футбол/боулинг/дартс [ставка] → спортивные PvP-игры (ответом)
+    if word in ("баскет", "basket", "баскетбол"):
+        context.args = pts[1:]
+        await cmd_basket(update, context)
+        return
+    if word in ("футбол", "football"):
+        context.args = pts[1:]
+        await cmd_football(update, context)
+        return
+    if word in ("боулинг", "bowling"):
+        context.args = pts[1:]
+        await cmd_bowling(update, context)
+        return
+    if word in ("дартс", "darts"):
+        context.args = pts[1:]
+        await cmd_darts(update, context)
+        return
+
+    # слот [ставка] → слот-машина PvP (ответом)
+    if word in ("слот", "slot"):
+        context.args = pts[1:]
+        await cmd_slot(update, context)
+        return
+
+    # кости [раунды] [ставка] → многораундовая игра в кости PvP (ответом);
+    # отдельное слово от "куб" — тот занят под соло-угадайку числа
+    if word in ("кости", "cubes"):
+        context.args = pts[1:]
+        await cmd_cubes(update, context)
         return
 
     # помощь → /help
@@ -11771,11 +12306,21 @@ def _register_handlers(app, is_child: bool = False) -> None:
     # честной работы атак — иначе те, кто пишет только команды, всегда
     # выглядели бы офлайн). group=-1 — выполняется раньше всех остальных.
     app.add_handler(TypeHandler(Update, _touch_active_hook), group=-1)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
     # Core
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler(["clan", "clans"], cmd_clan))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("setwelcome",      cmd_setwelcome))
+    app.add_handler(CommandHandler("togglewelcome",   cmd_togglewelcome))
+    app.add_handler(CommandHandler("toggleantiflood", cmd_toggleantiflood))
+    app.add_handler(CommandHandler("addword",         cmd_addword))
+    app.add_handler(CommandHandler("removeword",      cmd_removeword))
+    app.add_handler(CommandHandler("wordlist",        cmd_wordlist))
+    app.add_handler(CommandHandler("setrules",        cmd_setrules))
+    app.add_handler(CommandHandler("rules",           cmd_rules))
 
     # Profile / stats
     app.add_handler(CommandHandler("profile",  cmd_profile))

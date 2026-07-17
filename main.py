@@ -230,6 +230,8 @@ ttt_games: dict       = {}   # key: game_id (str)
 battle_games: dict    = {}   # key: game_id (str)  — Battleship
 giveaway_setups: dict = {}   # key: setup_id (str) — Giveaway wizard
 giveaway_active: dict = {}   # key: f"{cid}:{msg_id}" — Active giveaway
+roulette_games: dict  = {}   # key: f"{uid}:{cid}" — соло рулетка против казино
+blackjack_games: dict = {}   # key: f"{uid}:{cid}" — соло блэкджек против дилера-бота
 crash_rounds: dict    = {}   # key: cid (int) — Crash multiplier game
 crash_setups: dict    = {}   # key: setup_id (str) — Crash setup wizard
 crash_custom_pending: dict = {}  # key: (cid, uid) — waiting for a custom bet amount
@@ -2250,15 +2252,20 @@ MENU_CATEGORIES = {
         "text": (
             "<b>Слэш-команды:</b>\n"
             "/duel /cubes /basket /football /bowling /darts /slot /mines /tictac "
-            "/seabattle /crash /tower /maze /giveaway\n\n"
+            "/seabattle /crash /tower /maze /giveaway /casino /roulette /blackjack\n\n"
             "<b>Текстовые триггеры (ответом на соперника):</b>\n"
             "<code>дуэль [ставка]</code> · <code>кости [раунды] [ставка]</code>\n"
             "<code>баскет / футбол / боулинг / дартс [ставка]</code>\n"
             "<code>слот [ставка]</code>\n\n"
-            "<b>Соло:</b> <code>мины</code> — открывай клетки, забирай вовремя\n"
+            "<b>🎰 Казино (соло против бота):</b>\n"
+            "<code>казино</code> — хаб со всеми играми на удачу\n"
+            "<code>рулетка</code> — цвет/чёт-нечет/число, до x36\n"
+            "<code>блэкджек</code> — 21 против дилера, блэкджек платит 3:2\n"
+            "<code>мины</code> — открывай клетки, забирай вовремя\n"
+            "<code>краш</code> / <code>башня</code> / <code>лабиринт</code>\n"
             "<code>куб [1-6] [ставка]</code> — угадай число"
         ),
-        "quick": [("💣 Мины", "мины")],
+        "quick": [("🎰 Казино", "казино"), ("💣 Мины", "мины")],
     },
     "love": {
         "title": "💍 Отношения",
@@ -6653,6 +6660,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await on_menu_callback(query, context, data, who, cid)
         return
 
+    # ── Казино (хаб + рулетка/блэкджек) ─────────────────
+    if data.startswith("cs:"):
+        await on_casino_hub_callback(query, context, data, who, cid)
+        return
+    if data.startswith("rl:") or data.startswith("bj:"):
+        await on_casino_callback(query, context, data, who, cid)
+        return
+
     # ── Top tabs ────────────────────────────────────────
     if data.startswith("top:"):
         _, sort, _ = data.split(":")
@@ -9739,7 +9754,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         pend = clan_pending_input[pend_key]
         if datetime.now() > pend["expires"]:
             clan_pending_input.pop(pend_key, None)
-        else:
+        elif pend["kind"] == "roulette_number":
+            clan_pending_input.pop(pend_key, None)
+            game = roulette_games.pop(f"{u.id}:{cid}", None)
+            if not game:
+                await update.message.reply_text("❌ Игра истекла, начни заново: «рулетка»")
+                return
+            try:
+                num = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ Нужно число от 0 до 36")
+                roulette_games[f"{u.id}:{cid}"] = game
+                return
+            if not (0 <= num <= 36):
+                await update.message.reply_text("❌ Число должно быть от 0 до 36")
+                roulette_games[f"{u.id}:{cid}"] = game
+                return
+            msg = await update.message.reply_text(f"🎯 Ставка на число {num}...")
+            await _roulette_spin_and_resolve(context.bot, cid, u.id, msg, "number", num, game["bet"])
+            return
+        elif pend["kind"] == "clan_name":
             clan_pending_input.pop(pend_key, None)
             name = text.strip()
             if not (CLAN_NAME_MIN <= len(name) <= CLAN_NAME_MAX):
@@ -9868,6 +9902,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if word in ("мины", "мина", "mines"):
         context.args = []
         await cmd_mines(update, context)
+        return
+
+    # краш/башня/лабиринт → соответствующие игры на весь чат / соло
+    if word in ("краш", "crash"):
+        context.args = []
+        await cmd_crash(update, context)
+        return
+    if word in ("башня", "tower"):
+        context.args = []
+        await cmd_tower(update, context)
+        return
+    if word in ("лабиринт", "maze"):
+        context.args = []
+        await cmd_maze(update, context)
+        return
+
+    # рулетка / блэкджек / казино
+    if word in ("рулетка", "roulette"):
+        context.args = []
+        await cmd_roulette(update, context)
+        return
+    if word in ("блэкджек", "blackjack", "очко", "21"):
+        context.args = []
+        await cmd_blackjack(update, context)
+        return
+    if word in ("казино", "casino"):
+        context.args = []
+        await cmd_casino(update, context)
         return
 
     # клан → клановый хаб (создать/вступить/инфо о своём клане)
@@ -10692,6 +10754,432 @@ async def handle_wheel_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_wheel_trigger(update, context)
+
+
+# ══════════════════════════════════════════════════════
+#           КАЗИНО  🎰  (Рулетка + Блэкджек против бота)
+# ══════════════════════════════════════════════════════
+# Соло-игры против "дилера" (казино/бот) — в отличие от PvP игр выше.
+# Ставка списывается сразу при начале, выигрыш начисляется по итогу.
+
+CASINO_BET_PRESETS = [10, 25, 50, 100, 200, 500]
+
+
+def _casino_bet_kb(prefix: str, uid: int, cid: int) -> InlineKeyboardMarkup:
+    row1 = [InlineKeyboardButton(f"💎 {v}", callback_data=f"{prefix}:bet:{uid}:{cid}:{v}")
+           for v in CASINO_BET_PRESETS[:3]]
+    row2 = [InlineKeyboardButton(f"💎 {v}", callback_data=f"{prefix}:bet:{uid}:{cid}:{v}")
+           for v in CASINO_BET_PRESETS[3:]]
+    return InlineKeyboardMarkup([row1, row2,
+        [SBtn("Отмена", style="danger", callback_data=f"{prefix}:cancel:{uid}:{cid}")]])
+
+
+async def cmd_casino(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🎰 <b>Казино Verifure</b>\n\nВыбери игру против казино:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [SBtn("🎡 Рулетка", style="success", callback_data="cs:open:roulette"),
+             SBtn("🃏 Блэкджек", style="success", callback_data="cs:open:blackjack")],
+            [SBtn("💣 Мины", style="primary", callback_data="cs:open:mines"),
+             SBtn("🎡 Колесо Фортуны", style="primary", callback_data="cs:open:wheel")],
+            [SBtn("🚀 Краш", style="primary", callback_data="cs:open:crash"),
+             SBtn("🏢 Башня", style="primary", callback_data="cs:open:tower")],
+            [SBtn("🏰 Лабиринт", style="primary", callback_data="cs:open:maze")],
+        ]),
+    )
+
+
+async def on_casino_hub_callback(query, context, data: str, who, cid: int) -> None:
+    """cs:open:<game> — запускает соответствующую игру прямо из /casino."""
+    game = data.split(":")[2]
+    await query.answer()
+    try:
+        await query.message.delete()
+    except TelegramError:
+        pass
+
+    class _FakeMsg:
+        def __init__(self, orig, text):
+            self.text = text; self.caption = None
+            self.message_id = orig.message_id
+            self.reply_to_message = None
+        async def reply_text(self, *a, **kw):
+            return await context.bot.send_message(cid, *a, **kw)
+        async def react(self, *a, **kw):
+            pass
+    class _FakeUpdate:
+        pass
+    fu = _FakeUpdate()
+    fu.message = _FakeMsg(query.message, game)
+    fu.effective_user = who
+    fu.effective_chat = query.message.chat
+    trigger_map = {
+        "roulette": "рулетка", "blackjack": "блэкджек", "mines": "мины",
+        "wheel": "колесо", "crash": "краш", "tower": "башня", "maze": "лабиринт",
+    }
+    fu.message.text = trigger_map.get(game, game)
+    await on_message(fu, context)
+
+
+# ── РУЛЕТКА ─────────────────────────────────────────────
+
+ROULETTE_RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+
+
+def roulette_color(n: int) -> str:
+    if n == 0:
+        return "green"
+    return "red" if n in ROULETTE_RED else "black"
+
+
+def _roulette_type_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [SBtn("🔴 Красное (x2)", style="danger",  callback_data=f"rl:t:{uid}:{cid}:red"),
+         SBtn("⚫ Чёрное (x2)",  style="primary", callback_data=f"rl:t:{uid}:{cid}:black")],
+        [SBtn("🟢 Зеро (x36)",   style="success", callback_data=f"rl:t:{uid}:{cid}:green")],
+        [SBtn("Чёт (x2)",   style="primary", callback_data=f"rl:t:{uid}:{cid}:even"),
+         SBtn("Нечет (x2)", style="primary", callback_data=f"rl:t:{uid}:{cid}:odd")],
+        [SBtn("1-18 (x2)",  style="primary", callback_data=f"rl:t:{uid}:{cid}:low"),
+         SBtn("19-36 (x2)", style="primary", callback_data=f"rl:t:{uid}:{cid}:high")],
+        [SBtn("🎯 Число (x36)", style="success", callback_data=f"rl:num:{uid}:{cid}")],
+        [SBtn("Отмена", style="danger", callback_data=f"rl:cancel:{uid}:{cid}")],
+    ])
+
+
+ROULETTE_BET_LABELS = {
+    "red": "🔴 Красное", "black": "⚫ Чёрное", "green": "🟢 Зеро",
+    "even": "Чётное", "odd": "Нечётное", "low": "1-18", "high": "19-36",
+}
+
+
+def roulette_check_win(bet_type: str, bet_value, result: int) -> Tuple[bool, int]:
+    """Возвращает (выигрыш?, коэффициент x к ставке)."""
+    color = roulette_color(result)
+    if bet_type == "number":
+        return (result == bet_value), 36
+    if bet_type == "green":
+        return (result == 0), 36
+    if bet_type in ("red", "black"):
+        return (color == bet_type), 2
+    if bet_type == "even":
+        return (result != 0 and result % 2 == 0), 2
+    if bet_type == "odd":
+        return (result != 0 and result % 2 == 1), 2
+    if bet_type == "low":
+        return (1 <= result <= 18), 2
+    if bet_type == "high":
+        return (19 <= result <= 36), 2
+    return False, 0
+
+
+@only_groups
+async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    await update.message.reply_text(
+        "🎡 <b>Рулетка</b>\n\nВыбери ставку:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_casino_bet_kb("rl", u.id, cid),
+    )
+
+
+async def _roulette_spin_and_resolve(bot, cid: int, uid: int, msg, bet_type: str, bet_value, amount: int) -> None:
+    frames = [random.randint(0, 36) for _ in range(4)]
+    for f in frames:
+        await asyncio.sleep(0.4)
+        color_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[roulette_color(f)]
+        try:
+            await msg.edit_text(f"🎡 Крутится... {color_emoji} <b>{f}</b>", parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+
+    result = random.randint(0, 36)
+    won, mult = roulette_check_win(bet_type, bet_value, result)
+    color_emoji = {"red": "🔴", "black": "⚫", "green": "🟢"}[roulette_color(result)]
+    label = ROULETTE_BET_LABELS.get(bet_type, f"число {bet_value}")
+
+    if won:
+        payout = amount * mult
+        new_bal = await db_add_vrf(uid, cid, payout)
+        await db_record_game(uid, cid, won=True)
+        text = (
+            f"🎡 Выпало: {color_emoji} <b>{result}</b>\n\n"
+            f"🏆 <b>ПОБЕДА!</b> Ставка: {label}\n"
+            f"💰 Выигрыш: <b>+{fmt(payout)} VRF</b> (x{mult})\n"
+            f"💎 Баланс: {fmt(new_bal)} VRF"
+        )
+    else:
+        await db_record_game(uid, cid, won=False)
+        text = (
+            f"🎡 Выпало: {color_emoji} <b>{result}</b>\n\n"
+            f"❌ Не повезло. Ставка: {label}\n"
+            f"💸 Потеряно: <b>{fmt(amount)} VRF</b>"
+        )
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
+    await check_achievements(bot, uid, cid)
+
+
+# ── БЛЭКДЖЕК ────────────────────────────────────────────
+
+CARD_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+CARD_SUITS = ["♠", "♥", "♦", "♣"]
+
+
+def _bj_new_deck() -> list:
+    deck = [(r, s) for r in CARD_RANKS for s in CARD_SUITS] * 2   # 2 колоды на игру
+    random.shuffle(deck)
+    return deck
+
+
+def _bj_card_label(card) -> str:
+    return f"{card[0]}{card[1]}"
+
+
+def _bj_hand_value(cards: list) -> int:
+    total, aces = 0, 0
+    for r, _ in cards:
+        if r == "A":
+            total += 11; aces += 1
+        elif r in ("J", "Q", "K"):
+            total += 10
+        else:
+            total += int(r)
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+
+def _bj_hand_str(cards: list) -> str:
+    return " ".join(_bj_card_label(c) for c in cards)
+
+
+def _bj_kb(uid: int, cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        SBtn("🃏 Взять карту", style="primary", callback_data=f"bj:hit:{uid}:{cid}"),
+        SBtn("✋ Хватит", style="success", callback_data=f"bj:stand:{uid}:{cid}"),
+    ]])
+
+
+def _bj_status_text(game: dict, reveal_dealer: bool = False) -> str:
+    p_val = _bj_hand_value(game["player"])
+    lines = [
+        f"🃏 <b>Блэкджек</b> · Ставка: <b>{fmt(game['bet'])} VRF</b>\n",
+        f"👤 Твои карты: {_bj_hand_str(game['player'])}  (<b>{p_val}</b>)",
+    ]
+    if reveal_dealer:
+        d_val = _bj_hand_value(game["dealer"])
+        lines.append(f"🤵 Дилер: {_bj_hand_str(game['dealer'])}  (<b>{d_val}</b>)")
+    else:
+        lines.append(f"🤵 Дилер: {_bj_card_label(game['dealer'][0])} 🂠")
+    return "\n".join(lines)
+
+
+@only_groups
+async def cmd_blackjack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    key = f"{u.id}:{cid}"
+    if key in blackjack_games:
+        await update.message.reply_text(
+            "♻️ У тебя уже есть активная игра!\n\n" + _bj_status_text(blackjack_games[key]),
+            parse_mode=ParseMode.HTML, reply_markup=_bj_kb(u.id, cid),
+        )
+        return
+    await update.message.reply_text(
+        "🃏 <b>Блэкджек</b>\n\nВыбери ставку:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_casino_bet_kb("bj", u.id, cid),
+    )
+
+
+async def _bj_start_game(context, cid: int, uid: int, msg, amount: int) -> None:
+    deck = _bj_new_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+    key = f"{uid}:{cid}"
+    blackjack_games[key] = {"bet": amount, "player": player, "dealer": dealer, "deck": deck}
+
+    p_val = _bj_hand_value(player)
+    if p_val == 21:
+        # Натуральный блэкджек — выплата 3:2 сразу
+        payout = int(amount * 2.5)
+        new_bal = await db_add_vrf(uid, cid, payout)
+        await db_record_game(uid, cid, won=True)
+        del blackjack_games[key]
+        try:
+            await msg.edit_text(
+                f"🃏 <b>БЛЭКДЖЕК!</b> 🎉\n\n{_bj_status_text({'bet':amount,'player':player,'dealer':dealer}, True)}\n\n"
+                f"🏆 Натуральные 21! Выплата 3:2: <b>+{fmt(payout)} VRF</b>\n💎 Баланс: {fmt(new_bal)} VRF",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+        await check_achievements(context.bot, uid, cid)
+        return
+
+    try:
+        await msg.edit_text(
+            _bj_status_text(blackjack_games[key]),
+            parse_mode=ParseMode.HTML, reply_markup=_bj_kb(uid, cid),
+        )
+    except TelegramError:
+        pass
+
+
+async def _bj_finish(context, cid: int, uid: int, query) -> None:
+    key = f"{uid}:{cid}"
+    game = blackjack_games.pop(key, None)
+    if not game:
+        return
+    deck = game["deck"]
+    while _bj_hand_value(game["dealer"]) < 17:
+        game["dealer"].append(deck.pop())
+
+    p_val = _bj_hand_value(game["player"])
+    d_val = _bj_hand_value(game["dealer"])
+    amount = game["bet"]
+
+    if d_val > 21 or p_val > d_val:
+        payout = amount * 2
+        new_bal = await db_add_vrf(uid, cid, payout)
+        await db_record_game(uid, cid, won=True)
+        outcome = f"🏆 <b>Победа!</b> +{fmt(payout)} VRF\n💎 Баланс: {fmt(new_bal)} VRF"
+    elif p_val == d_val:
+        await db_add_vrf(uid, cid, amount)   # возврат ставки
+        outcome = f"🤝 <b>Ничья</b> — ставка возвращена ({fmt(amount)} VRF)"
+    else:
+        await db_record_game(uid, cid, won=False)
+        outcome = f"❌ <b>Дилер победил</b> — потеряно {fmt(amount)} VRF"
+
+    text = _bj_status_text(game, reveal_dealer=True) + "\n\n" + outcome
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
+    await check_achievements(context.bot, uid, cid)
+
+
+async def on_casino_callback(query, context, data: str, who, cid: int) -> None:
+    """Обработчик rl:/bj: callback'ов — общая точка входа из on_callback."""
+    parts = data.split(":")
+    prefix, action = parts[0], parts[1]
+
+    if action == "cancel":
+        uid2 = int(parts[2])
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        blackjack_games.pop(f"{uid2}:{cid}", None)
+        roulette_games.pop(f"{uid2}:{cid}", None)
+        await query.answer("Отменено")
+        try:
+            await query.edit_message_text("❌ Отменено.")
+        except TelegramError:
+            pass
+        return
+
+    if action == "bet":
+        uid2, cid2, amount = int(parts[2]), int(parts[3]), int(parts[4])
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        uu = await db_get_user(uid2, cid2)
+        if not uu or uu["vrf"] < amount:
+            await query.answer(f"❌ Нужно {amount} VRF, у тебя {uu['vrf'] if uu else 0}", show_alert=True)
+            return
+        await db_deduct_vrf(uid2, cid2, amount)
+        await query.answer()
+        if prefix == "rl":
+            roulette_games[f"{uid2}:{cid2}"] = {"bet": amount}
+            try:
+                await query.edit_message_text(
+                    f"🎡 Ставка: <b>{fmt(amount)} VRF</b>\n\nНа что ставим?",
+                    parse_mode=ParseMode.HTML, reply_markup=_roulette_type_kb(uid2, cid2),
+                )
+            except TelegramError:
+                pass
+        elif prefix == "bj":
+            await _bj_start_game(context, cid2, uid2, query.message, amount)
+        return
+
+    # ── Рулетка: выбор типа ставки ─────────────────────
+    if prefix == "rl" and action == "t":
+        uid2, cid2, bet_type = int(parts[2]), int(parts[3]), parts[4]
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        game = roulette_games.pop(f"{uid2}:{cid2}", None)
+        if not game:
+            await query.answer("❌ Игра не найдена", show_alert=True); return
+        await query.answer()
+        await _roulette_spin_and_resolve(context.bot, cid2, uid2, query.message, bet_type, None, game["bet"])
+        return
+
+    if prefix == "rl" and action == "num":
+        uid2, cid2 = int(parts[2]), int(parts[3])
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        game = roulette_games.get(f"{uid2}:{cid2}")
+        if not game:
+            await query.answer("❌ Игра не найдена", show_alert=True); return
+        clan_pending_input[(cid2, uid2)] = {
+            "kind": "roulette_number", "expires": datetime.now() + timedelta(seconds=60),
+        }
+        await query.answer()
+        try:
+            await context.bot.send_message(
+                cid2, f"🎯 {mention(uid2, who.first_name)}, напиши число от 0 до 36 ответом:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ForceReply(selective=True, input_field_placeholder="0-36"),
+            )
+        except TelegramError:
+            pass
+        return
+
+    # ── Блэкджек: hit/stand ─────────────────────────────
+    if prefix == "bj" and action == "hit":
+        uid2, cid2 = int(parts[2]), int(parts[3])
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        game = blackjack_games.get(f"{uid2}:{cid2}")
+        if not game:
+            await query.answer("❌ Игра не найдена", show_alert=True); return
+        game["player"].append(game["deck"].pop())
+        p_val = _bj_hand_value(game["player"])
+        if p_val > 21:
+            await query.answer("💥 Перебор!")
+            del blackjack_games[f"{uid2}:{cid2}"]
+            await db_record_game(uid2, cid2, won=False)
+            try:
+                await query.edit_message_text(
+                    _bj_status_text(game, reveal_dealer=True) +
+                    f"\n\n💥 <b>Перебор!</b> Потеряно {fmt(game['bet'])} VRF",
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+            await check_achievements(context.bot, uid2, cid2)
+            return
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _bj_status_text(game), parse_mode=ParseMode.HTML,
+                reply_markup=_bj_kb(uid2, cid2),
+            )
+        except TelegramError:
+            pass
+        return
+
+    if prefix == "bj" and action == "stand":
+        uid2, cid2 = int(parts[2]), int(parts[3])
+        if who.id != uid2:
+            await query.answer("❌ Не твоя игра!", show_alert=True); return
+        await query.answer()
+        await _bj_finish(context, cid2, uid2, query)
+        return
+
+    await query.answer()
 
 
 def _clan_kb_raid_targets(clans: list, my_clan_id: int) -> InlineKeyboardMarkup:
@@ -12610,6 +13098,9 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(CommandHandler("rules",           cmd_rules))
     app.add_handler(CommandHandler(["achievements", "achieve"], cmd_achievements))
     app.add_handler(CommandHandler("wheel",           cmd_wheel))
+    app.add_handler(CommandHandler("casino",          cmd_casino))
+    app.add_handler(CommandHandler("roulette",        cmd_roulette))
+    app.add_handler(CommandHandler(["blackjack", "bj"], cmd_blackjack))
 
     # Profile / stats
     app.add_handler(CommandHandler("profile",  cmd_profile))

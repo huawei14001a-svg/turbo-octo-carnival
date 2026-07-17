@@ -155,6 +155,19 @@ FARM_BASE_MIN     = 30
 FARM_BASE_MAX     = 80
 FARM_CLAN_SHARE   = 0.30   # доля фарма, которая автоматически уходит в казну клана
 
+# ── Колесо Фортуны (/wheel, раз в 20 часов) ────────────
+WHEEL_COOLDOWN_H = 20
+WHEEL_SEGMENTS = [
+    # (вес, тип, min, max, эмодзи, подпись)
+    (6,  "nothing", 0,    0,    "💨", "Пусто! Не повезло"),
+    (28, "small",   30,   80,   "💎", "Немного VRF"),
+    (28, "medium",  100,  200,  "💰", "Хороший приз VRF"),
+    (18, "large",   300,  500,  "🤑", "Крупный приз VRF"),
+    (12, "bear",    1,    1,    "🐻", "Медведь!"),
+    (4,  "jackpot", 1000, 2000, "🎉", "ДЖЕКПОТ!!!"),
+]
+WHEEL_SPIN_FRAMES = ["🎡", "🌀", "✨", "🎯"]
+
 # ── Telegram message effects (private chat only) ──────
 # These are built-in Telegram effect IDs (🔥 ❤ 🎉 👍 💩 🌟)
 MSG_EFFECT_FIRE      = "5046589136895476552"
@@ -1016,6 +1029,14 @@ async def db_init() -> None:
                 new_user_paid INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS achievements (
+                user_id     INTEGER NOT NULL,
+                chat_id     INTEGER NOT NULL,
+                key         TEXT    NOT NULL,
+                unlocked_at TEXT    NOT NULL,
+                PRIMARY KEY (user_id, chat_id, key)
+            );
+
             CREATE TABLE IF NOT EXISTS chat_settings (
                 chat_id           INTEGER PRIMARY KEY,
                 welcome_text      TEXT    DEFAULT NULL,
@@ -1085,6 +1106,10 @@ async def db_init() -> None:
             "ALTER TABLE users ADD COLUMN last_active     TEXT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN last_attack     TEXT DEFAULT NULL",
             "ALTER TABLE users ADD COLUMN last_farm       TEXT DEFAULT NULL",
+            "ALTER TABLE users ADD COLUMN attacks_won     INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN defenses_won    INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN transfers_sent  INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN last_wheel      TEXT DEFAULT NULL",
         ):
             try:
                 await db.execute(col_sql)
@@ -1702,6 +1727,153 @@ async def db_touch_farm(uid: int, cid: int) -> None:
         await db.commit()
 
 
+async def db_bump_counter(uid: int, cid: int, field: str, amount: int = 1) -> None:
+    """Универсальный +N к любому числовому счётчику в users (используется
+    достижениями): attacks_won, defenses_won, transfers_sent."""
+    assert field in ("attacks_won", "defenses_won", "transfers_sent"), f"unexpected field {field}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE users SET {field} = COALESCE({field},0) + ? WHERE user_id=? AND chat_id=?",
+            (amount, uid, cid),
+        )
+        await db.commit()
+
+
+# ══════════════════════════════════════════════════════
+#           ДОСТИЖЕНИЯ  🏅  (/achievements)
+# ══════════════════════════════════════════════════════
+# Разблокируются автоматически по ходу игры и показываются бейджами
+# в /profile. Идемпотентно — уже открытые не проверяются повторно.
+
+ACHIEVEMENTS = {
+    "first_game":   {"emoji": "🎉", "label": "Новичок",        "desc": "Сыграй первую игру",
+                     "check": lambda u, c: u["total_games"] >= 1},
+    "first_win":    {"emoji": "🏆", "label": "Первая победа",   "desc": "Выиграй первую игру",
+                     "check": lambda u, c: u["wins"] >= 1},
+    "streak_5":     {"emoji": "🔥", "label": "Огненная серия",  "desc": "Серия побед: 5 подряд",
+                     "check": lambda u, c: u["max_streak"] >= 5},
+    "wins_100":     {"emoji": "💯", "label": "Сотня побед",     "desc": "100 побед в играх",
+                     "check": lambda u, c: u["wins"] >= 100},
+    "games_100":    {"emoji": "🎰", "label": "Завсегдатай",     "desc": "Сыграй 100 игр",
+                     "check": lambda u, c: u["total_games"] >= 100},
+    "level_10":     {"emoji": "⭐", "label": "10 уровень",      "desc": "Достигни 10 уровня",
+                     "check": lambda u, c: get_level(u["experience"]) >= 10},
+    "level_25":     {"emoji": "🌟", "label": "25 уровень",      "desc": "Достигни 25 уровня",
+                     "check": lambda u, c: get_level(u["experience"]) >= 25},
+    "married":      {"emoji": "💍", "label": "Молодожён",       "desc": "Женись/выйди замуж",
+                     "check": lambda u, c: c.get("married", False)},
+    "clan_founder": {"emoji": "👑", "label": "Основатель",      "desc": "Создай свой клан",
+                     "check": lambda u, c: c.get("is_clan_leader", False)},
+    "attacker_5":   {"emoji": "⚔️", "label": "Налётчик",        "desc": "5 успешных атак/рейдов",
+                     "check": lambda u, c: (u.get("attacks_won") or 0) >= 5},
+    "defender_5":   {"emoji": "🛡", "label": "Несокрушимый",    "desc": "Отрази 5 чужих атак",
+                     "check": lambda u, c: (u.get("defenses_won") or 0) >= 5},
+    "rich_10k":     {"emoji": "💰", "label": "Богач",           "desc": "Баланс 10 000 VRF",
+                     "check": lambda u, c: u["vrf"] >= 10_000},
+    "rich_100k":    {"emoji": "💎", "label": "Магнат",          "desc": "Баланс 100 000 VRF",
+                     "check": lambda u, c: u["vrf"] >= 100_000},
+    "generous_20":  {"emoji": "🎁", "label": "Щедрая душа",     "desc": "20 переводов VRF другим",
+                     "check": lambda u, c: (u.get("transfers_sent") or 0) >= 20},
+    "bears_10":     {"emoji": "🐻", "label": "Медвежатник",     "desc": "Собери 10 медведей",
+                     "check": lambda u, c: u["bears"] >= 10},
+}
+
+
+async def check_achievements(bot, uid: int, cid: int) -> list:
+    """Проверяет все условия, разблокирует новые ачивки, шлёт уведомление.
+    Возвращает список только что открытых ключей."""
+    u = await db_get_user(uid, cid)
+    if not u:
+        return []
+    marriage = await db_get_marriage(uid, cid)
+    clan = await db_get_user_clan(uid, cid)
+    ctx_flags = {
+        "married": marriage is not None,
+        "is_clan_leader": bool(clan and clan.get("my_role") == "leader"),
+    }
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT key FROM achievements WHERE user_id=? AND chat_id=?", (uid, cid)
+        ) as cur:
+            already = {r["key"] for r in await cur.fetchall()}
+
+    newly_unlocked = []
+    for key, ach in ACHIEVEMENTS.items():
+        if key in already:
+            continue
+        try:
+            if ach["check"](u, ctx_flags):
+                newly_unlocked.append(key)
+        except Exception:
+            continue
+
+    if not newly_unlocked:
+        return []
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for key in newly_unlocked:
+            try:
+                await db.execute(
+                    "INSERT INTO achievements (user_id, chat_id, key, unlocked_at) VALUES (?,?,?,?)",
+                    (uid, cid, key, _now()),
+                )
+            except Exception:
+                pass
+        await db.commit()
+
+    if bot is not None:
+        for key in newly_unlocked:
+            ach = ACHIEVEMENTS[key]
+            try:
+                await bot.send_message(
+                    cid,
+                    f"🏅 <b>Новое достижение!</b>\n\n"
+                    f"{ach['emoji']} <b>{ach['label']}</b> — {mention(uid, u['first_name'])}\n"
+                    f"<i>{ach['desc']}</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+    return newly_unlocked
+
+
+async def cmd_achievements(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    await check_achievements(context.bot, u.id, cid)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT key FROM achievements WHERE user_id=? AND chat_id=?", (u.id, cid)
+        ) as cur:
+            unlocked = {r["key"] for r in await cur.fetchall()}
+
+    lines = [f"🏅 <b>Достижения</b> ({len(unlocked)}/{len(ACHIEVEMENTS)})\n"]
+    for key, ach in ACHIEVEMENTS.items():
+        mark = ach["emoji"] if key in unlocked else "🔒"
+        style = "" if key in unlocked else " <i>(не открыто)</i>"
+        lines.append(f"{mark} <b>{ach['label']}</b> — {ach['desc']}{style}")
+
+    result = await send_ephemeral_or_normal(
+        context.bot, cid, u.id, "\n".join(lines), reply_to_id=update.message.message_id,
+    )
+    if isinstance(result, dict) and result.get("ephemeral_message_id"):
+        try:
+            await update.message.react([ReactionTypeEmoji(emoji="🏅")])
+        except TelegramError:
+            pass
+
+
+def achievement_badges_line(unlocked_keys: set) -> str:
+    """Короткая строка эмодзи-бейджей для вставки в /profile."""
+    if not unlocked_keys:
+        return ""
+    return " ".join(ACHIEVEMENTS[k]["emoji"] for k in ACHIEVEMENTS if k in unlocked_keys)
+
+
 # ── Marriages ──────────────────────────────────────────
 
 async def db_get_marriage(uid: int, cid: int) -> Optional[dict]:
@@ -2057,7 +2229,8 @@ MENU_CATEGORIES = {
         "title": "💎 Профиль и экономика",
         "text": (
             "<b>Слэш-команды:</b>\n"
-            "/profile /statsimg /activity /top /stats /daily /bonus /ref /cancel\n\n"
+            "/profile /statsimg /activity /top /stats /daily /bonus /ref /cancel "
+            "/achievements /wheel\n\n"
             "<b>Текстовые триггеры:</b>\n"
             "<code>б</code> / <code>баланс</code> — короткий приватный баланс\n"
             "<code>топ</code> — таблица лидеров\n"
@@ -2065,9 +2238,12 @@ MENU_CATEGORIES = {
             "<code>бонус</code> — статус кулдаунов\n"
             "<code>пер [сумма]</code> — перевод VRF (ответом)\n"
             "<code>ферма</code> — сбор ресурсов (часть в казну клана)\n"
+            "<code>колесо</code> — Колесо Фортуны, раз в 20 часов 🎡\n"
+            "<code>достижения</code> — твои бейджи 🏅\n"
             "<code>отмена</code> — отменить ожидающую игру"
         ),
-        "quick": [("🏆 Топ", "топ"), ("🎁 Бонус", "бонус"), ("🌾 Ферма", "ферма")],
+        "quick": [("🏆 Топ", "топ"), ("🎁 Бонус", "бонус"), ("🌾 Ферма", "ферма"),
+                 ("🎡 Колесо", "колесо"), ("🏅 Ачивки", "достижения")],
     },
     "games": {
         "title": "🎲 Игры и казино",
@@ -3723,6 +3899,15 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not u:
         return
 
+    await check_achievements(context.bot, target.id, cid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT key FROM achievements WHERE user_id=? AND chat_id=?", (target.id, cid)
+        ) as cur:
+            unlocked_keys = {r["key"] for r in await cur.fetchall()}
+    badges = achievement_badges_line(unlocked_keys)
+
     lvl, _, _, pct = get_progress(u["experience"])
     bar     = xp_bar(u["experience"])
     rank_nm = get_rank(lvl)
@@ -3757,6 +3942,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"<tr><td>🐻 Медведей</td><td><b>{u['bears']}</b></td></tr>"
         "</table>"
         f"<blockquote>{m_line}</blockquote>"
+        + (f"<p>🏅 {badges}</p>" if badges else "")
     )
     fb_h = (
         f"👤 <b>{mention(target.id, u['first_name'])}</b>\n\n"
@@ -3765,6 +3951,7 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🎮 Игр: <b>{u['total_games']}</b>  ✅ <b>{u['wins']}</b> ({wr}%)  ❌ <b>{u['losses']}</b>\n"
         f"🔥 Серия: <b>{u['win_streak']}</b> (макс. {u['max_streak']})  🐻 <b>{u['bears']}</b>\n\n"
         f"{m_line}"
+        + (f"\n\n🏅 {badges}" if badges else "")
     )
 
     caller = update.effective_user
@@ -4430,6 +4617,8 @@ async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode=ParseMode.HTML,
     )
     await _react(update, "🎊")
+    await check_achievements(context.bot, u.id, cid)
+    await check_achievements(context.bot, prop["proposer_id"], cid)
 
 
 @only_groups
@@ -9583,6 +9772,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"командой <code>казна +500</code>, защищайтесь и атакуйте другие кланы!",
                 parse_mode=ParseMode.HTML,
             )
+            await check_achievements(context.bot, u.id, cid)
             return
 
     # ── Text shortcuts ────────────────────────────────────
@@ -9765,6 +9955,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await handle_farm_trigger(update, context)
         return
 
+    # колесо → Колесо Фортуны (раз в 20 часов)
+    if word in ("колесо", "wheel", "рулетка"):
+        await handle_wheel_trigger(update, context)
+        return
+
+    # достижения → список бейджей
+    if word in ("достижения", "ачивки", "achievements"):
+        context.args = []
+        await cmd_achievements(update, context)
+        return
+
     # ── Transfer: пер [сумма] (с реплеем или @username [сумма]) ─
     if word in ("пер", "перевод", "send", "tr"):
         sender = u
@@ -9830,6 +10031,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await db_deduct_vrf(sender.id, cid, amount)
         new_bal = await db_add_vrf(recipient.id, cid, amount)
+        await db_bump_counter(sender.id, cid, "transfers_sent")
+        await check_achievements(context.bot, sender.id, cid)
 
         # Карточка перевода — тот же фон/стиль, что и в боте-бирже
         loop = asyncio.get_running_loop()
@@ -10365,6 +10568,7 @@ async def handle_attack_trigger(update: Update, context: ContextTypes.DEFAULT_TY
         await db_deduct_vrf(target_u.id, cid, steal)
         await db_add_vrf(attacker.id, cid, steal)
         await db_log_attack(cid, attacker.id, "user", target_u.id, True, steal)
+        await db_bump_counter(attacker.id, cid, "attacks_won")
         await update.message.reply_text(
             f"💰 <b>Атака удалась!</b>\n\n"
             f"{mention(attacker.id, attacker.first_name)} застал(а) "
@@ -10372,14 +10576,17 @@ async def handle_attack_trigger(update: Update, context: ContextTypes.DEFAULT_TY
             f"<b>{fmt(steal)} VRF</b>! (шанс был {int(chance*100)}%)",
             parse_mode=ParseMode.HTML,
         )
+        await check_achievements(context.bot, attacker.id, cid)
     else:
         await db_log_attack(cid, attacker.id, "user", target_u.id, False, 0)
+        await db_bump_counter(target_u.id, cid, "defenses_won")
         await update.message.reply_text(
             f"🛡 <b>Атака провалилась!</b>\n\n"
             f"{mention(attacker.id, attacker.first_name)} попытался(ась) ограбить "
             f"{mention(target_u.id, target_u.first_name)}, но не вышло. (шанс был {int(chance*100)}%)",
             parse_mode=ParseMode.HTML,
         )
+        await check_achievements(context.bot, target_u.id, cid)
 
 
 async def handle_farm_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10405,6 +10612,86 @@ async def handle_farm_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE
     if clan:
         text += f"\n🏰 В казну клана «{clan['name']}»: <b>+{fmt(clan_cut)} VRF</b>"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def wheel_cooldown_left(u: dict) -> int:
+    lw = u.get("last_wheel")
+    if not lw:
+        return 0
+    elapsed = (datetime.now() - datetime.fromisoformat(lw)).total_seconds()
+    left = WHEEL_COOLDOWN_H * 3600 - elapsed
+    return max(0, int(left))
+
+
+async def db_touch_wheel(uid: int, cid: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET last_wheel=? WHERE user_id=? AND chat_id=?", (_now(), uid, cid)
+        )
+        await db.commit()
+
+
+def _wheel_spin() -> tuple:
+    """Взвешенный случайный выбор сегмента колеса. Возвращает (kind, amount, emoji, label)."""
+    total_w = sum(seg[0] for seg in WHEEL_SEGMENTS)
+    r = random.uniform(0, total_w)
+    upto = 0
+    for weight, kind, lo, hi, emoji, label in WHEEL_SEGMENTS:
+        upto += weight
+        if r <= upto:
+            amount = random.randint(lo, hi) if hi > 0 else 0
+            return kind, amount, emoji, label
+    # fallback (не должно случаться)
+    weight, kind, lo, hi, emoji, label = WHEEL_SEGMENTS[0]
+    return kind, 0, emoji, label
+
+
+async def handle_wheel_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u, cid = update.effective_user, update.effective_chat.id
+    await db_ensure_user(u.id, cid, u.username or "", u.first_name)
+    uu = await db_get_user(u.id, cid)
+    left = wheel_cooldown_left(uu)
+    if left > 0:
+        await update.message.reply_text(f"🎡 Колесо ещё крутится — подожди {fmt_cd(left)}")
+        return
+
+    msg = await update.message.reply_text("🎡 Крутим колесо фортуны...")
+    for frame in WHEEL_SPIN_FRAMES:
+        await asyncio.sleep(0.5)
+        try:
+            await msg.edit_text(f"{frame} Крутим колесо фортуны{'.' * random.randint(1,3)}")
+        except TelegramError:
+            pass
+
+    kind, amount, emoji, label = _wheel_spin()
+    await db_touch_wheel(u.id, cid)
+
+    if kind == "nothing":
+        result_text = f"{emoji} <b>{label}</b>\n\nПопробуй завтра снова!"
+    elif kind == "bear":
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET bears=bears+? WHERE user_id=? AND chat_id=?",
+                (amount, u.id, cid),
+            )
+            await db.commit()
+        result_text = f"{emoji} <b>{label}</b>\n\n+{amount} 🐻 медведь(я/ей)!"
+    else:
+        new_bal = await db_add_vrf(u.id, cid, amount)
+        result_text = f"{emoji} <b>{label}</b>\n\n+{fmt(amount)} VRF!\n💰 Баланс: {fmt(new_bal)} VRF"
+
+    try:
+        await msg.edit_text(
+            f"🎡 <b>Колесо Фортуны</b>\n\n{mention(u.id, u.first_name)}:\n\n{result_text}",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        pass
+    await check_achievements(context.bot, u.id, cid)
+
+
+async def cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_wheel_trigger(update, context)
 
 
 def _clan_kb_raid_targets(clans: list, my_clan_id: int) -> InlineKeyboardMarkup:
@@ -12321,6 +12608,8 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(CommandHandler("wordlist",        cmd_wordlist))
     app.add_handler(CommandHandler("setrules",        cmd_setrules))
     app.add_handler(CommandHandler("rules",           cmd_rules))
+    app.add_handler(CommandHandler(["achievements", "achieve"], cmd_achievements))
+    app.add_handler(CommandHandler("wheel",           cmd_wheel))
 
     # Profile / stats
     app.add_handler(CommandHandler("profile",  cmd_profile))

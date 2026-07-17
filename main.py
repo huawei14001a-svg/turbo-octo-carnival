@@ -222,6 +222,7 @@ E_BONUS  = "⭐"   # Bonus / daily
 # ══════════════════════════════════════════════════════
 
 duel_challenges: dict = {}   # key: f"{cid}:{c_id}:{o_id}"
+joker_challenges: dict = {}  # key: f"{cid}:{c_id}:{o_id}" — карточная дуэль "Джокер"
 cubes_games: dict     = {}   # key: game_id (str)
 sports_games: dict    = {}   # key: game_id (str)
 slot_games: dict      = {}   # key: game_id (str)
@@ -2251,10 +2252,12 @@ MENU_CATEGORIES = {
         "title": "🎲 Игры и казино",
         "text": (
             "<b>Слэш-команды:</b>\n"
-            "/duel /cubes /basket /football /bowling /darts /slot /mines /tictac "
+            "/duel /joker /cubes /basket /football /bowling /darts /slot /mines /tictac "
             "/seabattle /crash /tower /maze /giveaway /casino /roulette /blackjack\n\n"
             "<b>Текстовые триггеры (ответом на соперника):</b>\n"
-            "<code>дуэль [ставка]</code> · <code>кости [раунды] [ставка]</code>\n"
+            "<code>дуэль [ставка]</code> · <code>джокер [ставка]</code> — карточная дуэль, "
+            "Джокер бьёт всё\n"
+            "<code>кости [раунды] [ставка]</code>\n"
             "<code>баскет / футбол / боулинг / дартс [ставка]</code>\n"
             "<code>слот [ставка]</code>\n\n"
             "<b>🎰 Казино (соло против бота):</b>\n"
@@ -4881,6 +4884,137 @@ async def _run_duel(context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
         except TelegramError:
             pass
 # ══════════════════════════════════════════════════════
+#           ДЖОКЕР  🃏  (карточная PvP-дуэль, как в GRAM)
+# ══════════════════════════════════════════════════════
+# Каждый тянет одну карту из колоды 52+2 джокера. Джокер бьёт всё,
+# иначе побеждает старшая карта. При ничьей — колода тасуется заново.
+
+JOKER_RANK_VALUE = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8,
+                   "9": 9, "10": 10, "J": 11, "Q": 12, "K": 13, "A": 14, "JOKER": 15}
+JOKER_MAX_REDRAWS = 5   # защита от бесконечного цикла ничьих
+
+
+def _joker_new_deck() -> list:
+    deck = [(r, s) for r in CARD_RANKS for s in CARD_SUITS]
+    deck.append(("JOKER", "🃏"))
+    deck.append(("JOKER", "🃏"))
+    random.shuffle(deck)
+    return deck
+
+
+def _joker_card_label(card) -> str:
+    r, s = card
+    return "🃏 ДЖОКЕР" if r == "JOKER" else f"{r}{s}"
+
+
+def _joker_value(card) -> int:
+    return JOKER_RANK_VALUE[card[0]]
+
+
+@only_groups
+async def cmd_joker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    challenger = update.effective_user
+    cid        = update.effective_chat.id
+
+    if not update.message.reply_to_message or update.message.reply_to_message.from_user.is_bot:
+        await update.message.reply_text("🃏 Ответь на сообщение соперника чтобы вызвать на Джокера!")
+        return
+
+    opponent = update.message.reply_to_message.from_user
+    if opponent.id == challenger.id:
+        await update.message.reply_text("🃏 Нельзя вызвать самого себя!")
+        return
+
+    await db_ensure_user(challenger.id, cid, challenger.username or "", challenger.first_name)
+    await db_ensure_user(opponent.id,   cid, opponent.username   or "", opponent.first_name)
+    cu = await db_get_user(challenger.id, cid)
+    ou = await db_get_user(opponent.id,   cid)
+
+    bet, err = resolve_custom_bet(context, cu["vrf"], ou["vrf"])
+    if err:
+        await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+    if cu["vrf"] < bet or ou["vrf"] < bet:
+        await update.message.reply_text(f"❌ Недостаточно VRF для игры!\nСтавка: {bet} VRF")
+        return
+
+    key = f"{cid}:{challenger.id}:{opponent.id}"
+    joker_challenges[key] = {
+        "cid": cid, "c_id": challenger.id, "c_name": challenger.first_name,
+        "o_id": opponent.id, "o_name": opponent.first_name, "bet": bet,
+    }
+
+    await update.message.reply_text(
+        f"🃏 <b>ВЫЗОВ НА ДЖОКЕРА!</b>\n\n"
+        f"{E_ALERT} {mention(challenger.id, challenger.first_name)} вызывает\n"
+        f"{mention(opponent.id, opponent.first_name)}!\n\n"
+        f"💰 Ставка: <b>{bet} VRF</b>\n"
+        f"🎴 Каждый тянет по одной карте — Джокер бьёт всё, иначе старшая карта!\n\n"
+        f"{mention(opponent.id, opponent.first_name)}, принимаешь?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            SBtn("Принять 🃏", style="success", callback_data=f"ja:{challenger.id}:{opponent.id}"),
+            SBtn("Отклонить", style="danger",   callback_data=f"jd:{challenger.id}:{opponent.id}"),
+        ]]),
+    )
+
+
+async def _run_joker(context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
+    cid   = data["cid"]
+    c_id, c_name = data["c_id"], data["c_name"]
+    o_id, o_name = data["o_id"], data["o_name"]
+    bet   = data["bet"]
+
+    await context.bot.send_message(cid, "🃏 Тасуем колоду...", parse_mode=ParseMode.HTML)
+    await asyncio.sleep(1.5)
+
+    c_card = o_card = None
+    for attempt in range(JOKER_MAX_REDRAWS):
+        deck = _joker_new_deck()
+        c_card, o_card = deck.pop(), deck.pop()
+        if _joker_value(c_card) != _joker_value(o_card):
+            break
+        await context.bot.send_message(
+            cid, f"🤝 Ничья! {_joker_card_label(c_card)} = {_joker_card_label(o_card)} — тасуем заново...",
+        )
+        await asyncio.sleep(1.2)
+    else:
+        # 5 ничьих подряд — крайне маловероятно, но на всякий случай возвращаем ставки
+        await context.bot.send_message(cid, "🤝 Слишком много ничьих подряд — ставки возвращены.")
+        await db_record_game(c_id, cid, won=False, draw=True)
+        await db_record_game(o_id, cid, won=False, draw=True)
+        return
+
+    await context.bot.send_message(
+        cid,
+        f"🎴 {mention(c_id, c_name)}: <b>{_joker_card_label(c_card)}</b>\n"
+        f"🎴 {mention(o_id, o_name)}: <b>{_joker_card_label(o_card)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    await asyncio.sleep(2)
+
+    if _joker_value(c_card) > _joker_value(o_card):
+        w_id, w_name, l_id = c_id, c_name, o_id
+    else:
+        w_id, w_name, l_id = o_id, o_name, c_id
+
+    await db_deduct_vrf(l_id, cid, bet)
+    new_bal = await db_add_vrf(w_id, cid, bet)
+    await db_add_xp(w_id, cid, XP_PER_WIN)
+    await db_add_xp(l_id, cid, XP_PER_GAME)
+    await db_record_game(w_id, cid, won=True)
+    await db_record_game(l_id, cid, won=False)
+
+    await context.bot.send_message(
+        cid,
+        f"🏆 <b>{mention(w_id, w_name)} побеждает картой {_joker_card_label(c_card if w_id==c_id else o_card)}!</b>\n\n"
+        f"💎 +{fmt(bet)} VRF → Баланс: {fmt(new_bal)} VRF",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_play_again_kb("joker", cid, bet),
+    )
+    await check_achievements(context.bot, w_id, cid)
+    await check_achievements(context.bot, l_id, cid)
+# ══════════════════════════════════════════════════════
 
 @only_groups
 async def cmd_cubes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6602,6 +6736,22 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         del duel_challenges[k]
         cancelled.append("⚔️ Дуэль")
 
+    # Joker challenges (challenger or opponent)
+    for k in [k for k, v in list(joker_challenges.items())
+              if k.startswith(f"{cid}:") and (v.get("c_id") == uid or v.get("o_id") == uid)]:
+        del joker_challenges[k]
+        cancelled.append("🃏 Джокер")
+
+    # Roulette / Blackjack (waiting for bet type / active hand — refund bet)
+    for prefix, gdict, label in (("rl", roulette_games, "🎡 Рулетка"), ("bj", blackjack_games, "🃏 Блэкджек")):
+        key = f"{uid}:{cid}"
+        if key in gdict:
+            bet = gdict[key].get("bet", 0)
+            if bet:
+                await db_add_vrf(uid, cid, bet)
+            del gdict[key]
+            cancelled.append(f"{label} (ставка возвращена)")
+
     # Cubes (waiting)
     for k, v in list(cubes_games.items()):
         if v["cid"] == cid and v["state"] == "waiting" and uid in (v["host_id"], v["opp_id"]):
@@ -6763,6 +6913,53 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
         )
         context.application.create_task(_run_duel(context, challenge))
+        return
+
+    # ── Joker (accept/decline) ───────────────────────────
+    if data.startswith("ja:") or data.startswith("jd:"):
+        parts  = data.split(":")
+        action = parts[0]
+        c_id   = int(parts[1])
+        o_id   = int(parts[2])
+        key    = f"{cid}:{c_id}:{o_id}"
+
+        if who.id != o_id:
+            await query.answer("❌ Вызов не для тебя!", show_alert=True)
+            return
+        if key not in joker_challenges:
+            await query.answer("❌ Вызов уже неактуален", show_alert=True)
+            await query.edit_message_reply_markup(None)
+            return
+
+        challenge = joker_challenges.pop(key)
+
+        if action == "jd":
+            await query.answer("🏳️ Ты отказался")
+            await query.edit_message_text(
+                f"🏳️ {mention(o_id, who.first_name)} отказался от Джокера!\n"
+                f"{mention(c_id, challenge['c_name'])} остаётся непобеждённым.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        cu = await db_get_user(c_id, cid)
+        ou = await db_get_user(o_id, cid)
+        bet = challenge["bet"]
+        if not cu or cu["vrf"] < bet:
+            await query.answer("❌ У вызывающего недостаточно VRF!", show_alert=True)
+            return
+        if not ou or ou["vrf"] < bet:
+            await query.answer("❌ У тебя недостаточно VRF!", show_alert=True)
+            return
+
+        await query.answer("🃏 Принято!")
+        await query.edit_message_text(
+            f"🃏 <b>ДЖОКЕР ПРИНЯТ!</b>\n"
+            f"{mention(c_id, challenge['c_name'])} 🃏 {mention(o_id, who.first_name)}\n"
+            f"💰 Ставка: {bet} VRF · 🎴 Тянем карты...",
+            parse_mode=ParseMode.HTML,
+        )
+        context.application.create_task(_run_joker(context, challenge))
         return
 
     # ── Cubes join ──────────────────────────────────────
@@ -8330,11 +8527,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # PvP games (duel, cubes, sport): show bet picker + offer challenge
+        # PvP games (duel, cubes, sport, joker): show bet picker + offer challenge
         presets   = [25, 50, 100, 250, 500]
-        emoji_map = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅"}
+        emoji_map = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅", "joker": "🃏"}
         icon      = emoji_map.get(game_name, "🎮")
-        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт"}
+        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт", "joker": "Джокер"}
         gname     = name_map.get(game_name, "Игра")
 
         # Default to last bet if known, else 50
@@ -8412,9 +8609,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await query.answer(f"Вызов брошен на {bet} VRF!")
 
-        cmd_map   = {"duel": "/duel", "cubes": "/cubes", "sport": "/basket"}
-        icon_map  = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅"}
-        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт"}
+        cmd_map   = {"duel": "/duel", "cubes": "/cubes", "sport": "/basket", "joker": "/joker"}
+        icon_map  = {"duel": "⚔️", "cubes": "🎲", "sport": "🏅", "joker": "🃏"}
+        name_map  = {"duel": "Дуэль", "cubes": "Кубики", "sport": "Спорт", "joker": "Джокер"}
         icon      = icon_map.get(game_name, "🎮")
         gname     = name_map.get(game_name, "Игра")
         game_id   = str(uuid.uuid4())[:8]
@@ -9926,6 +10123,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if word in ("блэкджек", "blackjack", "очко", "21"):
         context.args = []
         await cmd_blackjack(update, context)
+        return
+    if word in ("джокер", "joker"):
+        context.args = pts[1:]
+        await cmd_joker(update, context)
         return
     if word in ("казино", "casino"):
         context.args = []
@@ -13101,6 +13302,7 @@ def _register_handlers(app, is_child: bool = False) -> None:
     app.add_handler(CommandHandler("casino",          cmd_casino))
     app.add_handler(CommandHandler("roulette",        cmd_roulette))
     app.add_handler(CommandHandler(["blackjack", "bj"], cmd_blackjack))
+    app.add_handler(CommandHandler("joker", cmd_joker))
 
     # Profile / stats
     app.add_handler(CommandHandler("profile",  cmd_profile))
